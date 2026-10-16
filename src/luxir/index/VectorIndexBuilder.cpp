@@ -153,7 +153,7 @@ void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
   size_t chunkVecs = chunkBytes == 0 ? (size_t)numVals
                                      : std::max((size_t)1, chunkBytes / bytesPerVec);
 
-  if (!normalizeForFaiss && vr.encoding() == VectorEncoding::F32) {
+  if (!normalizeForFaiss && vr.encoding() == VectorEncoding::F32 && !vr.hasNorms()) {
     // F32 straight from the mapped column, no copy.
     const float* base = (const float*)vr.rowAtRank(0).data();
     for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {

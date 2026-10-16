@@ -1643,7 +1643,24 @@ public:
             dims, vr.dims()));
         }
         VectorScorer scorer(request.query, dims, metric, normalizeColumnOnCosineRescore,
-                            vr.encoding());
+                            vr.encoding(), vr.hasNorms());
+        const char* rowsBase = vr.rowsBase();
+        int64_t rowStride = vr.valueBytes();
+        // Eligible ranks are scored in blocks through the batched kernels; the
+        // offers below then run in rank order exactly as a per-row loop would.
+        ScanBlock block;
+        auto scoreBlock = [&]() {
+          block.scores.resize(block.ranks.size());
+          if (scorer.scoresColumn()) {
+            block.rows.resize(block.ranks.size());
+            for (size_t j = 0; j < block.ranks.size(); j++) {
+              block.rows[j] = rowsBase + block.ranks[j] * rowStride;
+            }
+            scorer.scoreRows(block.rows.data(), block.rows.size(), block.scores.data());
+          } else {
+            std::fill(block.scores.begin(), block.scores.end(), 0.0f);
+          }
+        };
 
         // Pooled-rank exclusion (request.eligible), honored at DOC level:
         // this engine's scores are exact and it emits each doc's max-sim
@@ -1670,46 +1687,51 @@ public:
         // monotonic; sparse select and dense identity likewise), so a doc's
         // vectors form a contiguous run and max-sim collapse falls out of one
         // pass.  liveDocs/domain are applied as a per-run predicate.
-        auto scan = [&](auto emit) {
-          if (v2d.mono != nullptr) {
-            MonoReader::BulkValues valDoc(*v2d.mono);
-            int64_t idx = valDoc.next();
-            int64_t rank = 0;
-            while (rank < numVals) {
-              int32_t docId = (int32_t)valDoc.value();
-              int64_t end = rank;
-              do {
-                end++;
-                idx = valDoc.next();
-              } while (end < numVals && (int32_t)valDoc.value() == docId);
-              unused(idx);
-              if (docEligible(docId) && !pooledInRun(rank, end)) {
+        if constexpr (Groups) {
+          // Group admission checks competitiveness per hit before the key
+          // lookup, so this path scores row by row.
+          auto rowScore = [&](int64_t r) {
+            return scorer.scoresColumn() ? scorer.score(rowsBase + r * rowStride) : 0.0f;
+          };
+          auto scan = [&](auto emit) {
+            if (v2d.mono != nullptr) {
+              MonoReader::BulkValues valDoc(*v2d.mono);
+              int64_t idx = valDoc.next();
+              int64_t rank = 0;
+              while (rank < numVals) {
+                int32_t docId = (int32_t)valDoc.value();
+                int64_t end = rank;
+                do {
+                  end++;
+                  idx = valDoc.next();
+                } while (end < numVals && (int32_t)valDoc.value() == docId);
+                unused(idx);
+                if (docEligible(docId) && !pooledInRun(rank, end)) {
+                  eligibleDocs++;
+                  emit(docId, [&]() LUXIR_INLINE {
+                    scanned += end - rank;
+                    auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
+                      return rowScore(r);
+                    });
+                    return VectorEngineHit{bestScore, segOrd, bestRank};
+                  });
+                }
+                rank = end;
+              }
+            } else {
+              // Single-valued (dense identity or sparse select): one-vector runs.
+              for (int64_t rank = 0; rank < numVals; rank++) {
+                if (pooledInRun(rank, rank + 1)) continue;
+                int32_t docId = v2d.resolve(rank);
+                if (!docEligible(docId)) continue;
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
-                  if constexpr (Groups) scanned += end - rank;
-                  auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
-                    return scorer.score(vr.rowAtRank(r), 0.0f);
-                  });
-                  return VectorEngineHit{bestScore, segOrd, bestRank};
+                  scanned++;
+                  return VectorEngineHit{rowScore(rank), segOrd, rank};
                 });
               }
-              rank = end;
             }
-          } else {
-            // Single-valued (dense identity or sparse select): one-vector runs.
-            for (int64_t rank = 0; rank < numVals; rank++) {
-              if (pooledInRun(rank, rank + 1)) continue;
-              int32_t docId = v2d.resolve(rank);
-              if (!docEligible(docId)) continue;
-              eligibleDocs++;
-              emit(docId, [&]() LUXIR_INLINE {
-                if constexpr (Groups) scanned++;
-                return VectorEngineHit{scorer.score(vr.rowAtRank(rank), 0.0f), segOrd, rank};
-              });
-            }
-          }
-        };
-        if constexpr (Groups) {
+          };
           // Exact vectors arrive in doc order. Join one bulk key walk to
           // that stream; drop-policy members are rejected before scoring.
           CollapseKeyReader keys(*groupPlan);
@@ -1721,10 +1743,74 @@ public:
               if (key != nullptr) heap.offerKey(hit, *key, doc);
             });
           });
-        } else scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
-          unused(doc);
-          heap.offer(makeHit());
-        });
+        } else {
+          if (v2d.mono != nullptr) {
+            // Blocks hold whole runs: runStarts[j] is the block offset of the
+            // j-th eligible run, which ends where the next one starts.
+            auto flushRuns = [&]() {
+              if (block.ranks.empty()) return;
+              scoreBlock();
+              block.runStarts.push_back(block.ranks.size());
+              for (size_t j = 0; j + 1 < block.runStarts.size(); j++) {
+                int64_t begin = (int64_t)block.runStarts[j];
+                auto [bestPos, bestScore] = bestInRun(
+                    begin, (int64_t)block.runStarts[j + 1],
+                    [&](int64_t p) { return block.scores[(size_t)p]; });
+                heap.offer(VectorEngineHit{
+                               .score = bestScore,
+                               .segOrd = segOrd,
+                               .valueRank = block.ranks[(size_t)bestPos],
+                             });
+              }
+              block.clear();
+            };
+            MonoReader::BulkValues valDoc(*v2d.mono);
+            int64_t idx = valDoc.next();
+            int64_t rank = 0;
+            while (rank < numVals) {
+              int32_t docId = (int32_t)valDoc.value();
+              int64_t end = rank;
+              do {
+                end++;
+                idx = valDoc.next();
+              } while (end < numVals && (int32_t)valDoc.value() == docId);
+              unused(idx);
+
+              if (docEligible(docId) && !pooledInRun(rank, end)) {
+                eligibleDocs++;
+                block.runStarts.push_back(block.ranks.size());
+                for (int64_t r = rank; r < end; r++) block.ranks.push_back(r);
+                if (block.ranks.size() >= SCAN_BLOCK_ROWS) flushRuns();
+              }
+              rank = end;
+            }
+            flushRuns();
+          } else {
+            // Single-valued (dense identity or sparse select): runs are length
+            // 1 by construction.
+            auto flushRanks = [&]() {
+              if (block.ranks.empty()) return;
+              scoreBlock();
+              for (size_t j = 0; j < block.ranks.size(); j++) {
+                heap.offer(VectorEngineHit{
+                               .score = block.scores[j],
+                               .segOrd = segOrd,
+                               .valueRank = block.ranks[j],
+                             });
+              }
+              block.clear();
+            };
+            for (int64_t rank = 0; rank < numVals; rank++) {
+              if (pooledInRun(rank, rank + 1)) continue;
+              int32_t docId = v2d.resolve(rank);
+              if (!docEligible(docId)) continue;
+              eligibleDocs++;
+              block.ranks.push_back(rank);
+              if (block.ranks.size() >= SCAN_BLOCK_ROWS) flushRanks();
+            }
+            flushRanks();
+          }
+        }
 
         if (statsForTests) {
           int64_t count = Groups ? scanned : eligibleDocs;
@@ -1739,6 +1825,21 @@ public:
       }
 
     private:
+      // Rows per batched scoring call: enough to amortize the per-block
+      // dispatch, small enough that the block's scores stay in L1.
+      static constexpr size_t SCAN_BLOCK_ROWS = 64;
+
+      struct ScanBlock {
+        std::vector<int64_t> ranks;
+        std::vector<const char*> rows;
+        std::vector<float> scores;
+        std::vector<size_t> runStarts;
+        void clear() {
+          ranks.clear();
+          runStarts.clear();
+        }
+      };
+
       // The domain, when present, is live-filtered and is the complete
       // eligibility predicate (PrepareContext contract); null means the
       // segment has no deletes and no filters.
@@ -2524,6 +2625,11 @@ private:
       const SegV2D& v2d = v2dPerSeg[(size_t)segOrd];
       int64_t rescored = 0;
       bool keepEngineScores = !segApprox.empty() && !segApprox[(size_t)segOrd];
+      // Exact scores for the whole bucket in one batched pass: candidates are
+      // rank-sorted, so the gathered rows walk the column forward and the
+      // scorer prefetches ahead across the gaps.  Groups restores each
+      // witness's full per-document max, so it scores row by row below.
+      std::vector<float> exactScores;
       std::optional<VectorReader> vr;
       std::optional<VectorScorer> scorer;
       if (!keepEngineScores) {
@@ -2532,7 +2638,25 @@ private:
           throw std::runtime_error(std::format(
             "KnnQuery: query vector dims {} do not match segment dims {}", dims, vr->dims()));
         }
-        scorer.emplace(queryPtr, dims, metric, normalizeColumnOnCosineRescore, vr->encoding());
+        scorer.emplace(queryPtr, dims, metric, normalizeColumnOnCosineRescore,
+                       vr->encoding(), vr->hasNorms());
+        if (!scorer->scoresColumn()) {
+          keepEngineScores = true;
+        } else if constexpr (!Groups) {
+          int64_t numVals = vr->numVectors();
+          const char* rowsBase = numVals > 0 ? vr->rowsBase() : nullptr;
+          int64_t rowStride = vr->valueBytes();
+          std::vector<const char*> rows(bucketEnd - bucketBegin);
+          for (size_t c = bucketBegin; c < bucketEnd; c++) {
+            int64_t rank = candidates[c].valueRank;
+            if (rank < 0 || rank >= numVals) {
+              throw std::runtime_error("KnnQuery: vector candidate rank out of range");
+            }
+            rows[c - bucketBegin] = rowsBase + rank * rowStride;
+          }
+          exactScores.resize(rows.size());
+          scorer->scoreRows(rows.data(), rows.size(), exactScores.data());
+        }
       }
 
       [[no_unique_address]] std::conditional_t<Groups,
@@ -2568,12 +2692,11 @@ private:
             }
             bestScore = bestInRun(begin, end, [&](int64_t rank) {
               rescored++;
-              return scorer->score(vr->rowAtRank(rank), 0.0f);
+              return scorer->score(vr->rowAtRank(rank).data());
             }).second;
           } else {
             bestScore = bestInRun((int64_t)i, (int64_t)runEnd, [&](int64_t c) {
-              return scorer->score(vr->rowAtRank(candidates[(size_t)c].valueRank),
-                                 candidates[(size_t)c].score);
+              return exactScores[(size_t)c - bucketBegin];
             }).second;
           }
         }

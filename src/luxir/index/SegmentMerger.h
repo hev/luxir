@@ -1770,6 +1770,17 @@ private:
       firstEncoding = false;
     }
     outputFieldInfo.vectorEncoding = (int32_t)outEncoding;
+    // Whether a column needs the norm prefix depends on its encoding (and the
+    // field settings), so the output keeps it when any input already in the
+    // output encoding has it.  Other inputs gain it (computed here) or drop it.
+    bool outNorms = false;
+    for (auto* f : sortedFields) {
+      if (f == nullptr || !isVector) continue;
+      if ((VectorEncoding)f->segFieldInfo.vectorEncoding == outEncoding) {
+        outNorms = outNorms || f->segFieldInfo.vectorNorms;
+      }
+    }
+    outputFieldInfo.vectorNorms = outNorms;
     std::vector<float> transcodeFloats;
     std::vector<char> transcodeBytes;
 
@@ -1831,23 +1842,36 @@ private:
       StrColReader reader(*field->seg->postingsReader, field->segFieldInfo);
       StrColReader::Iterator iter(reader);
 
-      // Identity unless this input's vector encoding differs from the output's.
+      // Identity unless this input's vector encoding or norm prefix differs
+      // from the output's.  Only the prefix differing keeps the payload bytes.
       auto inEncoding = (VectorEncoding)field->segFieldInfo.vectorEncoding;
-      bool transcode = isVector && inEncoding != outEncoding && reader.numValues() > 0;
+      bool inNorms = field->segFieldInfo.vectorNorms;
+      bool transcode = isVector && (inEncoding != outEncoding || inNorms != outNorms)
+          && reader.numValues() > 0;
       int32_t transcodeDims = 0;
       if (transcode) {
-        transcodeDims = vcodec::dimsFromBytes(inEncoding, reader.fixedValueSize());
+        transcodeDims = vcodec::dimsFromRowBytes(inEncoding, reader.fixedValueSize(), inNorms);
         if (!reader.isFixedSize() || transcodeDims <= 0) {
           throw std::runtime_error("SegmentMerger: invalid vector column in field "
                                    + std::string((std::string_view)field->segFieldInfo.fieldname));
         }
         transcodeFloats.resize((size_t)transcodeDims);
-        transcodeBytes.resize((size_t)vcodec::bytesPerVector(outEncoding, transcodeDims));
+        transcodeBytes.resize((size_t)vcodec::rowBytes(outEncoding, transcodeDims, outNorms));
       }
       auto convert = [&](std::string_view value) {
         if (!transcode) return value;
-        vcodec::decode(inEncoding, value.data(), transcodeDims, transcodeFloats.data());
-        vcodec::encode(outEncoding, transcodeFloats.data(), transcodeDims, transcodeBytes.data());
+        const char* payload = vcodec::rowPayload(value.data(), inNorms);
+        char* out = transcodeBytes.data();
+        if (inEncoding == outEncoding) {
+          // Same payload; only the norm prefix is added (outNorms is the OR
+          // over the inputs of this encoding, so it is never dropped here).
+          std::memcpy(out + vcodec::NORM_BYTES, payload,
+                      (size_t)vcodec::bytesPerVector(inEncoding, transcodeDims));
+          vcodec::writeRowNorm(outEncoding, out, transcodeDims);
+        } else {
+          vcodec::decode(inEncoding, payload, transcodeDims, transcodeFloats.data());
+          vcodec::encodeRow(outEncoding, outNorms, transcodeFloats.data(), transcodeDims, out);
+        }
         return std::string_view(transcodeBytes.data(), transcodeBytes.size());
       };
 

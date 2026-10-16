@@ -167,7 +167,10 @@ it. `encoding` chooses how each vector is stored:
 | `f16` | `2 * dims` | IEEE half precision per element |
 | `int8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
 
-At 768 dimensions that is 3072, 1536, and 776 bytes per vector.
+At 768 dimensions that is 3072, 1536, and 776 bytes per vector. Fields
+whose scoring needs each stored vector's norm also store it once, 4 more bytes
+per vector, so searches never recompute it: cosine over `f16` or `int8`,
+cosine with `normalize_on_write: false`, and `int8` with `l2`.
 
 ```json
 {
@@ -707,8 +710,8 @@ POST /collections/books/_search
 ```
 
 That is `[0.6, 0.3, 0.1]` at unit length. Set `normalize_on_write: false` to
-keep the raw vectors in the column; candidate rescoring then normalizes at
-query time. Zero and near-zero cosine vectors have no direction and are
+keep the raw vectors in the column; each raw vector's norm is then stored
+once at index time (4 bytes per vector) and scoring divides by it. Zero and near-zero cosine vectors have no direction and are
 skipped at index time.
 
 ### Measure recall

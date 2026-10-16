@@ -101,7 +101,8 @@ locations, browse `src/luxir/<area>/`.
    - `VectorReader`: reads column-stored vectors in the segment's `VectorEncoding`
      (`codec/VectorCodec.h`: f32, f16, per-vector int8) for exact flat KNN
    - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
-     per encoding, shared by the flat column scan and candidate rescore
+     per encoding, shared by the flat column scan and candidate rescore; batched over blocks
+     of rows, on the SIMD kernels in `codec/VectorKernels.cpp` (AVX2/F16C, NEON, portable)
    - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF+PQ aux overlays for ANN,
      built from the decoded column or the `keep_original` companion column
    - Reuses column storage for exact search, cosine raw-column normalization, and candidate rescoring
