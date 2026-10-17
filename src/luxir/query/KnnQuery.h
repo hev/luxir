@@ -41,6 +41,7 @@
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
 #include "luxir/util/heap.h"
+#include "luxir/util/PagePrefetch.h"
 #include "luxir/util/log.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/thread.h"
@@ -1646,6 +1647,26 @@ public:
                             vr.encoding(), vr.hasNorms());
         const char* rowsBase = vr.rowsBase();
         int64_t rowStride = vr.valueBytes();
+        // Read-ahead for a column that is not resident (see PagePrefetcher).
+        // Unfiltered scans read every row, so they advise a byte window ahead
+        // of the cursor; filtered scans advise each block's rows before
+        // scoring it, which reads only eligible rows.
+        PagePrefetcher prefetch;
+        prefetch.probe(rowsBase);
+        prefetch.probe(rowsBase + numVals / 2 * rowStride);
+        const char* advisedEnd = rowsBase;
+        const char* columnEnd = rowsBase + numVals * rowStride;
+        auto adviseAhead = [&](int64_t rank) {
+          if (!prefetch.active() || domain != nullptr) return;
+          const char* at = rowsBase + rank * rowStride;
+          if (advisedEnd - at > (ptrdiff_t)(SCAN_PREFETCH_BYTES / 2)) return;
+          const char* end = std::min(columnEnd, at + SCAN_PREFETCH_BYTES);
+          if (end <= advisedEnd) return;
+          const char* from = std::max(advisedEnd, at);
+          prefetch.add(from, (size_t)(end - from));
+          prefetch.flush();
+          advisedEnd = end;
+        };
         // Eligible ranks are scored in blocks through the batched kernels; the
         // offers below then run in rank order exactly as a per-row loop would.
         ScanBlock block;
@@ -1656,7 +1677,16 @@ public:
             for (size_t j = 0; j < block.ranks.size(); j++) {
               block.rows[j] = rowsBase + block.ranks[j] * rowStride;
             }
+            if (prefetch.active()) {
+              if (domain == nullptr) {
+                adviseAhead(block.ranks.front());
+              } else {
+                for (const char* row : block.rows) prefetch.add(row, (size_t)rowStride);
+                prefetch.flush();
+              }
+            }
             scorer.scoreRows(block.rows.data(), block.rows.size(), block.scores.data());
+            prefetch.refresh();
           } else {
             std::fill(block.scores.begin(), block.scores.end(), 0.0f);
           }
@@ -1690,8 +1720,14 @@ public:
         if constexpr (Groups) {
           // Group admission checks competitiveness per hit before the key
           // lookup, so this path scores row by row.
+          int64_t scoredRows = 0;
           auto rowScore = [&](int64_t r) {
-            return scorer.scoresColumn() ? scorer.score(rowsBase + r * rowStride) : 0.0f;
+            if (!scorer.scoresColumn()) return 0.0f;
+            if ((++scoredRows & (SCAN_BLOCK_ROWS - 1)) == 0) {
+              prefetch.refresh();
+              adviseAhead(r);
+            }
+            return scorer.score(rowsBase + r * rowStride);
           };
           auto scan = [&](auto emit) {
             if (v2d.mono != nullptr) {
@@ -1828,6 +1864,8 @@ public:
       // Rows per batched scoring call: enough to amortize the per-block
       // dispatch, small enough that the block's scores stay in L1.
       static constexpr size_t SCAN_BLOCK_ROWS = 64;
+      // Read-ahead window of an unfiltered scan over a cold column.
+      static constexpr size_t SCAN_PREFETCH_BYTES = 8 * 1024 * 1024;
 
       struct ScanBlock {
         std::vector<int64_t> ranks;
@@ -2655,7 +2693,7 @@ private:
             rows[c - bucketBegin] = rowsBase + rank * rowStride;
           }
           exactScores.resize(rows.size());
-          scorer->scoreRows(rows.data(), rows.size(), exactScores.data());
+          scoreRowsPrefetched(*scorer, rows, (size_t)rowStride, exactScores.data());
         }
       }
 
@@ -2733,6 +2771,37 @@ private:
     RescoreAccumulator<Groups>* acc = merger.getData();
     docHits = acc->heap.take();
     std::sort(docHits.begin(), docHits.end(), betterDoc);
+  }
+
+  // Candidate rows ahead of the scoring cursor with read-ahead in flight on a
+  // cold column (each row is at most two pages), and rows per scoring call.
+  static constexpr size_t RESCORE_PREFETCH_ROWS = 1024;
+  static constexpr size_t RESCORE_CHUNK_ROWS = 64;
+
+  /// scorer.scoreRows over rank-sorted candidate rows, with read-ahead when
+  /// the column is not resident (see PagePrefetcher): the rows' pages are
+  /// advised RESCORE_PREFETCH_ROWS ahead so their reads overlap instead of
+  /// faulting one at a time.
+  static void scoreRowsPrefetched(const VectorScorer& scorer, std::span<const char* const> rows,
+                                  size_t rowBytes, float* out) {
+    if (rows.empty()) return;
+    PagePrefetcher prefetch;
+    prefetch.probe(rows.front());
+    prefetch.probe(rows[rows.size() / 2]);
+    size_t advised = 0;
+    for (size_t at = 0; at < rows.size(); at += RESCORE_CHUNK_ROWS) {
+      size_t n = std::min(RESCORE_CHUNK_ROWS, rows.size() - at);
+      if (prefetch.active() && advised < rows.size()
+          && advised < at + RESCORE_PREFETCH_ROWS / 2) {
+        size_t target = std::min(rows.size(), at + RESCORE_PREFETCH_ROWS);
+        for (advised = std::max(advised, at); advised < target; advised++) {
+          prefetch.add(rows[advised], rowBytes);
+        }
+        prefetch.flush();
+      }
+      scorer.scoreRows(rows.data() + at, n, out + at);
+      prefetch.refresh();
+    }
   }
 
   static float finiteScore(float score) {
