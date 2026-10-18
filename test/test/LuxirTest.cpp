@@ -95,10 +95,7 @@ static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
   }
   if (auto* l = dynamic_cast<const StoredFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const StoredFieldType*>(&rhs);
-    return r != nullptr
-           && l->codec_ == r->codec_
-           && l->chunkTargetUncompressed_ == r->chunkTargetUncompressed_
-           && l->maxDocsPerChunk_ == r->maxDocsPerChunk_;
+    return r != nullptr && l->format_ == r->format_;
   }
   return typeid(lhs) == typeid(rhs);
 }
@@ -230,6 +227,13 @@ TEST(LuxirTestHarnessTest, effortScaling) {
 
   luxir::LuxirTest::effort = 8;
   EXPECT_EQ(200, luxir::LuxirTest::scaleTestDimension(100, 3));
+}
+
+// Read by jemalloc when it is the process allocator (unused otherwise). The debug
+// preset links jemalloc's debug build, whose junk filling of every allocation and
+// free costs more than the tests themselves; its assertions stay on.
+extern "C" {
+const char* malloc_conf = "junk:false";
 }
 
 // global argc/argv

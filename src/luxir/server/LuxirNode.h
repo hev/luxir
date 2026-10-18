@@ -4,7 +4,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -31,19 +33,28 @@ class LuxirNode;
 class ReplicationSource;
 class CommitWaits;
 class ReplicationFollower;
+class Scrubber;
 
 class LuxirNode {
 public:
   static constexpr std::string_view kDefaultCollectionName = Collections::kDefaultCollectionName;
   using CollectionEntry = Collections::Entry;
 
+  using Clock = std::chrono::steady_clock;
+  using Now = std::function<Clock::time_point()>;
+
   LuxirNode() : LuxirNode(LuxirConfig{}) {}
   enum class Mode { SERVE, PULL };
-  explicit LuxirNode(LuxirConfig config, Mode mode = Mode::SERVE);
+  // `clock` times replication: commit waits, follower liveness and sync retries.
+  explicit LuxirNode(LuxirConfig config, Mode mode = Mode::SERVE, Now clock = Clock::now);
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }
+  Clock::time_point now() const { return clock(); }
   ReplicationFollower* getFollower() { return follower.get(); }
+  // Checksum scrub of published snapshots; runs periodically only when
+  // store.scrub-interval-s is set, but scrub() works on demand regardless.
+  Scrubber& getScrubber() { return *scrubber; }
   bool following() const { return !config.replication.source.empty(); }
   ReplicationSource& getReplication() { return *replication; }
   CommitWaits& getCommitWaits() { return *commitWaits; }
@@ -132,6 +143,7 @@ private:
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
 
   LuxirConfig config;
+  Now clock;
 
   // Query work.  Workers: server.workers (resolveWorkers(); at least
   // one, since an arena of only reserved slots never serves enqueued tasks).
@@ -186,6 +198,7 @@ private:
   std::shared_ptr<CollectionEvents> events; // ordered feed of the collection map
   std::unique_ptr<Collections> collections_;
   std::unique_ptr<ReplicationFollower> follower;
+  std::unique_ptr<Scrubber> scrubber;
   std::unique_ptr<SearchEngine> searchEngine;
 };
 

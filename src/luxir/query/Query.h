@@ -22,6 +22,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/search/IndexReader.h"
@@ -63,6 +64,7 @@ enum class QueryKind : uint8_t {
   ALL,
   NONE,
   RESCORE,
+  MIN_SCORE,
   TEST,
 };
 
@@ -1260,12 +1262,9 @@ public:
       return result;
     }
 
-    // code must have static storage duration.
+    // code must have static storage duration. Repeats are dropped.
     void warn(std::string_view code, std::string_view message) {
-      if (warnings == nullptr) return;
-      char* copy = pool.alloc(message.size());
-      std::memcpy(copy, message.data(), message.size());
-      warnings->push_back({code, std::string_view(copy, message.size())});
+      if (warnings != nullptr) addWarning(*warnings, pool, code, message);
     }
 
   };

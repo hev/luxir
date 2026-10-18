@@ -347,6 +347,14 @@ IndexWriter::~IndexWriter() {
   flushingInverters.clear();
 }
 
+void IndexWriter::fail(std::string reason) {
+  std::lock_guard publicationLock(publicationMutex);
+  if (failed.load(std::memory_order_acquire)) return;
+  failureReason = std::make_shared<const std::string>(std::move(reason));
+  failed.store(true, std::memory_order_release);
+  snapshots.fail();
+}
+
 void IndexWriter::close() {
   // Fatal publication can happen inside a graph task. Drain here even when
   // already marked, never recursively from the publishing task itself.
@@ -2327,10 +2335,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       PostingsWriter pwriter(dir, outputSegId);
 
       phase = "segment_merge";
-      // Do the actual merge.
+      // Do the actual merge.  The current schema chooses each stored-fields
+      // resource's output format.
+      auto mergeSchema = getSchema();
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
-                           termPartitionMaxRanges);
+                           termPartitionMaxRanges, *mergeSchema);
       merger.merge();
 
       phase = "new_segment_info";
