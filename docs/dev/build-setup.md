@@ -218,7 +218,22 @@ Shared state lives outside the checkout, so a new worktree reuses it:
   corrupt it.
 
 Build directories and per-build installs (such as `build/arm64-deps`) stay in
-each worktree.
+each worktree. With `-DLUXIR_CCACHE_RELATIVE_PATHS=ON` they must physically be
+there: ccache rewrites paths relative to the real working directory, so a build
+directory outside the worktree (through `-B` or a `build/` symlink) puts the
+worktree's name in every hashed path and never hits another worktree's objects.
+
+`tools/worktree add NAME [START]` creates a worktree on a new branch (from
+`origin/main` by default) under `LUXIR_WORKTREE_ROOT` (default
+`<main checkout>-wt`), with the submodule and FastPFOR fetched.
+`tools/worktree remove NAME` deletes it with its builds, refusing uncommitted
+or unpushed work without `-f`, and `tools/worktree list` shows each worktree
+with its build size. Worktrees are cheap to recreate, so on a machine whose
+source disk is short of space, point `LUXIR_WORKTREE_ROOT` at a larger one:
+build directories are 10 to 20 GB per worktree. Prefer a directory that
+systemd-tmpfiles does not age out (check `tmpfiles.d` for `/tmp` and
+`/var/tmp`): aging deletes files untouched for its period even without a
+reboot, including sources of a long-lived worktree.
 
 ## Fresh checkout / after `rm -rf build/`
 
