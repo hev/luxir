@@ -41,7 +41,7 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   }
   if (auto* vector = dynamic_cast<VectorFieldType*>(&type)) {
     properties["dims"] = std::to_string(vector->dims());
-    static constexpr const char* metrics[] = {"none", "l2", "ip", "cosine"};
+    static constexpr const char* metrics[] = {"none", "l2", "ip", "cosine", "hamming"};
     properties["metric"] = "\"" + std::string(metrics[vector->metric()]) + "\"";
     properties["normalize_on_write"] = vector->normalizeOnWrite() ? "true" : "false";
     properties["normalized"] = vector->metric() == VectorFieldType::METRIC_COSINE && vector->normalized()

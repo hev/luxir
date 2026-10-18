@@ -213,6 +213,11 @@ private:
           "field '{}': {}expected dims={}, got {}",
           std::string_view(fieldName), prefix(), expected, n));
     }
+    if (encoding == VectorEncoding::BIT && n % 8 != 0) {
+      throw DocumentError(fmt::format(
+          "field '{}': {}bit vectors need dims that are a multiple of 8, got {}",
+          std::string_view(fieldName), prefix(), n));
+    }
     // Every element must be finite, whatever arm it arrived in (a double past
     // float32 range has narrowed to inf). One branch-free pass over the exponent
     // bits; only a failure goes back for the first bad index.

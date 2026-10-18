@@ -1766,7 +1766,7 @@ private:
     for (auto* f : sortedFields) {
       if (f == nullptr || !isVector) continue;
       auto e = (VectorEncoding)f->segFieldInfo.vectorEncoding;
-      if (firstEncoding || vcodec::precision(e) > vcodec::precision(outEncoding)) outEncoding = e;
+      outEncoding = firstEncoding ? e : vcodec::mergeEncoding(outEncoding, e);
       firstEncoding = false;
     }
     outputFieldInfo.vectorEncoding = (int32_t)outEncoding;

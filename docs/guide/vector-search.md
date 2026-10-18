@@ -147,7 +147,8 @@ POST /collections/books/_schema
 }
 ```
 
-Metrics are `l2`, `ip` (inner product), and `cosine`. Set a positive `dims`
+Metrics are `l2`, `ip` (inner product), `cosine`, and `hamming` (binary
+vectors, see [Binary vectors](#binary-vectors)). Set a positive `dims`
 to fix the dimension for indexed and query vectors across the collection.
 When omitted, the first vector in each segment establishes the dimension.
 
@@ -165,9 +166,13 @@ it. `encoding` chooses how each vector is stored:
 |---|---|---|
 | `f32` (default) | `4 * dims` | the float32 values |
 | `f16` | `2 * dims` | IEEE half precision per element |
+| `bf16` | `2 * dims` | bfloat16 per element: the float32 rounded to its high 16 bits |
 | `int8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
+| `bit` | `dims / 8` | one bit per dimension, for `hamming` fields (see [Binary vectors](#binary-vectors)) |
 
-At 768 dimensions that is 3072, 1536, and 776 bytes per vector. Fields
+At 768 dimensions that is 3072, 1536, 1536, 776, and 96 bytes per vector.
+`f16` keeps more precision per element (10 significand bits against 7), `bf16`
+keeps the full float32 range. Fields
 whose scoring needs each stored vector's norm also store it once, 4 more bytes
 per vector, so searches never recompute it: cosine over `f16` or `int8`,
 cosine with `normalize_on_write: false`, and `int8` with `l2`.
@@ -191,13 +196,13 @@ statistics. Merges copy stored vectors unchanged. Cosine vectors are
 normalized before they are quantized.
 
 Encoded fields reject vectors with non-finite elements (NaN or infinity), and
-`f16` also rejects elements whose magnitude exceeds 65504. A constant vector
-is valid under `int8`.
+`f16` also rejects elements whose magnitude exceeds 65504. `bf16` needs no
+range check. A constant vector is valid under `int8`.
 
 Search scores the query, which stays float32, against the stored encoding:
 `exact: true`, the scan of segments without an overlay, and the rescore of
 approximate candidates are all exact over the stored vectors, not over the
-vectors you submitted. Cosine over `f16` and `int8` divides by the norm of the
+vectors you submitted. Cosine over `f16`, `bf16` and `int8` divides by the norm of the
 stored vector, so scores remain cosines. Vectors read back in `fields` are the
 stored values decoded to float32.
 
@@ -211,7 +216,39 @@ the exact input.
 `encoding` and `keep_original` apply to segments written after the change.
 Existing segments keep the encoding they were written with, and a merge of
 segments with different encodings writes the most precise of them, so a merge
-never loses precision. To re-encode existing data, reindex it.
+never loses precision (`f16` and `bf16` together merge to `f32`). To re-encode
+existing data, reindex it.
+
+### Binary vectors
+
+Binary embeddings (and SimHash-style fingerprints) use `metric: "hamming"`,
+which stores one bit per dimension (`encoding: "bit"`, the default and only
+encoding for it). `dims` must be a multiple of 8:
+
+```json
+{
+  "fields": {
+    "fingerprint_v": {
+      "type": "vector",
+      "dims": 256,
+      "metric": "hamming"
+    }
+  }
+}
+```
+
+Index and query vectors are ordinary number arrays of `dims` elements; an
+element sets its bit when it is greater than 0, so the sign of a float
+embedding binarizes it. Read back in `fields`, a bit vector is its bits as
+`0` and `1`. The score is `1 - hamming_distance / dims`, from `1` for
+identical bits down to `0`. Search scans the column exactly with a SIMD
+popcount; commits build no approximate index for `hamming` fields, and a
+`bit` column is 32 times smaller than `f32`.
+
+`bit` requires `hamming` (or `metric: "none"` for storage only), and
+`hamming` requires `bit`. Changing a field between `bit` and another
+encoding needs a reindex: older segments cannot be scored under the new
+metric.
 
 ## Index vectors
 
@@ -684,7 +721,8 @@ only work limiter.
 ### Scoring
 
 L2 scores are `1 / (1 + squared_distance)`. Inner product scores are the dot
-product. Cosine is inner product over normalized vectors. The score
+product. Cosine is inner product over normalized vectors. Hamming scores are
+`1 - hamming_distance / dims`. The score
 distribution depends on the embedding model and corpus, so calibrate
 thresholds per deployment.
 
