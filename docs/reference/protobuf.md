@@ -844,8 +844,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
-| <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 17 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to F32. F16 and INT8 reject non-finite elements; F16 also rejects magnitudes above 65504. Applies to newly written segments. |
-| <a id="field-luxir.fielddef.keep_original"></a>[`keep_original`](#field-luxir.fielddef.keep_original) | 18 | `bool` | optional | VECTOR only. Also keep the submitted float32 vectors in a separate cold column that searches never read, so the field can be re-encoded later. Unset inherits, falling back to false. |
+| <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 20 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to F32. F16 and INT8 reject non-finite elements; F16 also rejects magnitudes above 65504. Applies to newly written segments. |
+| <a id="field-luxir.fielddef.keep_original"></a>[`keep_original`](#field-luxir.fielddef.keep_original) | 21 | `bool` | optional | VECTOR only. Also keep the submitted float32 vectors in a separate cold column that searches never read, so the field can be re-encoded later. Unset inherits, falling back to false. |
 
 <a id="message-luxir.fielddefaults"></a>
 
