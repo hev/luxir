@@ -234,6 +234,40 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
                                   maxEdits, prefixLength, fuzzyQuery.max_expansions);
 }
 
+// KnnQuery.queries packed into one pool array of queryCount * dims floats.
+static std::span<const float> packKnnQueries(MemPool& pool, const luxir::api::KnnQuery& knnQuery,
+                                             const VectorFieldType& vectorType,
+                                             std::string_view field) {
+  if (knnQuery.query.has_value()) {
+    throw std::runtime_error(std::format(
+      "KnnQuery for field '{}' sets both query and queries", field));
+  }
+  if (!vectorType.maxSim()) {
+    throw std::runtime_error(std::format(
+      "KnnQuery queries requires a field with multi_vector_scoring maxsim (field '{}')", field));
+  }
+  if (knnQuery.queries.size() > luxir::KnnQuery::MAX_QUERY_VECTORS) {
+    throw std::runtime_error(std::format(
+      "KnnQuery for field '{}' has {} query vectors; at most {}", field, knnQuery.queries.size(),
+      luxir::KnnQuery::MAX_QUERY_VECTORS));
+  }
+  size_t dims = 0;
+  for (const auto& vec : knnQuery.queries) {
+    size_t n = vec.f32.has_value() ? vec.f32->v.size() : 0;
+    if (n == 0 || (dims != 0 && n != dims)) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}': every query vector must be non-empty with the same dims", field));
+    }
+    dims = n;
+  }
+  auto packed = pool.make_span<float>(dims * knnQuery.queries.size());
+  for (size_t i = 0; i < knnQuery.queries.size(); i++) {
+    const auto& v = knnQuery.queries[i].f32->v;
+    std::copy(v.begin(), v.end(), packed.begin() + (ptrdiff_t)(i * dims));
+  }
+  return packed;
+}
+
 luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery) {
   const auto& target = context.fields.resolve(knnQuery.field, OpClass::PRIMARY, context.opName);
   auto field = api::build::arenaStr(pool, target.physicalName);
@@ -245,22 +279,29 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   if (!vectorType.knnSearchable()) {
     throw std::runtime_error(std::format("KnnQuery on vector field without metric: {}", field));
   }
-  if (!knnQuery.query.has_value() || !knnQuery.query->f32.has_value()) {
-    throw std::runtime_error(std::format(
-      "KnnQuery for field '{}' is missing query vector (only f32 supported in v1)", field));
+  std::span<const float> queryVec;
+  int32_t queryCount = 1;
+  if (!knnQuery.queries.empty()) {
+    queryVec = packKnnQueries(pool, knnQuery, vectorType, field);
+    queryCount = (int32_t)knnQuery.queries.size();
+  } else {
+    if (!knnQuery.query.has_value() || !knnQuery.query->f32.has_value()) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' is missing query vector (only f32 supported in v1)", field));
+    }
+    const auto& f32 = knnQuery.query->f32->v;
+    // The repeated float field is contiguous; the request storage outlives the
+    // pool-allocated query tree (request arena), so pointing into it is safe.
+    queryVec = std::span<const float>(f32.data(), (size_t)f32.size());
   }
-  const auto& f32 = knnQuery.query->f32->v;
-  // The repeated float field is contiguous; the request storage outlives the
-  // pool-allocated query tree (request arena), so pointing into it is safe.
-  std::span<const float> queryVec(f32.data(), (size_t)f32.size());
   if (queryVec.empty()) {
     throw std::runtime_error(std::format(
       "KnnQuery for field '{}' must have a non-empty query vector", field));
   }
-  if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims()) {
+  if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims() * queryCount) {
     throw std::runtime_error(std::format(
       "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-      queryVec.size(), vectorType.dims(), field));
+      queryVec.size() / (size_t)queryCount, vectorType.dims(), field));
   }
 
   int32_t k = knnQuery.k;
@@ -288,10 +329,14 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   if (groups && context.collapse == nullptr) {
     throw std::runtime_error("knn.unit groups requires an enclosing collapse");
   }
+  if (groups && queryCount > 1) {
+    throw std::runtime_error("knn.unit groups does not support several query vectors (queries)");
+  }
   return pool.make<luxir::KnnQuery>(
     field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
-    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr);
+    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr, queryCount);
 }
+
 
 std::span<Query*> ProtobufQueryParser::parseQueryList(
     std::span<const luxir::api::Query> queries) {

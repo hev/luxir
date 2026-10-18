@@ -319,6 +319,9 @@ public:
   // Also store the submitted float32 vectors in a cold companion column
   // (originalColumnName) that the query path never reads.
   bool keepOriginal_;
+  // Multi-valued only: KnnQuery with several query vectors scores late
+  // interaction (sum over query vectors of the best document vector).
+  bool maxSim_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
                   int flags = COLUMN_STORED | FIXED_SIZE,
@@ -326,14 +329,16 @@ public:
                   bool normalized = false,
                   bool normalizeOnWrite = true,
                   VectorEncoding encoding = VectorEncoding::F32,
-                  bool keepOriginal = false)
+                  bool keepOriginal = false,
+                  bool maxSim = false)
     : FieldType(name, FieldType::VECTOR, flags),
       dims_(dims),
       metric_(metric),
       normalized_(normalized),
       normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
       encoding_(encoding),
-      keepOriginal_(keepOriginal) {
+      keepOriginal_(keepOriginal),
+      maxSim_(maxSim) {
   }
 
   // Physical name of the keep_original companion column.  The '#' makes it an
@@ -355,14 +360,18 @@ public:
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
   VectorEncoding encoding() const { return encoding_; }
   bool keepOriginal() const { return keepOriginal_; }
+  bool maxSim() const { return maxSim_; }
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
 
   // True iff commits may build an ANN overlay for this field.  HAMMING has no
-  // ANN index: bit columns are small and scanned exactly.
-  bool annIndexable() const { return knnSearchable() && metric_ != METRIC_HAMMING; }
+  // ANN index: bit columns are small and scanned exactly.  Neither has MaxSim:
+  // late interaction is scored exactly over a document's whole vector set.
+  bool annIndexable() const {
+    return knnSearchable() && metric_ != METRIC_HAMMING && !maxSim_;
+  }
 };
 
 // Describes a stored-fields resource (a per-segment column of LZ4-compressed
