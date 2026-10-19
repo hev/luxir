@@ -235,7 +235,31 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
                                   maxEdits, prefixLength, fuzzyQuery.max_expansions);
 }
 
-// KnnQuery.queries packed into one pool array of queryCount * dims floats.
+// Query vectors follow the same input contract as indexed ones and are cut to
+// the same stored prefix, so a query is scored exactly like the indexed
+// vectors.  Returns the stored prefix of vec.
+static std::span<const float> knnStoredQuery(const VectorFieldType& vectorType,
+                                             std::span<const float> vec, std::string_view field) {
+  if (std::string err = vectorType.inputError(vec); !err.empty()) {
+    throw std::runtime_error(std::format(
+      "KnnQuery: query vector for field '{}': {}", field, err));
+  }
+  vec = vec.first(vectorType.storedSize(vec.size()));
+  if (vectorType.metric() == VectorFieldType::METRIC_COSINE) {
+    // No direction to compare (possibly only after truncation): every
+    // candidate would score 0.
+    double normSq = 0.0;
+    for (float x : vec) normSq += (double)x * (double)x;
+    if (normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) {
+      throw std::runtime_error(std::format(
+        "KnnQuery: cosine query vector for field '{}' has zero norm", field));
+    }
+  }
+  return vec;
+}
+
+// KnnQuery.queries packed into one pool array of queryCount * stored dims
+// floats, each validated and cut by knnStoredQuery.
 static std::span<const float> packKnnQueries(MemPool& pool, const luxir::api::KnnQuery& knnQuery,
                                              const VectorFieldType& vectorType,
                                              std::string_view field) {
@@ -261,10 +285,12 @@ static std::span<const float> packKnnQueries(MemPool& pool, const luxir::api::Kn
     }
     dims = n;
   }
-  auto packed = pool.make_span<float>(dims * knnQuery.queries.size());
+  size_t stored = vectorType.storedSize(dims);
+  auto packed = pool.make_span<float>(stored * knnQuery.queries.size());
   for (size_t i = 0; i < knnQuery.queries.size(); i++) {
     const auto& v = knnQuery.queries[i].f32->v;
-    std::copy(v.begin(), v.end(), packed.begin() + (ptrdiff_t)(i * dims));
+    auto vec = knnStoredQuery(vectorType, std::span<const float>(v.data(), (size_t)v.size()), field);
+    std::copy(vec.begin(), vec.end(), packed.begin() + (ptrdiff_t)(i * stored));
   }
   return packed;
 }
@@ -294,15 +320,11 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     // The repeated float field is contiguous; the request storage outlives the
     // pool-allocated query tree (request arena), so pointing into it is safe.
     queryVec = std::span<const float>(f32.data(), (size_t)f32.size());
-  }
-  if (queryVec.empty()) {
-    throw std::runtime_error(std::format(
-      "KnnQuery for field '{}' must have a non-empty query vector", field));
-  }
-  if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims() * queryCount) {
-    throw std::runtime_error(std::format(
-      "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-      queryVec.size() / (size_t)queryCount, vectorType.dims(), field));
+    if (queryVec.empty()) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' must have a non-empty query vector", field));
+    }
+    queryVec = knnStoredQuery(vectorType, queryVec, field);
   }
 
   int32_t k = knnQuery.k;
