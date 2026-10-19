@@ -48,6 +48,7 @@ struct Fields {
   api::VectorEncoding encoding = api::VectorEncoding::F32;
   bool keepOriginal = false;
   bool multi = false;
+  std::optional<api::VectorAnnDef> ann;
 };
 
 // ref_v is the f32 reference; enc_v stores the same values in the encoding.
@@ -61,6 +62,10 @@ void installFields(Collection& col, const Fields& f) {
     def.encoding = encoding;
     def.multi = f.multi;
     if (encoding == f.encoding) def.keep_original = f.keepOriginal;
+    if (f.ann) {
+      def.dims = DIMS;
+      def.ann = f.ann;
+    }
   }
   b.set(col);
 }
@@ -108,31 +113,16 @@ std::vector<std::string> rows(CollectionHelper& h, std::string_view field,
   return out;
 }
 
-struct IvfPqGuard {
-  bool ivfPq = VectorIndexBuilder::buildFaissIvfPqAuxIndexes;
-  int32_t nlist = VectorIndexBuilder::ivfPqNList;
-  int32_t m = VectorIndexBuilder::ivfPqM;
-  int32_t bits = VectorIndexBuilder::ivfPqBits;
-  int64_t minTraining = VectorIndexBuilder::ivfPqMinTrainingVectors;
-  int64_t threshold = VectorIndexBuilder::ivfPqBuildThresholdScanCost;
-
-  IvfPqGuard() {
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-    VectorIndexBuilder::ivfPqNList = 4;
-    VectorIndexBuilder::ivfPqM = 2;
-    VectorIndexBuilder::ivfPqBits = 2;
-    VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
-    VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-  }
-  ~IvfPqGuard() {
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = ivfPq;
-    VectorIndexBuilder::ivfPqNList = nlist;
-    VectorIndexBuilder::ivfPqM = m;
-    VectorIndexBuilder::ivfPqBits = bits;
-    VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
-    VectorIndexBuilder::ivfPqBuildThresholdScanCost = threshold;
-  }
-};
+// Small IVF+PQ overlay settings for the tiny test corpus.
+api::VectorAnnDef smallPqAnn() {
+  api::VectorAnnDef ann;
+  ann.codec = api::VectorAnnDef::Codec::PQ;
+  ann.nlist = 4;
+  ann.pq.emplace();
+  ann.pq->m = 2;
+  ann.pq->bits = 2;
+  return ann;
+}
 
 } // namespace
 
@@ -332,13 +322,14 @@ TEST_F(VectorEncodingTest, partialOriginalColumnIsIgnored) {
 // IVF+PQ overlays build from f16 / int8 columns (and from the original
 // column when kept); rescored ANN results match exact search.
 TEST_F(VectorEncodingTest, annOverlayBuildsFromEncodedColumn) {
-  IvfPqGuard guard;
+  IvfTestGuard guard(/*minTraining=*/16);
   for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
     for (bool keep : {false, true}) {
       CollectionHelper h("main");
       h.clear();
       installFields(h.collection(), {.metric = api::VectorMetric::COSINE,
-                                     .encoding = encoding, .keepOriginal = keep});
+                                     .encoding = encoding, .keepOriginal = keep,
+                                     .ann = smallPqAnn()});
       for (int i = 0; i < 160; i++) {
         Vec v = docVec(i % 30);
         v[(size_t)(i % DIMS)] += 0.001f * (float)i;
