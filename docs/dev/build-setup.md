@@ -228,16 +228,14 @@ symlink shares normally.
 `tools/worktree add NAME [START]` creates a worktree under
 `LUXIR_WORKTREE_ROOT` (default `<main checkout>-wt`) with the submodule and
 FastPFOR fetched. It checks out branch NAME, creating it from START (default:
-the main checkout's HEAD) if it does not exist.
-`tools/worktree remove NAME` deletes it with its builds and keeps its branch.
-Without `-f` it refuses when that would lose uncommitted changes or commits on
-no branch, tag, or remote, including a submodule's. `tools/worktree list` shows
-each worktree with its build size. Worktrees are cheap to recreate, so on a machine whose
-source disk is short of space, point `LUXIR_WORKTREE_ROOT` at a larger one:
-build directories are 10 to 20 GB per worktree. Prefer a directory that
-systemd-tmpfiles does not age out (check `tmpfiles.d` for `/tmp` and
-`/var/tmp`): aging deletes files untouched for its period even without a
-reboot, including sources of a long-lived worktree.
+the main checkout's HEAD) if it does not exist. `tools/worktree remove NAME`
+deletes a worktree with its builds and keeps its branch. Without `-f` it
+refuses when that would lose uncommitted changes or commits on no branch, tag,
+or remote, including a submodule's. `tools/worktree list` shows each worktree
+with its build size. Build directories take 10 to 20 GB per worktree, so on a
+machine whose source disk is short of space, point `LUXIR_WORKTREE_ROOT` at a
+larger one. Avoid `/tmp` and `/var/tmp`, where systemd-tmpfiles can delete
+files left untouched for days.
 
 ## Fresh checkout / after `rm -rf build/`
 

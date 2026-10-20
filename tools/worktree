@@ -3,14 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Creates Luxir worktrees ready to build, and removes them with their builds.
-# Worktrees live under LUXIR_WORKTREE_ROOT (default: <main checkout>-wt).
-#
-# With -DLUXIR_CCACHE_RELATIVE_PATHS=ON, ccache shares objects between
-# worktrees only when each build directory is physically inside its worktree
-# (the presets' build/<preset>): ccache rewrites paths relative to the real
-# working directory, so a build directory elsewhere, even behind a build/
-# symlink, puts the worktree name into every hashed path. To keep builds off a
-# full disk, move the worktrees there instead.
+# Worktrees live under LUXIR_WORKTREE_ROOT (default: <main checkout>-wt). See
+# docs/dev/build-setup.md for sharing ccache objects between them.
 #
 # Usage:
 #   tools/worktree add NAME [START]    branch NAME, created from START (default HEAD) if new
