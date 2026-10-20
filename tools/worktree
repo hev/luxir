@@ -14,7 +14,7 @@
 #
 # Usage:
 #   tools/worktree add NAME [START]    new branch NAME from START (default origin/main)
-#   tools/worktree remove [-f] NAME    refuses uncommitted or unpushed work without -f
+#   tools/worktree remove [-f] NAME    keeps the branch; refuses to lose work without -f
 #   tools/worktree list
 set -euo pipefail
 
@@ -58,8 +58,13 @@ case $cmd in
         echo "$dir has uncommitted changes; commit them or pass -f" >&2
         exit 1
       fi
-      if [[ -n $(git -C "$dir" rev-list HEAD --not --remotes) ]]; then
-        echo "$dir has commits on no remote; push them or pass -f" >&2
+      # The branch is kept, so removal loses only commits that no ref reaches: a
+      # detached HEAD's, or a submodule's, whose repository lives in the
+      # worktree's metadata and goes with it.
+      unreachable='git rev-list HEAD --not --branches --tags --remotes'
+      lost=$(cd "$dir" && $unreachable && git submodule foreach --quiet --recursive "$unreachable")
+      if [[ -n $lost ]]; then
+        echo "$dir has commits on no branch, tag, or remote (detached HEAD or a submodule); keep them on a branch or pass -f" >&2
         exit 1
       fi
     fi

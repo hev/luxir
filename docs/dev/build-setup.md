@@ -228,9 +228,10 @@ symlink shares normally.
 `tools/worktree add NAME [START]` creates a worktree on a new branch (from
 `origin/main` by default) under `LUXIR_WORKTREE_ROOT` (default
 `<main checkout>-wt`), with the submodule and FastPFOR fetched.
-`tools/worktree remove NAME` deletes it with its builds, refusing uncommitted
-or unpushed work without `-f`, and `tools/worktree list` shows each worktree
-with its build size. Worktrees are cheap to recreate, so on a machine whose
+`tools/worktree remove NAME` deletes it with its builds and keeps its branch.
+Without `-f` it refuses when that would lose uncommitted changes or commits on
+no branch, tag, or remote, including a submodule's. `tools/worktree list` shows
+each worktree with its build size. Worktrees are cheap to recreate, so on a machine whose
 source disk is short of space, point `LUXIR_WORKTREE_ROOT` at a larger one:
 build directories are 10 to 20 GB per worktree. Prefer a directory that
 systemd-tmpfiles does not age out (check `tmpfiles.d` for `/tmp` and
