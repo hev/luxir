@@ -225,9 +225,10 @@ worktree's name in every hashed path and never hits another worktree's objects.
 Configure warns about such a build directory. A worktree reached through a
 symlink shares normally.
 
-`tools/worktree add NAME [START]` creates a worktree on a new branch (from
-`origin/main` by default) under `LUXIR_WORKTREE_ROOT` (default
-`<main checkout>-wt`), with the submodule and FastPFOR fetched.
+`tools/worktree add NAME [START]` creates a worktree under
+`LUXIR_WORKTREE_ROOT` (default `<main checkout>-wt`) with the submodule and
+FastPFOR fetched. It checks out branch NAME, creating it from START (default:
+the main checkout's HEAD) if it does not exist.
 `tools/worktree remove NAME` deletes it with its builds and keeps its branch.
 Without `-f` it refuses when that would lose uncommitted changes or commits on
 no branch, tag, or remote, including a submodule's. `tools/worktree list` shows

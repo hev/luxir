@@ -13,12 +13,12 @@
 # full disk, move the worktrees there instead.
 #
 # Usage:
-#   tools/worktree add NAME [START]    new branch NAME from START (default origin/main)
+#   tools/worktree add NAME [START]    branch NAME, created from START (default HEAD) if new
 #   tools/worktree remove [-f] NAME    keeps the branch; refuses to lose work without -f
 #   tools/worktree list
 set -euo pipefail
 
-repo=$(git rev-parse --path-format=absolute --git-common-dir)
+repo=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir)
 repo=${repo%/.git}
 root=${LUXIR_WORKTREE_ROOT:-$repo-wt}
 
@@ -27,20 +27,32 @@ usage() {
   exit 1
 }
 
+# Prints the worktrees other than the main checkout at path $1 or ending in /$1,
+# so a worktree is still found after LUXIR_WORKTREE_ROOT changes.
+find_worktrees() {
+  local dir
+  git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r dir; do
+    if [[ $dir != "$repo" && ( $dir == "$1" || $dir == */"$1" ) ]]; then
+      echo "$dir"
+    fi
+  done
+}
+
 cmd=${1:-}
 (( $# )) && shift
 case $cmd in
   add)
     (( $# >= 1 && $# <= 2 )) || usage
-    name=$1 start=${2:-origin/main}
+    name=$1
     dir=$root/$name
     mkdir -p "$root"
-    git -C "$repo" worktree add -b "$name" "$dir" "$start"
-    git -C "$dir" submodule update --init
-    # Clone FastPFOR from the main checkout when it has one, not the network.
-    if [[ -d $repo/deps/FastPFOR/.git ]]; then
-      export FASTPFOR_REPO=file://$repo/deps/FastPFOR
+    if (( $# == 1 )) && git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
+      git -C "$repo" worktree add "$dir" "$name"
+    else
+      # Without START, git branches from the main checkout's HEAD.
+      git -C "$repo" worktree add -b "$name" "$dir" ${2:+"$2"}
     fi
+    git -C "$dir" submodule update --init
     "$dir/deps/fetch_sources.sh"
     echo "Worktree ready: $dir"
     ;;
@@ -51,8 +63,15 @@ case $cmd in
       shift
     fi
     (( $# == 1 )) || usage
-    dir=$root/$1
-    [[ -d $dir ]] || { echo "No worktree at $dir" >&2; exit 1; }
+    mapfile -t dirs < <(find_worktrees "$1")
+    case ${#dirs[@]} in
+      1) dir=${dirs[0]} ;;
+      0) echo "No worktree named $1" >&2; exit 1 ;;
+      *) echo "$1 names several worktrees; pass one as a full path:" >&2
+         printf '  %s\n' "${dirs[@]}" >&2
+         exit 1 ;;
+    esac
+    [[ -d $dir ]] || { echo "$dir is missing; git worktree prune drops it" >&2; exit 1; }
     if (( !force )); then
       if [[ -n $(git -C "$dir" status --porcelain) ]]; then
         echo "$dir has uncommitted changes; commit them or pass -f" >&2
