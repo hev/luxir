@@ -182,17 +182,28 @@ endif()
 # the launcher rather than relying on each developer's global ccache config.
 # LUXIR_CCACHE_RELATIVE_PATHS shares objects between checkouts and worktrees at different
 # paths: CCACHE_BASEDIR makes the paths ccache hashes relative, and the prefix map makes
-# the debug info's compilation directory relative to the checkout. It is off by default
-# because compiler diagnostics and __FILE__ then name sources relative to the build
-# directory, and debuggers resolve sources from the checkout root.
+# the debug info's compilation directory relative to the checkout. PWD gives ccache the
+# build directory as configured (Ninja runs every compile there, and ccache ignores a PWD
+# naming another directory), so the prefix map still applies to a checkout reached through
+# a symlink. Relative paths only match between checkouts when the build directory is
+# physically inside its checkout. It is off by default because compiler diagnostics and
+# __FILE__ then name sources relative to the build directory, and debuggers resolve
+# sources from the checkout root.
 option(LUXIR_CCACHE_RELATIVE_PATHS "Use checkout-relative paths so ccache shares objects across checkouts" OFF)
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
   list(APPEND _luxir_compile_launcher "${CMAKE_COMMAND}" -E env CCACHE_SLOPPINESS=pch_defines,time_macros)
   if(LUXIR_CCACHE_RELATIVE_PATHS)
-    list(APPEND _luxir_compile_launcher "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}")
+    list(APPEND _luxir_compile_launcher "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}" "PWD=${CMAKE_BINARY_DIR}")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       add_compile_options("-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+    endif()
+    file(REAL_PATH "${CMAKE_SOURCE_DIR}" _luxir_real_source)
+    file(REAL_PATH "${CMAKE_BINARY_DIR}" _luxir_real_binary)
+    cmake_path(IS_PREFIX _luxir_real_source "${_luxir_real_binary}" _luxir_binary_inside)
+    if(NOT _luxir_binary_inside)
+      message(WARNING "Luxir: build directory ${_luxir_real_binary} is not inside ${_luxir_real_source}, "
+                      "so ccache cannot share its objects with other checkouts")
     endif()
   endif()
   list(APPEND _luxir_compile_launcher "${CCACHE_PROGRAM}")

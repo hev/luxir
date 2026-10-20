@@ -222,6 +222,8 @@ each worktree. With `-DLUXIR_CCACHE_RELATIVE_PATHS=ON` they must physically be
 there: ccache rewrites paths relative to the real working directory, so a build
 directory outside the worktree (through `-B` or a `build/` symlink) puts the
 worktree's name in every hashed path and never hits another worktree's objects.
+Configure warns about such a build directory. A worktree reached through a
+symlink shares normally.
 
 `tools/worktree add NAME [START]` creates a worktree on a new branch (from
 `origin/main` by default) under `LUXIR_WORKTREE_ROOT` (default
