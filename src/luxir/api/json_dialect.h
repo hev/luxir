@@ -920,6 +920,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::GeoBoxQuery>);
           } else if (key == "geo_distance") {
             arm(std::in_place_type<api::GeoDistanceQuery>);
+          } else if (key == "geo_nearest") {
+            arm(std::in_place_type<api::GeoNearestQuery>);
           } else if (key == "boost") {
             arm(std::in_place_type<api::BoostQuery>);
           } else if (key == "rescore") {

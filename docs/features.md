@@ -229,7 +229,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Request `min_score` (Elasticsearch-style): documents scoring below it are
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
-- `knn` vector search, `geo_box`, and `geo_distance`.
+- `knn` vector search, `geo_box`, `geo_distance`, and `geo_nearest`.
 - `multi_match`: search one text across weighted fields. `combined`
   (default) scores TEXT fields sharing an analyzer and long-term policy as
   one field with BM25F; weights scale term frequency and length at every
@@ -353,6 +353,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   `ignore_z_value`.
 - Bounding-box queries (dateline-aware) and great-circle distance queries,
   usable as the main query, as a non-scoring filter, or as a boolean clause.
+- `geo_nearest`: the `k` nearest documents within filters, found by a
+  best-first walk of the points index that stops at the k-th distance.
+- Distance sorting with `geo_distance(field, lat, lon)` (nearest or farthest
+  point of a multi-valued field), pruned through a bounding box and the
+  points index; `_sort_` returns the distances.
 
 ## API surfaces
 
