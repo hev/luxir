@@ -351,6 +351,8 @@ struct SkipStats {
   static inline int64_t geoNearestLeaves = 0;
   // Geo distance sorts: competitive circles built from the points index.
   static inline int64_t geoSortCircleBuilds = 0;
+  // distance_feature scorers that narrowed to a circle from the points index.
+  static inline int64_t distanceFeatureCircleBuilds = 0;
   // Codec skipBlock calls on landing-block traversal only: header-level
   // leaps (skipToBlock over whole blocks) bypass freq planes by byte length
   // without charging this counter, so it undercounts under jumped windows.
@@ -653,6 +655,7 @@ struct SkipStats {
     geoNearestScans = 0;
     geoNearestLeaves = 0;
     geoSortCircleBuilds = 0;
+    distanceFeatureCircleBuilds = 0;
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
     scoredWordProbeAdvances = 0;

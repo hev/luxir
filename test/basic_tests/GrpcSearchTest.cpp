@@ -315,6 +315,43 @@ TEST_F(GrpcSearchTest, geoNearestAndDistanceSort) {
   EXPECT_LT(meters[1], meters[2]);
 }
 
+TEST_F(GrpcSearchTest, distanceFeatureScoresByProximity) {
+  CollectionHelper helper;
+  SchemaBuilder b;
+  auto& field = b.field("geo");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
+  helper.indexAll({{{"id", "ny"}, {"geo", "40.7128,-74.0060"}},
+                   {{"id", "la"}, {"geo", "34.0522,-118.2437"}}},
+                  UpdateMessage::COMMIT);
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& cur = request->collection("main").topDocs("q");
+  cur.rawQuery() = qb::distanceFeature(cur.mr(), "geo", 40.7128, -74.0060, 1000.0);
+  cur.fields({"id"}).getScores();
+  grpc::ClientContext context;
+  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+      channel.get(), rpc::Search, &context);
+  ASSERT_TRUE(stream.Write(request->proto));
+  ASSERT_TRUE(stream.WritesDone());
+  std::vector<std::string> ids;
+  std::vector<float> scores;
+  Reply<luxir::api::SearchResponse> response;
+  while (stream.Read(&response)) {
+    ASSERT_FALSE(response.msg.error.has_value());
+    const auto* list = response.msg.ops.at("q")->docList();
+    if (list == nullptr) continue;
+    for (auto value : std::get<luxir::api::ColStr>(list->columns.find("id")->kind).v) ids.emplace_back(value);
+    for (float value : std::get<luxir::api::ColFloat>(list->columns.find("_score_")->kind).v) scores.push_back(value);
+  }
+  ASSERT_TRUE(stream.Finish().ok());
+  EXPECT_EQ((std::vector<std::string>{"ny", "la"}), ids);
+  ASSERT_EQ(2u, scores.size());
+  EXPECT_GT(scores[0], 0.99f);
+  EXPECT_NEAR(1000.0 / (1000.0 + geo::haversinMeters(40.7128, -74.0060, 34.0522, -118.2437)),
+              scores[1], 1e-6);
+}
+
 // A client that cancels the RPC while the emitter is paused must not strand
 // the request: the failed writes wake the parked emitter, whose next reply()
 // observes CANCEL and completes the call.  A stranded call would hang

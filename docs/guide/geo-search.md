@@ -246,10 +246,56 @@ documents inside it; the lookup repeats each time the last distance halves.
 Inside a larger value expression (`geo_distance(...) / 1000`),
 `geo_distance` is evaluated per document without this pruning.
 
+## Score by proximity
+
+`distance_feature` matches every document with a point and scores it by how
+near the point is to an origin, as Elasticsearch's query of the same name
+does for geo fields:
+
+```text
+score = boost * pivot_meters / (pivot_meters + meters)
+```
+
+The score is `boost` at the origin, half of it at `pivot_meters`, and falls
+toward zero beyond. A multi-valued document scores by its nearest point. Its
+usual place is an optional clause beside a text query, so that relevance
+decides first and proximity breaks the near-ties:
+
+```http
+POST /collections/places/_search
+
+{
+  "query": {
+    "boolean": {
+      "required": [{"match":{"description_t":"coffee"}}],
+      "optional": [
+        {"distance_feature":{"field":"location","lat":40.7128,"lon":-74.0060,"pivot_meters":1000}}
+      ]
+    }
+  },
+  "fields": ["id","name_s"],
+  "get_scores": true
+}
+```
+
+Wrap it in `boost` to weigh it against the text score. It does not narrow the
+match set: put a `geo_distance` filter beside it for that.
+
+Top-k collection prunes with it. Once the k-th best score reaches a floor
+`theta`, a document can only compete while its proximity score reaches the
+floor minus the most the other clauses can add, that is, within
+`pivot * (boost / floor - 1)` meters. The query then reads the documents
+inside that circle from the points index and skips the rest, and reads them
+again each time the circle radius halves. This works as the main query and as
+an optional clause beside a required or filter clause, and as one of several
+optional clauses; nested inside another boolean, under `dis_max`, or with
+`min_match` it scores correctly without skipping. A field without a points
+index scores every document.
+
 ## Combine place with relevance
 
-Geo queries are constant-scoring when used as queries and non-scoring when
-used as filters. The usual pattern is a text query with a geo filter, so text relevance is
+`geo_box` and `geo_distance` are constant-scoring when used as queries, and
+every geo query is non-scoring when used as a filter. The usual pattern is a text query with a geo filter, so text relevance is
 unaffected:
 
 ```http

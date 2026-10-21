@@ -1168,6 +1168,33 @@ TEST_F(HttpApiTest, geoNearestAndDistanceSortOverJson) {
   EXPECT_NE(std::string::npos, bad.body().find("k > 0")) << bad.body();
 }
 
+TEST_F(HttpApiTest, distanceFeatureOverJson) {
+  SchemaBuilder b;
+  auto& field = b.field("geo");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"near","geo":[-74.0060,40.7128],"body_t":"coffee"},)"
+      R"({"id":"far","geo":[-118.2437,34.0522],"body_t":"coffee"},{"id":"none","body_t":"coffee"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto result = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"boolean":{"required":[{"match":{"body_t":"coffee"}}],)"
+      R"("optional":[{"distance_feature":{"field":"geo","lat":40.7128,"lon":-74.0060,"pivot_meters":1000}}]}},)"
+      R"("fields":["id"],"get_scores":true,"count_limit":-1})");
+  ASSERT_EQ(200, result.result_int()) << result.body();
+  size_t near = result.body().find(R"("near")");
+  size_t far = result.body().find(R"("far")");
+  ASSERT_NE(std::string::npos, near) << result.body();
+  ASSERT_NE(std::string::npos, far) << result.body();
+  EXPECT_LT(near, far) << result.body();
+  EXPECT_NE(std::string::npos, result.body().find(R"("found":3)")) << result.body();
+
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"distance_feature":{"field":"geo","lat":40.0,"lon":-75.0,"pivot_meters":0}}})");
+  EXPECT_NE(std::string::npos, bad.body().find("pivot_meters")) << bad.body();
+}
+
 TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {

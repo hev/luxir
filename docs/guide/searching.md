@@ -617,6 +617,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
 | Geo distance | `{"geo_distance":{"field":"location","lat":40.71,"lon":-74.01,"radius_meters":5000}}` | Inclusive great-circle radius. |
+| Distance feature | `{"distance_feature":{"field":"location","lat":40.71,"lon":-74.01,"pivot_meters":1000}}` | Scores documents with a point by proximity, `pivot / (pivot + meters)`. See [Geo search](geo-search.md#score-by-proximity). |
 | Geo nearest | `{"geo_nearest":{"field":"location","lat":40.71,"lon":-74.01,"k":10}}` | The `k` nearest documents within filters; optional `max_distance_meters`. See [Geo search](geo-search.md#nearest-documents). |
 
 `match` accepts `operator: "and"` or a numeric `min_match` when analysis

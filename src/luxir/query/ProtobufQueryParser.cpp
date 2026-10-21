@@ -25,6 +25,7 @@
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/DistanceFeatureQuery.h"
 #include "luxir/query/GeoNearestQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/ParseContext.h"
@@ -222,6 +223,22 @@ luxir::Query* ProtobufQueryParser::parseGeoDistance(
   return pool.make<luxir::GeoDistanceQuery>(
       api::build::arenaStr(pool, target.physicalName), geoDistanceQuery.lat, geoDistanceQuery.lon,
       geoDistanceQuery.radius_meters);
+}
+
+luxir::Query* ProtobufQueryParser::parseDistanceFeature(
+    const luxir::api::DistanceFeatureQuery& distanceFeatureQuery) {
+  const auto& target = context.fields.resolve(distanceFeatureQuery.field, OpClass::PRIMARY, context.opName);
+  if (target.fieldType->type() != FieldType::GEO_POINT) {
+    throw std::runtime_error(std::format("distance_feature query on non-geo field: {}",
+                                         distanceFeatureQuery.field));
+  }
+  if (!target.fieldType->hasColumn()) {
+    throw std::runtime_error(std::format("distance_feature query on geo field without a column: {}",
+                                         distanceFeatureQuery.field));
+  }
+  return pool.make<luxir::DistanceFeatureQuery>(
+      api::build::arenaStr(pool, target.physicalName), distanceFeatureQuery.lat,
+      distanceFeatureQuery.lon, distanceFeatureQuery.pivot_meters);
 }
 
 luxir::Query* ProtobufQueryParser::parseGeoNearest(
@@ -632,6 +649,9 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     },
     [&](const luxir::api::GeoNearestQuery& g) -> luxir::Query* {
       return parseGeoNearest(g);
+    },
+    [&](const luxir::api::DistanceFeatureQuery& d) -> luxir::Query* {
+      return parseDistanceFeature(d);
     },
     [&](const luxir::api::FuzzyQuery& f) -> luxir::Query* { return parseFuzzy(f); },
     [&](const luxir::api::SimpleQuery& s) -> luxir::Query* { return parseSimpleQuery(s, pquery); },

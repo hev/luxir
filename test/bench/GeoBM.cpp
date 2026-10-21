@@ -17,6 +17,7 @@
 
 #include "bench/luxir_bench.h"
 #include "luxir/query/GeoBoxQuery.h"
+#include "luxir/query/DistanceFeatureQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/query/GeoNearestQuery.h"
 #include "luxir/reader/BKDReader.h"
@@ -942,6 +943,62 @@ void BM_GeoSort(benchmark::State& state, bool filtered, int32_t pruning) {
   state.counters["matches"] = filtered ? docs / 10 : docs;
 }
 
+// Text plus proximity top-10 over one segment of uniform points whose body
+// text matches half the docs, with distance_feature skipping on or off.
+// shape: 0 = distance_feature alone, 1 = required text + optional
+// distance_feature, 2 = optional text + optional distance_feature.
+void BM_GeoProximity(benchmark::State& state, int32_t shape, bool skipping) {
+  int32_t docs = luxir::unit_tests ? (int32_t)LuxirTest::scaleTestWork(5000) : 1'000'000;
+  CollectionHelper helper("geo_proximity_bm");
+  std::vector<int32_t> segments{docs};
+  if (!helper.indexMatchesShape(segments)) {
+    helper.clear();
+    CorpusGenerator generator(UNIFORM, 0x9e0f2a);
+    SplitMix64 rng(0x51);
+    std::vector<Doc> batch;
+    batch.reserve((size_t)docs);
+    for (int32_t doc = 0; doc < docs; doc++) {
+      RawPoint point = generator.next();
+      std::string body = doc % 2 == 0 ? "coffee" : "tea";
+      for (int32_t repeat = (int32_t)(rng() % 3); repeat > 0; repeat--) body += " coffee";
+      body += " house";
+      batch.push_back(flatdoc("id", std::to_string(doc), "body_t", body,
+                              "loc_p", std::vector<double>{point.lon, point.lat}));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT, false, 1).success);
+  }
+  bool saved = DistanceFeatureQuery::disableSkippingForTests;
+  auto restore = scope_guard([&]() { DistanceFeatureQuery::disableSkippingForTests = saved; });
+  DistanceFeatureQuery::disableSkippingForTests = !skipping;
+  size_t center = 0;
+  auto request = [&]() {
+    RawPoint origin = NEAREST_CENTERS[center++ % NEAREST_CENTERS.size()];
+    std::string df = R"({"distance_feature":{"field":"loc_p","lat":)" + std::to_string(origin.lat)
+        + R"(,"lon":)" + std::to_string(origin.lon) + R"(,"pivot_meters":50000}})";
+    std::string text = R"({"match":{"field":"body_t","val":"coffee"}})";
+    std::string query = shape == 0 ? df
+        : shape == 1 ? R"({"boolean":{"required":[)" + text + R"(],"optional":[)" + df + "]}}"
+                     : R"({"boolean":{"optional":[)" + text + "," + df + "]}}";
+    std::string json = R"({"collection":"geo_proximity_bm","query":)" + query
+        + R"(,"fields":["id"],"get_scores":true,"limit":10})";
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    EXPECT_TRUE(luxir::api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  {
+    SkipStatsScope stats;
+    request();
+    state.counters["circle_builds"] = (double)SkipStats::distanceFeatureCircleBuilds;
+  }
+  for (auto _ : state) {
+    auto req = request();
+    benchmark::DoNotOptimize(req->responses.size());
+  }
+  state.counters["docs"] = docs;
+}
+
 std::string distanceBenchName(const CorpusSpec& corpus, std::string_view op,
                               std::string_view circle) {
   return "BM_GeoDistance/" + std::string(corpus.name) + "/"
@@ -1021,6 +1078,16 @@ void registerBuildMerge(const CorpusSpec& corpus, bool merge) {
             BM_GeoSort(state, filtered, pruning);
           })->ArgName("limit")->Arg(10)->Arg(100)->UseRealTime()
             ->Unit(benchmark::kMicrosecond);
+    }
+  }
+  for (int32_t shape : {0, 1, 2}) {
+    std::string_view name = shape == 0 ? "alone" : shape == 1 ? "must_text" : "should_text";
+    for (bool skipping : {true, false}) {
+      benchmark::RegisterBenchmark(
+          "BM_GeoProximity/" + std::string(name) + "/" + (skipping ? "skipping" : "no_skipping"),
+          [shape, skipping](benchmark::State& state) {
+            BM_GeoProximity(state, shape, skipping);
+          })->UseRealTime()->Unit(benchmark::kMicrosecond);
     }
   }
   for (const CorpusSpec& corpus : CORPORA) {

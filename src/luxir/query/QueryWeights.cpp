@@ -16,6 +16,7 @@
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/DistanceFeatureQuery.h"
 #include "luxir/query/GeoNearestQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/MinScoreQuery.h"
@@ -156,6 +157,11 @@ Query::Weight* GeoDistanceQuery::createWeight(Context& context, int32_t flags,
 
 Query::Weight* GeoNearestQuery::createWeight(Context& context, int32_t flags,
                                              float multiplier) {
+  return context.pool.make<Weight>(context, *this, flags, multiplier);
+}
+
+Query::Weight* DistanceFeatureQuery::createWeight(Context& context, int32_t flags,
+                                                  float multiplier) {
   return context.pool.make<Weight>(context, *this, flags, multiplier);
 }
 

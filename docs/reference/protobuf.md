@@ -104,6 +104,7 @@ defaults and constraints are described in the comments and guides.
 - [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse)
 - [`DisMaxQuery`](#message-luxir.dismaxquery)
 - [`DiskStats`](#message-luxir.diskstats)
+- [`DistanceFeatureQuery`](#message-luxir.distancefeaturequery)
 - [`Diversify`](#message-luxir.diversify)
 - [`DocList`](#message-luxir.doclist)
 - [`Domain`](#message-luxir.domain)
@@ -848,6 +849,21 @@ One block device or partition (/proc/diskstats).
 | <a id="field-luxir.diskstats.io_now"></a>[`io_now`](#field-luxir.diskstats.io_now) | 10 | `uint64` | singular |  |
 | <a id="field-luxir.diskstats.io_time_seconds"></a>[`io_time_seconds`](#field-luxir.diskstats.io_time_seconds) | 11 | `double` | singular |  |
 | <a id="field-luxir.diskstats.io_time_weighted_seconds"></a>[`io_time_weighted_seconds`](#field-luxir.diskstats.io_time_weighted_seconds) | 12 | `double` | singular |  |
+
+<a id="message-luxir.distancefeaturequery"></a>
+
+### luxir.DistanceFeatureQuery
+
+Elasticsearch's distance\_feature for GEO\_POINT fields: matches every document with a point and scores it pivot / (pivot + meters) times any enclosing boost, where meters is the great-circle distance from the origin to its nearest point. Meant as an optional clause that adds proximity to a text query. Under top-k collection it skips documents too far away to reach the current minimum competitive score, through the field's points index.<br><br>Named origin scalars deliberately avoid positional ambiguity: the VALUE array contract \[x, y\] = \[lon, lat\] does not apply to this message.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.distancefeaturequery.field"></a>[`field`](#field-luxir.distancefeaturequery.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.distancefeaturequery.lat"></a>[`lat`](#field-luxir.distancefeaturequery.lat) | 2 | `double` | singular | origin latitude, degrees in \[-90, 90\] |
+| <a id="field-luxir.distancefeaturequery.lon"></a>[`lon`](#field-luxir.distancefeaturequery.lon) | 3 | `double` | singular | origin longitude, degrees in \[-180, 180\] |
+| <a id="field-luxir.distancefeaturequery.pivot_meters"></a>[`pivot_meters`](#field-luxir.distancefeaturequery.pivot_meters) | 4 | `double` | singular | distance at which the score halves; finite and positive |
 
 <a id="message-luxir.diversify"></a>
 
@@ -1768,6 +1784,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 | <a id="field-luxir.query.geo_nearest"></a>[`geo_nearest`](#field-luxir.query.geo_nearest) | 21 | [`GeoNearestQuery`](#message-luxir.geonearestquery) | oneof [`kind`](#oneof-luxir.query.kind) | the k documents nearest a point of a GEO\_POINT field |
+| <a id="field-luxir.query.distance_feature"></a>[`distance_feature`](#field-luxir.query.distance_feature) | 28 | [`DistanceFeatureQuery`](#message-luxir.distancefeaturequery) | oneof [`kind`](#oneof-luxir.query.kind) | scores GEO\_POINT documents by proximity to an origin |
 
 <a id="message-luxir.querybucket"></a>
 
