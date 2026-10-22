@@ -55,11 +55,12 @@ public:
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
     int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
+    uint32_t preparationPins = 0; // protected by indexMutex
     uint64_t publishedLiveGen = 0; // the generation in the published snapshot
     std::vector<uint64_t> obsoleteLiveGens; // protected by indexMutex
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
     uint64_t firstCommitTime = 0;  // first time this segment was committed as part of the index.
-    uint64_t lastCommitTime = 0;  // last time this segment was committed as part of the index (or 1 if currently committing)
+    uint64_t lastCommitTime = 0;  // last time this segment was committed as part of the index
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
@@ -72,6 +73,7 @@ public:
 
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
+    std::atomic<uint64_t> idDictionaryBlocks = UINT64_MAX;
 
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
@@ -153,14 +155,27 @@ public:
     int32_t mergeLevel = 0;
     bool merging = false;
   };
-  struct Stats : ReaderManager::SnapshotStats<SegmentStats> {
+  struct DeletePassStats {
+    uint64_t deletePassCount = 0, deletePassNanos = 0, deletePassMaxNanos = 0;
+    uint64_t deletePassRetiredBytes = 0; // removed from pending; merges may still own them
+    // Selected facts; new facts are the selected pending owners, excluding carry-only replay.
+    uint64_t deletePassFacts = 0, deletePassNewFacts = 0;
+    // Clipped facts summed over segments, in total and for the largest pass.
+    uint64_t deletePassProbes = 0, deletePassMaxProbes = 0;
+  };
+  struct Stats : ReaderManager::SnapshotStats<SegmentStats>, DeletePassStats {
     uint64_t commits = 0;
     uint64_t activeMerges = 0;
     uint64_t flushing = 0, idle = 0, indexing = 0;
     uint64_t retainedDeleteBytes = 0;
     uint64_t completedUpdateVersion = 0;
-    uint64_t minInverterVersion = UINT64_MAX;
+    uint64_t minInverterDocVersion = UINT64_MAX;
     uint64_t frontierHeldDeleteBytes = 0;
+    uint64_t pendingRetirableDeleteBytes = 0, pendingHeldDeleteBytes = 0, mergeCarryDeleteBytes = 0;
+    // liveDocs files written by commits, passes, merges and flushes.
+    uint64_t liveDocsBytesWritten = 0;
+    uint64_t pinningInverterFlushes = 0, deleteOnlyKneeFlushes = 0;
+    uint64_t deleteOnlyFlushCap = 0;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -212,6 +227,11 @@ public:
       }
     }
 
+    // TODO: deletes are not considered.  The level comes from maxDoc and a merge
+    // needs mergeFactor segments at one level, so a mostly-deleted segment keeps
+    // its level and its dead docs are reclaimed only once that level fills;
+    // overwrite-heavy loads grow the index until then.
+    //
     // Integer arithmetic: a floating-point log ratio rounds exact powers of the
     // merge factor (e.g. 100 docs for factor 10) down a level.
     int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
@@ -408,10 +428,62 @@ public:
   boost::unordered_flat_set<std::string> activeVectorOverlayNames;
 
   // Registered atomically with flushed segments and snapshotted with them.
-  // A batch survives until a normal commit has flushed every request through
-  // its largest version. Protected by indexMutex.
+  // A batch survives until a covering commit or a delete pass retires it.
+  // Merge catch-up can hold additional references. Protected by indexMutex.
   MultiDeletesData pendingDeletes;
+  // Set when a registered segment gains carried personalDeletes; the pass
+  // scan that finds none clears it. indexMutex.
+  bool carriedDeletes = false;
   uint64_t durableUpdateVersion = 0;
+  // Newest batch retired from pending. A pass retires without publishing, so
+  // the next manifest must cover it. indexMutex.
+  uint64_t preparedDeleteVersion = 0;
+  // Smallest minDocVersion over busy, idle and flushing inverters: lowered at
+  // release, recomputed when the inverter holding it leaves. indexMutex.
+  uint64_t minInverterDocVersion = UINT64_MAX;
+  // Version of the newest commit to complete, published or not. Commits
+  // complete in version order: startUpdateNode is serial and assigns versions
+  // and ordinals together, and initiateCommit assigns commitNum in ordinal
+  // order. So a packet claimed at or below it no longer belongs to an
+  // outstanding commit and returns to passes. Protected by indexMutex.
+  uint64_t completedCommitVersion = 0;
+  bool deletePassQueued = false; // indexMutex, includes a running pass
+  // A failed pass holds passes until deletePassRetrySlot fires. The delay
+  // doubles per consecutive failure and resets on a successful pass or commit.
+  static constexpr std::chrono::milliseconds DELETE_PASS_RETRY_MIN{100};
+  static constexpr std::chrono::milliseconds DELETE_PASS_RETRY_MAX{5000};
+  std::chrono::milliseconds deletePassBackoff{0}; // indexMutex
+  bool deletePassHeld = false; // indexMutex
+  DeadlineScheduler::Slot deletePassRetrySlot{[this] { deletePassRetryFired(); }};
+  // Every pending batch at or below this has left pressure as retirable: one
+  // registering at or below it is marked then, and markRetirableLocked marks
+  // the rest as the frontier, which never falls, passes them. indexMutex.
+  uint64_t retirableThrough = 0;
+  uint64_t pinningInverterFlushes = 0, deleteOnlyKneeFlushes = 0; // indexMutex
+  DeletePassStats deletePassStats; // counters only, protected by indexMutex
+  std::atomic<uint64_t> liveDocsBytesWritten = 0;
+  class DeletePassMessage;
+
+  // One delete application: every registered segment, pinned against
+  // retirement until unpin(); the packets it applies; and the version through
+  // which it retires pending batches. Commits and delete passes capture,
+  // apply and reconcile it the same way.
+  struct DeleteApplication {
+    IndexWriter& writer;
+    std::vector<SegInfo*> segs;
+    std::vector<SegInfo*> targets; // segments a selected packet may touch
+    MultiDeletesData selected;     // pending and carried packets
+    MultiDeletesData pending;      // the selected batches from pendingDeletes
+    uint64_t retireThrough = 0;
+    bool pinned = false;
+
+    explicit DeleteApplication(IndexWriter& owner) : writer(owner) {}
+    DeleteApplication(const DeleteApplication&) = delete;
+    DeleteApplication& operator=(const DeleteApplication&) = delete;
+    ~DeleteApplication() { unpin(); }
+    void select(const std::shared_ptr<const SortedDeletes>& packet, bool fromPending);
+    void unpin();
+  };
 
   // In an update response, we could return an update number, or a commit number, or even a monotonic time.
   // This would allow a searching client to specify a time to search up to.
@@ -502,6 +574,11 @@ public:
   // orders of magnitude sooner; tests lower it to flush at exact doc boundaries.
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = PostingsReader::MAX_SEGMENT_DOCS;
+  // Delete ids per application task within one segment.
+  size_t deleteApplyChunkEntries = 64 * 1024;
+  // Small indexes still batch delete-only buffers: per-id cost was about 2x the
+  // knee at 100K ids and 4.9x at 10K.
+  uint64_t deleteOnlyFlushFloor = 64 * 1024;
 
   // Minimum memSize() for an idle inverter to be flushed under global RAM budget
   // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
@@ -660,6 +737,8 @@ private:
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       completedUpdateVersion = msg.updateVersion;
+      markRetirableLocked();
+      requestDeletePassLocked();
     }
     bool doneWithMessage = true;
     // A failed request has no effects, including its commit.  Commit numbers are
@@ -710,6 +789,22 @@ private:
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
+  void deletePassBody();
+  template <class Visit> bool forEachPassPacketLocked(uint64_t frontier, Visit&& visit);
+  void pinSnapshotLocked(DeleteApplication& app);
+  uint64_t applyDeletes(const DeleteApplication& app);
+  void reconcileDeletes(const DeleteApplication& app);
+  uint64_t retirePendingLocked(const DeleteApplication& app);
+  uint64_t deleteFrontierLocked() const;
+  bool passMayRetireLocked(const SortedDeletes& packet, uint64_t frontier) const;
+  void requestDeletePassLocked() noexcept;
+  void markRetirableLocked();
+  void deletePassFinished(bool succeeded);
+  void deletePassRetryFired();
+  uint64_t minDocumentVersionLocked() const;
+  uint64_t deleteOnlyFlushCapLocked() const;
+  void flushPinningInverterLocked() noexcept;
+  void collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::string>& names);
   // Caller holds publicationMutex. A supplied schema is copied before assigning history.
   void publish(api::IndexInfo& info, std::pmr::memory_resource& arena,
                std::shared_ptr<Schema> schema = {});
@@ -741,9 +836,10 @@ private:
                                 std::string_view context) noexcept;
   // Release writer ownership; snapshot pins can retain the retired files.
   void tryDeleteSegments();
+  std::vector<std::unique_ptr<SegInfo>> takeDeletableSegmentsLocked();
+  void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
-  void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);
-  void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
+  uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
 

@@ -828,7 +828,7 @@ TEST_F(GrpcIndexTest, geoPointFormatsOverProtobuf) {
   auto& field = schema.field("loc");
   field.type = api::FieldDef::FieldClass::GEO_POINT;
   field.index = api::FieldDef::IndexMode::RANGE;
-  field.multi = true;
+  field.multi = api::FieldDef::MultiMode::DEFAULT;
   schema.set(helper.collection());
 
   std::pmr::monotonic_buffer_resource mr;

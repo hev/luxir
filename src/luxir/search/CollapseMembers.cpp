@@ -47,7 +47,8 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
           IntColReader::Iterator iter(column);
           if (iter.advance(doc.docId()) != doc.docId()) break;
           int64_t raw = column.multiValued()
-              ? iter.values().valueAt(column.getStartValueRank(iter.rank())) : iter.value();
+              ? column.selectedValue(iter.rank(), field.isReversed(), iter.values())
+              : iter.value();
           if (type == FieldType::FLOAT) value.kind = sortableInt32ToFloat((int32_t)raw);
           else if (type == FieldType::DOUBLE) value.kind = sortableInt64ToDouble(raw);
           else value.kind = raw;
@@ -60,7 +61,13 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
         } else {
           StrColReader column(segment.postingsReader(), info);
           StrColReader::DocIterator iter(column);
-          if (iter.advance(doc.docId()) == doc.docId()) value.kind = build::arenaStr(mr, iter.value());
+          if (iter.advance(doc.docId()) != doc.docId()) break;
+          if (column.isMultiValued()) {
+            StrColReader::DocValues values(column);
+            value.kind = build::arenaStr(mr, column.selectedValue(iter.rank(), field.isReversed(), values));
+          } else {
+            value.kind = build::arenaStr(mr, iter.value());
+          }
         }
         break;
       }
