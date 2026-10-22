@@ -33,6 +33,10 @@ size_t Inverter::retainedDeleteBytes() const {
   return static_cast<handler::IdHandler&>(*idHandler_).retainedDeleteBytes();
 }
 
+size_t Inverter::deleteCount() const {
+  return idHandler_ == nullptr ? 0 : static_cast<handler::IdHandler&>(*idHandler_).nonzeroWatermarks;
+}
+
 
 Inverter::UndoMark Inverter::undoMark() const {
   UndoMark mark;
@@ -118,7 +122,11 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
         fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
       } else {
         // indexed and column stored (via ord)
-        fieldHandler = pool.make_unique<handler::StrHandler>(*this, name, fieldType);
+        if (fieldType->multiArray()) {
+          fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType);
+        } else {
+          fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType);
+        }
       }
       break;
     case FieldType::Type::INT:

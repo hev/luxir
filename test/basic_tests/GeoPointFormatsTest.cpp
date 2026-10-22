@@ -229,7 +229,7 @@ TEST_F(GeoPointFormatsTest, ingestEveryFormSingleAndMulti) {
   single.index = api::FieldDef::IndexMode::RANGE;
   auto& multi = b.field("locs");
   multi.type = api::FieldDef::FieldClass::GEO_POINT;
-  multi.multi = true;  // column scan: exercises the unindexed path too
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;  // column scan: exercises the unindexed path too
   b.set(helper.collection());
 
   CollectionHelper::UpdateBuilder update;
@@ -266,7 +266,7 @@ TEST_F(GeoPointFormatsTest, malformedPointsFailTheDocumentUnlessIgnored) {
   auto& lenient = b.field("lenient");
   lenient.type = api::FieldDef::FieldClass::GEO_POINT;
   lenient.index = api::FieldDef::IndexMode::RANGE;
-  lenient.multi = true;
+  lenient.multi = api::FieldDef::MultiMode::DEFAULT;
   lenient.ignore_malformed = true;
   lenient.ignore_z_value = true;
   b.set(helper.collection());

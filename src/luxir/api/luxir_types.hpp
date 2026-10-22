@@ -131,6 +131,7 @@ enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class MultiMode { SINGLE = 0, DEFAULT = 1, SET = 2, ARRAY = 3 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
@@ -270,6 +271,7 @@ struct VectorAnnDef {
 };
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
+  using MultiMode = luxir::api::FieldDef_::MultiMode;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
   using LongTerms = luxir::api::FieldDef_::LongTerms;
   using Metric = luxir::api::VectorMetric;
@@ -286,8 +288,8 @@ struct FieldDef {
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
+  std::optional<MultiMode> multi;
   std::optional<bool> column;                                   // align 1 (optional<bool>s)
-  std::optional<bool> multi;
   std::optional<bool> stored;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
@@ -540,6 +542,7 @@ struct ServiceStats {
   uint64_t delete_ids_accepted = 0;
   ActivityStats flush;
   ActivityStats commit;
+  ActivityStats delete_pass;
   ActivityStats merge;
   ActivityStats vector_build;
   ActivityStats reader_refresh;
@@ -741,6 +744,7 @@ struct StatsResponse {
 struct CacheControlRequest {
   std::string_view collection;
   std::string_view tenant;
+  std::optional<uint64_t> max_bytes;
   uint32_t dump_limit = 0;
   bool flush = false;
   bool reset_admission = false;

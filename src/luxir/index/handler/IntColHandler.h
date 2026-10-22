@@ -16,7 +16,9 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <ranges>
+#include <vector>
 
 using namespace luxir;
 namespace luxir::handler {
@@ -194,11 +196,14 @@ public:
 };
 
 
+// Numeric sets sort and deduplicate encoded values before appending. Arrays
+// retain source order and repeats. GEO_POINT is always an array.
 class MultiIntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
   IntStream lengthStream;
   DocStream docsWithVal;
+  std::vector<int64_t> docValues;  // per-doc scratch, reused across docs
   int64_t numVals = 0;
   int32_t numDocs = 0;
 
@@ -223,21 +228,19 @@ public:
       return;
     }
     if (coerce::isNull(val)) return;
-    // Coercions last, element-wise through the field type.  Materialize the
-    // full array before indexMulti: a throw partway through a lazy transform
-    // would leave already-appended values without their doc/length entries
-    // (the column reconstructs positionally, corrupting later docs); a throw
-    // before any stream mutation just fails the doc.
-    std::vector<int64_t> encoded;
+    // Validate/materialize before mutating any stream. A failed coercion may
+    // retain scratch capacity, which still belongs to the inverter's budget.
+    docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
     bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           elem, std::string_view(fieldName), inverter.coerceContext));
     });
     if (!wasArray) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           val, std::string_view(fieldName), inverter.coerceContext));
     }
-    indexMulti(inverter, std::span<const int64_t>(encoded.data(), encoded.size()));
+    appendDocValues(inverter);
   }
 
   void index(Inverter& inverter, int64_t int64) override {
@@ -256,12 +259,20 @@ public:
   }
 
   void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
-    int64_t n = 0;
-    for (auto val : values) {
-      longStream.addVal(inverter.pool, val);
-      n++;
+    docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
+    for (auto val : values) docValues.push_back(val);
+    appendDocValues(inverter);
+  }
+
+  void appendDocValues(Inverter& inverter) {
+    if (docValues.empty()) return;
+    if (fieldType->multiSet()) {
+      std::ranges::sort(docValues);
+      docValues.erase(std::unique(docValues.begin(), docValues.end()), docValues.end());
     }
-    if (n == 0) return;
+    for (int64_t val : docValues) longStream.addVal(inverter.pool, val);
+    int64_t n = (int64_t)docValues.size();
     numVals += n;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
     lengthStream.addVal(inverter.pool, n);

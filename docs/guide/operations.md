@@ -273,7 +273,7 @@ Two byte counts measure different things and will disagree:
 
 `service` counters are process-wide and reset on restart. Each activity
 (`operations` per transport, `search`, `index_batches`, `flush`, `commit`,
-`merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
+`delete_pass`, `merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
 (`ok`, `error`, `cancelled`) and a `duration` histogram. Histogram `counts` are
 cumulative, aligned with `service.request_duration_bounds` (requests, search
 execution and index batches, from 10 microseconds) or
@@ -545,6 +545,12 @@ the node unlimited. The resolved values are logged at startup.
 - Lower `indexing.max-inverter-ram-mb` to trade merge work for flush latency and
   peak RSS: smaller flushes land sooner and cost less at once, at the price of
   more segments to merge.
+- A merge that cannot reserve its memory waits and asks indexing to give some
+  back, but never more than half of `indexing.max-ram-mb`: idle inverters are
+  flushed for it only while indexing holds more than that half, and only an
+  inverter holding at least its share of the half (and at least
+  `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
+  inverters are flushed only once the whole budget is in use.
 
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it
@@ -606,6 +612,14 @@ Search has its own limits:
   first. Cache counters appear in `_stats?collections=true`
   (and on the collection and tenant `_stats` routes). Date ranges with an unrounded
   `NOW` bound are never cached; see [Dates](dates.md#date-math).
+  The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)
+  changes the budget at runtime: a shrink evicts down to the new budget, a
+  grow evicts nothing, and `0` disables the cache and drops its entries.
+  Without a tenant or collection it sets every collection, including ones
+  created later; with a tenant or collection it sets the existing ones
+  selected. The setting is kept when a collection is replaced (for example by
+  a follower's re-download), dropped when the collection is deleted, and not
+  persisted: a restart returns to `query-cache-bytes`.
 
 ## Time-zone data
 
