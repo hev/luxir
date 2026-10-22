@@ -439,7 +439,7 @@ A list of vectors, used as a per-doc cell for multi-valued vector fields.
 
 ### luxir.CacheControlRequest
 
-Admin control over the per-collection query cache. Actions compose and apply in this order: flush, reset\_admission, reset\_counters, then dump. flush drops resident values and entry metadata; sighting history survives, so a known query can be readmitted and rebuilt immediately. flush + reset\_admission also forgets sightings, restarting admission tracking. reset\_counters zeroes the cumulative stats. An empty collection targets every collection.
+Admin control over the per-collection query cache. Actions compose and apply in this order: max\_bytes, flush, reset\_admission, reset\_counters, then dump. flush drops resident values and entry metadata; sighting history survives, so a known query can be readmitted and rebuilt immediately. flush + reset\_admission also forgets sightings, restarting admission tracking. reset\_counters zeroes the cumulative stats. An empty collection targets every collection.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -452,6 +452,7 @@ Admin control over the per-collection query cache. Actions compose and apply in 
 | <a id="field-luxir.cachecontrolrequest.reset_counters"></a>[`reset_counters`](#field-luxir.cachecontrolrequest.reset_counters) | 4 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump"></a>[`dump`](#field-luxir.cachecontrolrequest.dump) | 5 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump_limit"></a>[`dump_limit`](#field-luxir.cachecontrolrequest.dump_limit) | 6 | `uint32` | singular | max dump rows per shard; 0 = 100 |
+| <a id="field-luxir.cachecontrolrequest.max_bytes"></a>[`max_bytes`](#field-luxir.cachecontrolrequest.max_bytes) | 8 | `uint64` | optional | Administration only. Sets the selected caches' byte budget before the other actions; 0 disables caching and drops entries. With collection and tenant both empty it is also the budget for collections created later. Lasts for the node session: kept when a collection is replaced, dropped when it is deleted, back to --query-cache-bytes on restart. |
 
 <a id="message-luxir.cachecontrolresponse"></a>
 
@@ -1024,7 +1025,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.type"></a>[`type`](#field-luxir.fielddef.type) | 2 | [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass) | optional | required unless inherited from parent |
 | <a id="field-luxir.fielddef.index"></a>[`index`](#field-luxir.fielddef.index) | 3 | [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode) | optional | Unset inherits, falling back to MATCH for STRING/TEXT/ID and NONE for other types. Other type/mode combinations are rejected. |
 | <a id="field-luxir.fielddef.column"></a>[`column`](#field-luxir.fielddef.column) | 4 | `bool` | optional | store values in a per-field column |
-| <a id="field-luxir.fielddef.multi"></a>[`multi`](#field-luxir.fielddef.multi) | 5 | `bool` | optional | multi-valued |
+| <a id="field-luxir.fielddef.multi"></a>[`multi`](#field-luxir.fielddef.multi) | 5 | [`FieldDef.MultiMode`](#enum-luxir.fielddef.multimode) | optional | unset inherits, falling back to SINGLE |
 | <a id="field-luxir.fielddef.analyzer"></a>[`analyzer`](#field-luxir.fielddef.analyzer) | 6 | [`AnalyzerDef`](#message-luxir.analyzerdef) | singular | TEXT only. Unset or empty inherits; a nonempty definition replaces the entire analyzer. Without an inherited analyzer, defaults to whitespace. |
 | <a id="field-luxir.fielddef.stored"></a>[`stored`](#field-luxir.fielddef.stored) | 7 | `bool` | optional | Keep canonical source text before analysis/normalization for TEXT/STRING/ID retrieval. Defaults to true for TEXT, false otherwise; unused on other types. |
 | <a id="field-luxir.fielddef.stored_resource"></a>[`stored_resource`](#field-luxir.fielddef.stored_resource) | 8 | `string` | optional | Stored-field group for stored TEXT/STRING/ID values, e.g. "\_stored\_body\_", declared in SchemaDef.stored\_resources. Empty or unset inherits the parent's group, falling back to "\_stored\_". |
@@ -2170,7 +2171,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.cpu_target"></a>[`cpu_target`](#field-luxir.servicestats.cpu_target) | 20 | `string` | singular | The CPU target the binary was built for. |
 | <a id="field-luxir.servicestats.read_only"></a>[`read_only`](#field-luxir.servicestats.read_only) | 2 | `bool` | singular |  |
 | <a id="field-luxir.servicestats.request_duration_bounds"></a>[`request_duration_bounds`](#field-luxir.servicestats.request_duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, of the request, search execution and index batch histograms. |
-| <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, merge, vector build and reader refresh histograms. |
+| <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, delete pass, merge, vector build and reader refresh histograms. |
 | <a id="field-luxir.servicestats.http"></a>[`http`](#field-luxir.servicestats.http) | 5 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
 | <a id="field-luxir.servicestats.grpc"></a>[`grpc`](#field-luxir.servicestats.grpc) | 6 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
 | <a id="field-luxir.servicestats.search"></a>[`search`](#field-luxir.servicestats.search) | 21 | [`ActivityStats`](#message-luxir.activitystats) | singular | Searches the engine accepted, from submission to the final response. A gRPC Search call can carry many, so this is the per-search view there. |
@@ -2184,6 +2185,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.document_errors"></a>[`document_errors`](#field-luxir.servicestats.document_errors) | 19 | map&lt;`string`, `uint64`&gt; | map | Documents rejected with an error of their own, keyed by error kind. The rest of documents\_rejected were rolled back with a failed batch. |
 | <a id="field-luxir.servicestats.flush"></a>[`flush`](#field-luxir.servicestats.flush) | 14 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.commit"></a>[`commit`](#field-luxir.servicestats.commit) | 15 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.delete_pass"></a>[`delete_pass`](#field-luxir.servicestats.delete_pass) | 22 | [`ActivityStats`](#message-luxir.activitystats) | singular | Delete passes, which apply deletes between commits without flushing, syncing or publishing. |
 | <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.vector_build"></a>[`vector_build`](#field-luxir.servicestats.vector_build) | 17 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.reader_refresh"></a>[`reader_refresh`](#field-luxir.servicestats.reader_refresh) | 18 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
@@ -2584,6 +2586,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
+- [`FieldDef.MultiMode`](#enum-luxir.fielddef.multimode)
 - [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit)
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
@@ -2705,6 +2708,21 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.fielddef.longterms.truncate"></a>[`TRUNCATE`](#value-luxir.fielddef.longterms.truncate) | 0 | keep a UTF-8-safe prefix of at most 255 bytes; values may merge |
 | <a id="value-luxir.fielddef.longterms.reject"></a>[`REJECT`](#value-luxir.fielddef.longterms.reject) | 1 | reject overlong terms |
 | <a id="value-luxir.fielddef.longterms.hash128"></a>[`HASH128`](#value-luxir.fielddef.longterms.hash128) | 2 | prefix of at most 230 bytes plus 25 base36 hash digits |
+
+<a id="enum-luxir.fielddef.multimode"></a>
+
+### luxir.FieldDef.MultiMode
+
+SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts and deduplicates column values; ARRAY keeps their source order and repeats. Stored source keeps order and repeats independently of the column mode. DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING use SET, TEXT/VECTOR/GEO\_POINT use ARRAY. Explicit SET is rejected on an array-only primary and resolves to ARRAY on an array-only variant. Explicit ARRAY applies to every representation. ID is reserved for the single-valued id field. Variants inherit the declared mode and cannot override it. Schema JSON views echo the declaration. HTTP JSON accepts false, true (DEFAULT), "set", or "array".
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.fielddef.multimode.single"></a>[`SINGLE`](#value-luxir.fielddef.multimode.single) | 0 |  |
+| <a id="value-luxir.fielddef.multimode.default"></a>[`DEFAULT`](#value-luxir.fielddef.multimode.default) | 1 |  |
+| <a id="value-luxir.fielddef.multimode.set"></a>[`SET`](#value-luxir.fielddef.multimode.set) | 2 |  |
+| <a id="value-luxir.fielddef.multimode.array"></a>[`ARRAY`](#value-luxir.fielddef.multimode.array) | 3 |  |
 
 <a id="enum-luxir.fieldfacet.countunit"></a>
 

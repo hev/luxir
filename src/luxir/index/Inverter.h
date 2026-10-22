@@ -94,6 +94,9 @@ public:
   uint64_t currVersion = 0;
   uint64_t minVersion = std::numeric_limits<uint64_t>::max();
   uint64_t maxVersion = 0;
+  // Published at release under indexMutex; never inspect a busy builder.
+  uint64_t minDocVersion = UINT64_MAX;
+  int32_t acquisitionMaxDoc = 0;
 
   // When true, indexing an id field will automatically queue a delete for previous
   // versions. Set before indexing docs.
@@ -154,6 +157,7 @@ public:
   // so all deletes end up as sorted lists after flush.
   void deleteId(std::string_view id, uint64_t version);
   size_t retainedDeleteBytes() const;
+  size_t deleteCount() const;
 
   /// This is what clients should call to index the fields of a document.
   class IndexHandler {

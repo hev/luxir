@@ -79,7 +79,7 @@ struct Members {
     for (auto& clause : field.clauses) {
       if (auto* text = dynamic_cast<StrColComparator*>(clause.comparator.get())) {
         strings.push_back(text);
-        slotStride += sizeof(std::string);
+        slotStride += sizeof(std::string) + sizeof(uint8_t); // value and missing flag
       } else if (clause.comparator) slotStride += sizeof(int64_t);
       else if (clause.expr) slotStride += sizeof(FieldSortCollector::RuntimeClause::ExprSlot);
     }
@@ -220,7 +220,7 @@ struct MetricGroupData::Impl {
         1, 0, op.topCount, better);
     size_t slot = 0;
     table.forEachEntry([&](const CollapseKey& key, char* entry) {
-      finalizer.add({&key, table.occurrenceCount(entry),
+      finalizer.add({&key, loadUnaligned<int64_t>(entry),
           {slot++, loadUnaligned<int32_t>(entry + sizeof(int64_t))}});
     });
     auto page = finalizer.finish();

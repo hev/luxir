@@ -206,8 +206,8 @@ A multi-geo field uses an array of points in any
 [point form](geo-search.md#point-formats); an array of numbers alone is one
 point. A multi-vector field
 uses an array of number arrays; a bare number array is also accepted as a
-one-vector list. The field must be declared `multi: true`; the `_ss`, `_is`,
-`_fs`, `_ds`, `_dts`, `_ps`, and `_vs` default suffixes already are.
+one-vector list. Enable a [multi-valued mode](schema.md#multi-valued-modes);
+the `_ss`, `_is`, `_fs`, `_ds`, `_dts`, `_ps`, and `_vs` suffixes already do.
 
 ## What is returned
 
@@ -268,8 +268,9 @@ Patterns without `__` never expand variants; `author__*` or `*__s` discovers
 variants that have a column. HTTP row format omits missing fields; HTTP
 column format includes the requested key with `null`.
 
-For a multi-valued field, stored values keep source order and duplicates;
-a string column is a sorted, deduplicated set.
+Column retrieval follows each representation's
+[multi-valued mode](schema.md#multi-valued-modes). Stored-source retrieval
+keeps source order and repeats independently of that mode.
 
 ### Multi-valued text and phrases
 

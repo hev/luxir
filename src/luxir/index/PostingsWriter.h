@@ -65,6 +65,7 @@ public:
   // The id field's bounds, captured when its dictionary is finalized. Absent
   // when no finalized dictionary was written for it; callers then derive them.
   std::optional<IdRange> idRange;
+  std::optional<uint64_t> idDictionaryBlocks;
 
 private:
   Directory& directory;
@@ -1840,6 +1841,7 @@ public:
     assert(buildTrie);
 
     if ((std::string_view)fieldInfo->fieldname == "id") {
+      postingsWriter.idDictionaryBlocks = result.nBlocks;
       postingsWriter.idRange = IdRange{std::move(result.firstTerm), std::move(result.lastTerm), result.nTerms == 0};
     }
 

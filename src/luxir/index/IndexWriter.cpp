@@ -6,6 +6,7 @@
 #include "luxir/store/Manifest.h"
 
 #include <algorithm>
+#include <chrono>
 #include <typeinfo>
 
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -21,7 +22,6 @@
 #include <memory_resource>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
-#include "luxir/util/heap.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
@@ -54,16 +54,25 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
   }
 }
 
-bool mayApplyDeletes(const SegInfo& seg, const MultiDeletesData& deletes) {
+bool mayApplyDeletes(const SegInfo& seg, const SortedDeletes& packet) {
+  if (seg.minVersion >= packet.getLargestVersion()) return false;
   auto range = seg.idRange.load();
-  for (const auto& packet : deletes.deletes) {
-    if (seg.minVersion >= packet->getLargestVersion()) continue;
-    if (!range) return true;
-    for (auto span : packet->lists()) {
-      if (!span.empty() && range->overlaps((std::string_view)span.front(), (std::string_view)span.back())) return true;
-    }
+  if (!range) return true;
+  for (auto span : packet.lists()) {
+    if (!span.empty() && range->overlaps((std::string_view)span.front(), (std::string_view)span.back())) return true;
   }
   return false;
+}
+
+bool mayApplyDeletes(const SegInfo& seg, const MultiDeletesData& deletes) {
+  for (const auto& packet : deletes.deletes) if (mayApplyDeletes(seg, *packet)) return true;
+  return false;
+}
+
+uint64_t deleteFacts(const SortedDeletes& packet) {
+  uint64_t count = 0;
+  for (auto span : packet.lists()) count += span.size();
+  return count;
 }
 
 SortedDeletes::EntrySpan clipDeletes(SortedDeletes::EntrySpan span, const IdRange& range) {
@@ -77,6 +86,16 @@ SortedDeletes::EntrySpan clipDeletes(SortedDeletes::EntrySpan span, const IdRang
 
 } // namespace
 
+
+class IndexWriter::DeletePassMessage final : public UpdateMessage {
+public:
+  DeletePassMessage() { applyOnly = true; }
+  void handle(IndexWriter&) override {}
+  void done(IndexWriter& writer) override {
+    auto self = std::unique_ptr<DeletePassMessage>(this);
+    writer.deletePassFinished(!result.errored());
+  }
+};
 
 // Goals of the TBB flow graph for updates:
 //   - make sure that a commit waits for all update messages to be processed (in the same stream at least)
@@ -335,9 +354,11 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
       bool dispatchCompletion = true;
-      MetricScope metric(*metrics, metricActivity(MetricStage::COMMIT));
+      // Delete passes share this serial node with commits, not their metrics.
+      MetricScope metric(*metrics, metricActivity(msg->applyOnly ? MetricStage::DELETE_PASS : MetricStage::COMMIT));
       try {
-        dispatchCompletion = this->finishCommitBody(*msg);
+        if (msg->applyOnly) this->deletePassBody();
+        else dispatchCompletion = this->finishCommitBody(*msg);
       }
       catch (std::exception& e) {
         LOG_ERROR("finishCommitBody Exception Caught: exception={}",
@@ -411,6 +432,8 @@ void IndexWriter::fail(std::string reason) {
 }
 
 void IndexWriter::close() {
+  // No delete-pass retry fires once this returns; detach waits out a running one.
+  DeadlineScheduler::global().detach(deletePassRetrySlot);
   // Fatal publication can happen inside a graph task. Drain here even when
   // already marked, never recursively from the publishing task itself.
   std::lock_guard closeLock(closeMutex);
@@ -685,6 +708,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   // normal protobuf path immediately installs its request clock; custom/test
   // messages without one fall back to call-time DATE coercion.
   inverter->coerceContext = {};
+  inverter->acquisitionMaxDoc = inverter->getMaxDoc();
   return *inverter;
 }
 
@@ -713,6 +737,7 @@ void IndexWriter::pressureCheckBody() {
   if (isClosed()) return;
 
   const std::lock_guard<std::mutex> lock(indexMutex);
+  flushPinningInverterLocked();
   pressureShedIdleLocked();
 }
 
@@ -758,8 +783,18 @@ bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
 // Caller holds indexMutex. Largest-relief-first avoids flushing retained RAM; the
 // budget-side claim prevents broadcasts to multiple writers from over-shedding
 // once the global pressure target is met.
+//
+// Pressure that only merge demand creates sheds an inverter only once it holds
+// a fair share of half the pool (budget / (2 * this writer's active
+// inverters)): the demand is waiting for merges that shrink the segment count,
+// and a stream of floor-sized flushes would grow it faster than they can.
 void IndexWriter::pressureShedIdleLocked() {
   if (!indexRamBudget->pressurePossible()) return;
+  size_t floor = pressureFlushFloorBytes;
+  if (!idleInverters.empty() && !indexRamBudget->liveOverBudget()) {
+    size_t active = idleInverters.size() + busyInverters.size();
+    floor = std::max(floor, (size_t)indexRamBudget->totalBytes() / (2 * active));
+  }
   for (;;) {
     Inverter* victim = nullptr;
     size_t largestRelief = 0;
@@ -767,7 +802,7 @@ void IndexWriter::pressureShedIdleLocked() {
       size_t retained = entry.first->retainedDeleteBytes();
       assert(entry.first->memSize() >= retained);
       size_t relief = entry.first->memSize() - retained;
-      if (relief == 0 || relief < pressureFlushFloorBytes) continue;
+      if (relief == 0 || relief < floor) continue;
       if (relief > largestRelief) {
         victim = entry.first;
         largestRelief = relief;
@@ -801,7 +836,20 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   // batch, not per doc. The
   // reservation is held until the inverter is destroyed (after flush), so
   // flushing inverters stay counted until their RAM is actually freed.
-  inverter.ramGuard.forceResize((int64_t)inverter.memSize());
+  inverter.ramGuard.forceResize((int64_t)inverter.memSize(), (int64_t)inverter.retainedDeleteBytes());
+  if (inverter.getMaxDoc() > inverter.acquisitionMaxDoc) {
+    inverter.minDocVersion = std::min(inverter.minDocVersion, inverter.currVersion);
+    minInverterDocVersion = std::min(minInverterDocVersion, inverter.minDocVersion);
+  }
+  // A delete-only buffer flushes at the RAM cap or the id dictionary's locality
+  // knee, whichever comes first: past the knee, larger packets buy no per-id
+  // saving. Below the floor, the knee's sum over segments is not needed.
+  if (!flush && inverter.commitInfo == nullptr && inverter.getMaxDoc() == 0
+      && inverter.deleteCount() >= deleteOnlyFlushFloor
+      && inverter.deleteCount() >= deleteOnlyFlushCapLocked()) {
+    flush = true;
+    deleteOnlyKneeFlushes++;
+  }
 
   // Size-based auto-flush is driven by the caller (ProtoUpdateMessage::handle passes
   // flush=true at end of batch when inverter.shouldFlush() is true), not decided here:
@@ -830,6 +878,8 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     // return inverter to idle pool
     idleInverters.emplace(&inverter, std::move(it->second));
     busyInverters.erase(it);
+    // Only the frontier holder going idle can make it worth flushing.
+    if (inverter.minDocVersion == minInverterDocVersion) flushPinningInverterLocked();
   }
 
   // Re-evaluate even when raw reservations fit: pending merge demand may need
@@ -1126,6 +1176,174 @@ void IndexWriter::_releaseToCommitSequencer(UpdateMessage* msg) {
   }
 }
 
+uint64_t IndexWriter::minDocumentVersionLocked() const {
+  uint64_t minimum = UINT64_MAX;
+  auto include = [&](const auto& inverters) {
+    for (const auto& [inverter, _] : inverters) minimum = std::min(minimum, inverter->minDocVersion);
+  };
+  include(busyInverters);
+  include(idleInverters);
+  include(flushingInverters);
+  return minimum;
+}
+
+// The delete frontier. A packet whose largest version V is at or below it has
+// no live inverter holding a document born before V and no older request in
+// flight. Completion is ordered: a request's documents are recorded under
+// indexMutex at release before completedUpdateVersion can pass its version.
+// Only request completion and flush registration raise the frontier, so
+// passes are requested there; a release cannot, since it lowers
+// minInverterDocVersion only to a request still in flight. Cached inputs are
+// lowered eagerly and raised only by a recompute, so a stale one can delay a
+// pass but never retire a packet early.
+uint64_t IndexWriter::deleteFrontierLocked() const {
+  return std::min(completedUpdateVersion, minInverterDocVersion);
+}
+
+uint64_t IndexWriter::deleteOnlyFlushCapLocked() const {
+  uint64_t blocks = 0;
+  for (const auto& [_, seg] : segInfos) {
+    auto count = seg->idDictionaryBlocks.load();
+    // Reopened segments and merge outputs without a finalized id dictionary
+    // count slots until a reader supplies the exact count (including partial
+    // blocks at partition boundaries).
+    if (count == UINT64_MAX) count = ((uint64_t)seg->maxDoc + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE;
+    blocks += count;
+  }
+  return std::max(deleteOnlyFlushFloor, blocks);
+}
+
+// The oldest inverter holding documents pins the frontier; flush it once idle
+// if the pending batches it holds back are at least its size. Releases of other
+// inverters cannot make that true, so it is checked when a batch registers,
+// when the holder goes idle, and on a pressure check.
+void IndexWriter::flushPinningInverterLocked() noexcept {
+  // Only a finite budget runs passes. A pin below completedUpdateVersion must
+  // hold back a pending batch.
+  if (indexRamBudget->totalBytes() == 0 || minInverterDocVersion >= completedUpdateVersion
+      || pendingDeletes.between(minInverterDocVersion, completedUpdateVersion).empty()) return;
+  Inverter* oldest = nullptr;
+  uint64_t first = UINT64_MAX, next = completedUpdateVersion;
+  auto include = [&](const auto& inverters) {
+    for (const auto& [inverter, _] : inverters) {
+      auto version = inverter->minDocVersion;
+      if (version == UINT64_MAX) continue;
+      if (version < first) {
+        next = std::min(next, first);
+        first = version;
+        oldest = inverter;
+      } else next = std::min(next, version);
+    }
+  };
+  include(busyInverters);
+  include(idleInverters);
+  include(flushingInverters);
+  if (!oldest || next <= first || !idleInverters.contains(oldest)) return;
+  uint64_t released = 0;
+  for (const auto& batch : pendingDeletes.between(first, next)) released += batch->memSize();
+  try {
+    if (released >= oldest->memSize() && startIdleFlushLocked(*oldest, false)) {
+      pinningInverterFlushes++;
+      Signal::emit("pinningInverterFlush", oldest, (void*)released);
+    }
+  } catch (...) {
+    // A flush that fails to start leaves the inverter idle for the next check.
+  }
+}
+
+// A pass takes a packet once every request through its largest version has
+// flushed and no outstanding commit has claimed it.
+bool IndexWriter::passMayRetireLocked(const SortedDeletes& packet, uint64_t frontier) const {
+  return packet.getLargestVersion() <= frontier && packet.commitClaim <= completedCommitVersion;
+}
+
+// Visits each packet a pass would take now, pending batches first, as
+// visit(packet, fromPending); stops and returns false once visit does. The
+// pass trigger and the pass's capture both select here. Pending batches are
+// ordered by largest version, so the walk stops at the first past the frontier.
+template <class Visit>
+bool IndexWriter::forEachPassPacketLocked(uint64_t frontier, Visit&& visit) {
+  for (const auto& packet : pendingDeletes.deletes) {
+    if (packet->getLargestVersion() > frontier) break;
+    if (passMayRetireLocked(*packet, frontier) && !visit(packet, true)) return false;
+  }
+  if (!carriedDeletes) return true;
+  bool carried = false;
+  for (const auto& [_, seg] : segInfos) {
+    for (const auto& packet : seg->personalDeletes.deletes) {
+      carried = true;
+      if (passMayRetireLocked(*packet, frontier) && !visit(packet, false)) return false;
+    }
+  }
+  carriedDeletes = carried;
+  return true;
+}
+
+// Any packet a pass may take starts one, so the final commit inherits only the
+// last generation. One outstanding message keeps a commit behind at most one
+// pass; its finish asks again. This runs for every request, so it reads only
+// pending batches at or below the frontier, and carried packets while a merge
+// output holds some.
+void IndexWriter::requestDeletePassLocked() noexcept {
+  if (deletePassQueued || deletePassHeld || isClosed() || indexRamBudget->totalBytes() == 0) return;
+  try {
+    if (forEachPassPacketLocked(deleteFrontierLocked(), [](const auto&, bool) { return false; })) return;
+    auto message = std::make_unique<DeletePassMessage>();
+    deletePassQueued = true;
+    if (commitFinishNode->try_put(message.get())) message.release();
+    else deletePassQueued = false;
+  } catch (...) {
+    deletePassQueued = false;
+  }
+}
+
+// A batch the frontier has passed leaves pressure: a pass, or the commit that
+// claimed it, reclaims it. Runs where the frontier can move, and marks only the
+// batches between the last frontier it saw and this one.
+void IndexWriter::markRetirableLocked() {
+  uint64_t frontier = deleteFrontierLocked();
+  if (frontier <= retirableThrough) return;
+  for (const auto& batch : pendingDeletes.between(retirableThrough, frontier)) {
+    if (batch->ramGuard) batch->ramGuard.markRetirable();
+  }
+  retirableThrough = frontier;
+}
+
+void IndexWriter::deletePassFinished(bool succeeded) {
+  uint64_t prepared;
+  std::optional<DeadlineScheduler::Clock::time_point> retry;
+  {
+    const std::lock_guard lock(indexMutex);
+    prepared = preparedDeleteVersion;
+    deletePassQueued = false;
+    if (succeeded) {
+      deletePassBackoff = {};
+    } else if (!isClosed()) {
+      // Retry without waiting for traffic, paced so a persistent fault cannot spin.
+      deletePassBackoff = deletePassBackoff.count() == 0 ? DELETE_PASS_RETRY_MIN
+                                                         : std::min(2 * deletePassBackoff, DELETE_PASS_RETRY_MAX);
+      deletePassHeld = true;
+      retry = DeadlineScheduler::Clock::now() + deletePassBackoff;
+    }
+    requestDeletePassLocked();
+  }
+  if (retry) {
+    try {
+      DeadlineScheduler::global().arm(deletePassRetrySlot, *retry);
+    } catch (const std::exception& e) {
+      LOG_ERROR("delete pass retry arm failed: {}", e.what());
+    }
+  }
+  Signal::emit("deletePassFinished", this, (void*)prepared);
+}
+
+// Runs on the DeadlineScheduler thread; close() detaches the slot.
+void IndexWriter::deletePassRetryFired() {
+  const std::lock_guard lock(indexMutex);
+  deletePassHeld = false;
+  requestDeletePassLocked();
+}
+
 // Inverter for the segment should already be in the flushingInverters list.
 // This is called in parallel.  The inverter will be deleted.
 void IndexWriter::segmentFlushBody(Inverter& inverter) {
@@ -1169,9 +1387,12 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
     segInfo->schemaGen = inverter.schema->gen_;
-    if (auto& range = inverter.getPostingsWriter().idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
+    auto& postings = inverter.getPostingsWriter();
+    if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
+    segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
+      liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
       segInfo->liveGen = inverter.liveGen;
       segInfo->liveDocs = inverter.liveDocs;
       assert(segInfo->liveDocs <= segInfo->maxDoc);
@@ -1196,7 +1417,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   }
 
   std::unique_ptr<Inverter> inverterPtr;
-  std::shared_ptr<const SortedDeletes> deletes;
+  std::shared_ptr<SortedDeletes> deletes;
   if (!aborted && inverter.hasDeletions()) {
     auto& batch = *inverter.sortedDeletes;
     int64_t actual = (int64_t)batch.memSize();
@@ -1215,7 +1436,20 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // The delete-set insertion may allocate. Holding indexMutex across both
     // registrations keeps segment snapshots consistent with their deletes.
     if (success) segInfos.reserve(segInfos.size() + 1);
-    if (deletes) pendingDeletes.deletes.insert(std::move(deletes));
+    if (deletes) {
+      if (segInfo) deletes->sourceSegId = segInfo->segId;
+      // An adopting commit retires the packet unless it holds a newer request,
+      // and must not race a pass for it. No commit adopts the inverter once it
+      // leaves flushingInverters below. If initiateCommit throws after adopting
+      // inverters, nothing completes that commit, so their packets keep the
+      // claim until a later commit completes: a delay only.
+      if (auto* commit = inverter.commitInfo) {
+        uint64_t version = commit->updateMessage->updateVersion;
+        if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
+      }
+      if (deletes->getLargestVersion() <= retirableThrough && deletes->ramGuard) deletes->ramGuard.markRetirable();
+      pendingDeletes.deletes.insert(std::move(deletes));
+    }
 
     // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
     std::pair<SegMap::iterator, bool> iter;
@@ -1231,6 +1465,13 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     }
     inverterPtr = std::move(it->second);
     flushingInverters.erase(it);
+    // The cached minimum rises only when the inverter holding it leaves.
+    if (inverterPtr->minDocVersion != UINT64_MAX && inverterPtr->minDocVersion == minInverterDocVersion) {
+      minInverterDocVersion = minDocumentVersionLocked();
+    }
+    markRetirableLocked();
+    requestDeletePassLocked();
+    flushPinningInverterLocked();
 
     // Check if we should merge anything.  Must happen *before* the leftToFlush
     // decrement: if this flush triggers a merge and the inverter's commit is
@@ -1270,10 +1511,92 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   }
 }
 
+void IndexWriter::DeleteApplication::select(const std::shared_ptr<const SortedDeletes>& packet, bool fromPending) {
+  selected.deletes.insert(packet);
+  if (fromPending) pending.deletes.insert(packet);
+}
+
+void IndexWriter::DeleteApplication::unpin() {
+  if (!pinned) return;
+  const std::lock_guard lock(writer.indexMutex);
+  for (auto* seg : segs) --seg->preparationPins;
+  pinned = false;
+}
+
+// Caller holds indexMutex. Pins every registered segment across application
+// and concurrent merge replacement, and picks those a selected packet may touch.
+void IndexWriter::pinSnapshotLocked(DeleteApplication& app) {
+  app.segs.reserve(segInfos.size());
+  app.targets.reserve(segInfos.size());
+  app.pinned = true;
+  for (auto& [segId, seg] : segInfos) {
+    app.segs.push_back(seg.get());
+    ++seg->preparationPins;
+    bool carried = std::ranges::any_of(seg->personalDeletes.deletes, [&](const auto& packet) {
+      return app.selected.deletes.contains(packet) && mayApplyDeletes(*seg, *packet);
+    });
+    if (carried || mayApplyDeletes(*seg, app.pending)) app.targets.push_back(seg.get());
+  }
+}
+
+// A running merge carries completed applications by liveDocs diff. Only an
+// application finishing after the swap needs a packet carry to the output.
+void IndexWriter::reconcileDeletes(const DeleteApplication& app) {
+  const std::lock_guard<std::mutex> lock(indexMutex);
+  for (auto* seg : app.segs) {
+    if (!seg->merging && seg->mergedLiveGen >= 0 && seg->mergedLiveGen != (int64_t)seg->liveGen) {
+      // Swaps keep mergedIntoSegId on the latest output. An output that is
+      // no longer live has nothing left to delete.
+      if (auto it = segInfos.find(seg->mergedIntoSegId); it != segInfos.end()) {
+        auto& target = *it->second;
+        // The output is newer than this snapshot. Attach before clearing
+        // the source so an allocation failure keeps the packets.
+        assert(std::ranges::find(app.segs, &target) == app.segs.end());
+        uint64_t carriedBytes = 0;
+        auto carry = [&](const auto& packet) {
+          if (target.personalDeletes.deletes.insert(packet).second) carriedBytes += packet->memSize();
+          carriedDeletes = true;
+        };
+        for (const auto& packet : seg->personalDeletes.deletes) {
+          if (app.selected.deletes.contains(packet)) carry(packet);
+        }
+        // Batches this application does not retire reach the output from pending.
+        for (const auto& batch : app.pending.deletes) {
+          if (batch->getLargestVersion() <= app.retireThrough) carry(batch);
+        }
+        Signal::emit("mergeDeleteCarry", this, (void*)carriedBytes, seg);
+      }
+    }
+    if (!seg->personalDeletes.empty()) {
+      boost::container::erase_if(seg->personalDeletes.deletes,
+                                 [&](const auto& packet) { return app.selected.deletes.contains(packet); });
+    }
+  }
+}
+
+// Retires the application's pending batches through retireThrough; merge
+// carries keep their own references. Returns the bytes removed from pending.
+uint64_t IndexWriter::retirePendingLocked(const DeleteApplication& app) {
+  uint64_t bytes = 0;
+  for (const auto& batch : app.pending.deletes) {
+    if (batch->getLargestVersion() > app.retireThrough || !pendingDeletes.deletes.erase(batch)) continue;
+    preparedDeleteVersion = std::max(preparedDeleteVersion, batch->getLargestVersion());
+    bytes += batch->memSize();
+  }
+  return bytes;
+}
+
 // This applies deletes and writes out the new segments file.
 // called from the commitFinishNode which has concurrency==1 (single-threaded)
 bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
+  // A commit's claims end with it on every path; packets it did not retire
+  // return to passes.
+  auto endClaims = scope_guard([this, version = msg.updateVersion] {
+    const std::lock_guard lock(indexMutex);
+    completedCommitVersion = std::max(completedCommitVersion, version);
+    requestDeletePassLocked();
+  });
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   // TODO: if nothing actually changed, we could skip writing a new commit at this point.
   // Not for a commit that waits for replicas: that wait relies on a generation
@@ -1282,100 +1605,38 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // Pin the application snapshot through publication. A concurrent merge
   // diffs source liveDocs before swapping; applications finishing after that
   // swap forward their packets to its output for the next application.
-
-  MultiDeletesData commitDeletes;
-  uint64_t maxDeleteVersion;
-
-  std::vector<SegInfo*> segs;
-  std::vector<SegInfo*> segsToApplyDeletes;
-  std::vector<SegInfo*> markedInUse;
-
-  // A failed commit must clear its in-use marks: a marked segment that a merge
-  // retires before the next successful commit would otherwise never be deleted.
-  // Cleared once published, when publication or the empty-segment drop below
-  // has replaced every mark and retirement may free the segments.
-  auto releaseInUseMarks = scope_guard([&] {
-    if (markedInUse.empty()) return;
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    for (auto* seg : markedInUse) {
-      if (seg->lastCommitTime == 1) seg->lastCommitTime = 0;
-    }
-  });
-
+  DeleteApplication app(*this);
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-    commitDeletes = pendingDeletes;
-    maxDeleteVersion = commitDeletes.getLargestVersion();
-    msg.commitInfo->highestUpdateVersion =
-      std::max({durableUpdateVersion, msg.updateVersion, maxDeleteVersion});
-    segs.reserve(segInfos.size());
-    markedInUse.reserve(segInfos.size());
-    // grab all segments and mark them as being part of a commit.
-    for (auto& [segId, seg] : segInfos) {
-      segs.push_back(seg.get());
-      if (seg->lastCommitTime == 0) {
-        seg->lastCommitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
-        markedInUse.push_back(seg.get());
-      }
-      if (mayApplyDeletes(*seg, commitDeletes) || mayApplyDeletes(*seg, seg->personalDeletes)) {
-        // this segment has personal deletes and/or commit-level deletes that need to be applied.
-        segsToApplyDeletes.push_back(seg.get());
-      }
+    // A commit applies every pending batch and carried packet. publishOnly
+    // commits retire nothing; their batches stay pending.
+    for (const auto& batch : pendingDeletes.deletes) app.select(batch, true);
+    for (const auto& [_, seg] : segInfos) {
+      for (const auto& packet : seg->personalDeletes.deletes) app.select(packet, false);
     }
+    app.retireThrough = msg.publishOnly ? 0 : msg.updateVersion;
+    msg.commitInfo->highestUpdateVersion =
+      std::max({durableUpdateVersion, preparedDeleteVersion, msg.updateVersion, app.pending.getLargestVersion()});
+    pinSnapshotLocked(app);
   }
 
   // If a segmentMerge kicks off here, it could be merging segments without deletes applied yet.
   // We check for that after we finish applying deletes.
+  INDEX_DEBUG("finishCommitBody: msg={} applying deletes to {} of {} segments.", (void*)&msg,
+              app.targets.size(), app.segs.size());
+  applyDeletes(app);
+  reconcileDeletes(app);
 
   // Collect filenames that need to be fsynced before the commit point.
   std::vector<std::string> filesToSync;
 
   CommitInfo& commitInfo = *msg.commitInfo;
-  if (segsToApplyDeletes.empty()) {
-    INDEX_DEBUG("finishCommitBody: msg={} no deletes to apply.", (void*)&msg);
-  }
-  else {
-    INDEX_DEBUG("finishCommitBody: msg={} applying deletes to {} segments.", (void*)&msg, segs.size());
-    // This is where seg.liveGen can change!
-    // Can personal deletes be mutated elsewhere?
-    // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
-    // so we will either see the new segment with its personal deletes, or not see the segment at all.
-    applyDeletes(segsToApplyDeletes, commitDeletes);
-  }
-
-
-  // A running merge carries completed applications by liveDocs diff. Only
-  // an application finishing after the swap needs a packet carry to the output.
-  // publishOnly commits retire nothing; their batches stay pending.
-  const uint64_t retireThrough = msg.publishOnly ? 0 : msg.updateVersion;
-  {
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    for (auto* seg : segs) {
-      if (!seg->merging && seg->mergedLiveGen >= 0 && seg->mergedLiveGen != (int64_t)seg->liveGen) {
-        // Swaps keep mergedIntoSegId on the latest output. An output that is
-        // no longer live has nothing left to delete.
-        if (auto it = segInfos.find(seg->mergedIntoSegId); it != segInfos.end()) {
-          auto& target = *it->second;
-          // The output is newer than this snapshot. Attach before clearing
-          // the source so an allocation failure keeps the packets.
-          assert(std::ranges::find(segs, &target) == segs.end());
-          target.personalDeletes.addAll(seg->personalDeletes);
-          // Batches this application does not retire reach the output from pending.
-          for (const auto& batch : commitDeletes.deletes) {
-            if (batch->getLargestVersion() <= retireThrough) target.personalDeletes.deletes.insert(batch);
-          }
-        }
-      }
-      seg->personalDeletes.clear();
-    }
-  }
-
   // Check if any of the segments are now empty and remove them from the list.
   std::vector<SegInfo*> segsToKeep;
   std::vector<SegInfo*> toDelete;
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-    for (auto& seg : segs) {
+    for (auto* seg : app.segs) {
       if (seg->liveDocs == 0) {
         toDelete.push_back(seg);
       }
@@ -1450,17 +1711,17 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::unique_lock publicationLock(publicationMutex);
   CommitId result{incarnation, 0};
   writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
-  markedInUse.clear();
   for (auto* seg : segsToKeep) seg->unsyncedFiles.clear();
   result.index_gen = indexGen;
   msg.resultingCommit = std::move(result);
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     // Retire only batches in this snapshot. Later flushes may have registered
-    // more while deletes were applied. Merge catch-up owns its own references.
-    for (const auto& batch : commitDeletes.deletes) {
-      if (batch->getLargestVersion() <= retireThrough) pendingDeletes.deletes.erase(batch);
-    }
+    // more while deletes were applied.
+    retirePendingLocked(app);
+    // A published application lifts a failed pass's hold.
+    deletePassBackoff = {};
+    deletePassHeld = false;
   }
   publicationLock.unlock();
   // publishOnly commits publish a merge layout without flushing later-arrived
@@ -1472,8 +1733,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // NOTE: we did have a call to tryDeleteSegments() from the merge code as well, but
   // there was a race condition: writeIndexInfoFile() was updating the commitTime of
   // the segments before updating lastCommitTime, so a segment could be deleted in that period.
-  // The race is fixable (always use "1" for a segment being committed, etc), but it's
-  // easier for now to just call tryDeleteSegments() in this method.
+  // Preparation pins now protect that interval; cleanup still follows publication.
   if (!toDelete.empty()) {
     const std::lock_guard<std::mutex> lock(indexMutex);
     for (auto& seg : toDelete) {
@@ -1486,6 +1746,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // but we'll just do it here for now.
 
   // Delete segment files only after the IndexInfo file is written.
+  app.unpin();
   tryDeleteSegments();
 
   if (msg.maxSegments > 0) {
@@ -1493,6 +1754,66 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     return false;
   }
   return true;
+}
+
+// A delete pass applies and retires the packets every request through the
+// frontier has flushed, without flushing, syncing or publishing; the next
+// commit publishes what it prepared. Capture, application and merge
+// reconciliation are a commit's.
+void IndexWriter::deletePassBody() {
+  if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
+  auto start = std::chrono::steady_clock::now();
+  DeleteApplication app(*this);
+  {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    app.retireThrough = deleteFrontierLocked();
+    forEachPassPacketLocked(app.retireThrough, [&](const auto& packet, bool fromPending) {
+      app.select(packet, fromPending);
+      return true;
+    });
+    // A commit ahead of this message may have retired what triggered it.
+    if (app.selected.empty()) return;
+    pinSnapshotLocked(app);
+    deletePassStats.deletePassCount++;
+    for (const auto& packet : app.selected.deletes) deletePassStats.deletePassFacts += deleteFacts(*packet);
+    for (const auto& packet : app.pending.deletes) deletePassStats.deletePassNewFacts += deleteFacts(*packet);
+  }
+  auto timing = scope_guard([&] {
+    uint64_t nanos = nanosSince(start);
+    const std::lock_guard lock(indexMutex);
+    deletePassStats.deletePassNanos += nanos;
+    deletePassStats.deletePassMaxNanos = std::max(deletePassStats.deletePassMaxNanos, nanos);
+  });
+  Signal::emit("deletePassStart", this, (void*)app.retireThrough);
+  uint64_t probes = applyDeletes(app);
+  reconcileDeletes(app);
+
+  {
+    const std::lock_guard lock(indexMutex);
+    deletePassStats.deletePassProbes += probes;
+    deletePassStats.deletePassMaxProbes = std::max(deletePassStats.deletePassMaxProbes, probes);
+    deletePassStats.deletePassRetiredBytes += retirePendingLocked(app);
+    // The next publication makes the smaller layout visible.
+    for (auto* seg : app.segs) {
+      if (seg->liveDocs == 0 && !seg->merging) moveSegmentToDelete(seg->segId);
+    }
+  }
+  app.unpin();
+  // Reclaims the generations this pass superseded and the segments it emptied.
+  tryDeleteSegments();
+}
+
+// Collects seg's obsolete liveDocs generations for retirement, keeping the
+// current, published and merge-held ones. No sync list holds the others:
+// applyDeletes drops a generation from unsyncedFiles when it supersedes it.
+void IndexWriter::collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::string>& names) {
+  std::erase_if(seg.obsoleteLiveGens, [&](uint64_t gen) {
+    if (gen == seg.liveGen || gen == seg.publishedLiveGen
+        || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)
+        || (seg.mergeDiffLiveGen > 0 && gen == (uint64_t)seg.mergeDiffLiveGen)) return false;
+    names.push_back(Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), gen));
+    return true;
+  });
 }
 
 // Attempts to actually remove the files for segments in the deletion list.
@@ -1508,44 +1829,38 @@ void IndexWriter::tryDeleteSegments() {
       std::lock_guard publicationLock(publicationMutex);
       const std::lock_guard<std::mutex> lock(indexMutex);
       liveDocsToDelete.swap(pendingRetirement);
-      // grab all segments and put back ones we shouldn't delete yet.
-      std::swap(localDeleteList, segmentsToDelete);
-      for (auto& seg : localDeleteList) {
-        bool published = std::ranges::find(lastCommittedSegIds, seg->segId) != lastCommittedSegIds.end();
-        if (seg->merging || published || seg->lastCommitTime == 1) {
-          segmentsToDelete.push_back(std::move(seg)); // keep it in the list, we can't delete it yet.
-        }
-      }
-      auto retireLiveDocs = [&](SegInfo& seg) {
-        // Generations beyond the published one can still be in a preparing
-        // commit's sync list, including after a failed publication.
-        std::erase_if(seg.obsoleteLiveGens, [&](uint64_t gen) {
-          if (gen == seg.liveGen || gen >= seg.publishedLiveGen
-              || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)
-              || (seg.mergeDiffLiveGen > 0 && gen == (uint64_t)seg.mergeDiffLiveGen)) return false;
-          auto name = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), gen);
-          liveDocsToDelete.push_back(std::move(name));
-          return true;
-        });
-      };
-      for (auto& [id, seg] : segInfos) retireLiveDocs(*seg);
-      for (auto& seg : segmentsToDelete) retireLiveDocs(*seg);
+      localDeleteList = takeDeletableSegmentsLocked();
+      for (auto& [id, seg] : segInfos) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
+      for (auto& seg : segmentsToDelete) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
     }
 
     // No publication or index lock is held during filesystem cleanup.
-    Signal::emit("segmentRetirement", this);
     snapshots.retire(liveDocsToDelete);
-    // Now delete the segments outside of the mutex.
-    // In the future, if we wanted to support windows, we need a background deleter to
-    // retry deletes after some time in case they are still open.
-    for (auto& seg : localDeleteList) {
-      if (!seg) continue; // skip null segments
-      INDEX_DEBUG("Deleting files {}", *seg);
-      snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
-      seg.reset(); // deletes the in-memory segment info
-    }
+    retireSegments(localDeleteList);
   } catch (std::exception& e) {
     LOG_ERROR("Exception caught while deleting segments: {}", e.what());
+  }
+}
+
+std::vector<std::unique_ptr<SegInfo>> IndexWriter::takeDeletableSegmentsLocked() {
+  std::vector<std::unique_ptr<SegInfo>> result;
+  result.swap(segmentsToDelete);
+  for (auto& seg : result) {
+    bool published = std::ranges::find(lastCommittedSegIds, seg->segId) != lastCommittedSegIds.end();
+    if (seg->merging || published || seg->preparationPins != 0) {
+      segmentsToDelete.push_back(std::move(seg));
+    }
+  }
+  return result;
+}
+
+void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments) {
+  Signal::emit("segmentRetirement", this);
+  for (auto& seg : segments) {
+    if (!seg) continue;
+    INDEX_DEBUG("Deleting files {}", *seg);
+    snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
+    seg.reset();
   }
 }
 
@@ -1656,18 +1971,25 @@ std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& s
     if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId);
     seg.sharedPostingsReader.store(pr);
   }
-  if (!seg.idRange.load()) {
+  bool rangeKnown = seg.idRange.load() != nullptr;
+  if (!rangeKnown || seg.idDictionaryBlocks.load() == UINT64_MAX) {
     IdRange range;
+    uint64_t blocks = 0;
     if (auto* info = pr->fieldInfo("id"); info && info->nTerms > 0) {
       auto guard = MemPool::threadLocalPoolGuard();
       TermsEnum terms(guard.pool(), *pr, *info);
-      terms.seekOrd(0);
-      range.min = (std::string_view)terms.term();
-      terms.seekOrd(info->nTerms - 1);
-      range.max = (std::string_view)terms.term();
-      range.empty = false;
+      blocks = terms.numBlocks();
+      if (!rangeKnown) {
+        terms.seekOrd(0);
+        range.min = (std::string_view)terms.term();
+        terms.seekOrd(info->nTerms - 1);
+        range.max = (std::string_view)terms.term();
+        range.empty = false;
+      }
     }
-    seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
+    seg.idDictionaryBlocks.store(blocks);
+    // A populated range is never replaced.
+    if (!rangeKnown) seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
   }
   return pr;
 }
@@ -2380,6 +2702,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
+      if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
@@ -2479,9 +2802,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           auto name = Postings::getLiveDocsFileName(Postings::getSortableString(outputSegId), 1);
           std::erase(newSegInfo->unsyncedFiles, name);
           std::erase_if(newSegInfo->files, [&](const auto& file) { return file.name == name; });
-          LiveDocsWriter::writeLiveDocs(dir, outputSegId, 1, *outputLiveBits,
-                                       newSegInfo->maxDoc, newSegInfo->liveDocs,
-                                       newSegInfo->unsyncedFiles, &newSegInfo->files);
+          liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, outputSegId, 1, *outputLiveBits,
+                                                                newSegInfo->maxDoc, newSegInfo->liveDocs,
+                                                                newSegInfo->unsyncedFiles, &newSegInfo->files);
           newSegInfo->liveGen = 1;
         }
         Signal::emit("mergeLiveDocsDiff", newSegInfo.get());
@@ -2520,6 +2843,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           if (!segInfo->personalDeletes.empty()) {
             INDEX_DEBUG("Will merge personal deletes from {} to {}", *segInfo, *newSegInfo);
             newSegInfo->personalDeletes.addAll(segInfo->personalDeletes);
+            carriedDeletes = true;
           }
 
           // remove from the index: move from segInfos to segmentsToDelete
@@ -2795,7 +3119,14 @@ void IndexWriter::testDeleteAllData() {
     activeVectorOverlayNames.clear();
     lastMergeFailure.reset();
     pendingDeletes.clear();
+    retirableThrough = 0;
+    carriedDeletes = false;
+    minInverterDocVersion = UINT64_MAX;
     durableUpdateVersion = 0;
+    preparedDeleteVersion = 0;
+    completedCommitVersion = 0;
+    deletePassBackoff = {};
+    deletePassHeld = false;
     nextManifestGen = 0;
     manifestNames.clear();
 
@@ -2889,28 +3220,29 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);
     out.schemaGen = schemaGen_;
     out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
+    static_cast<DeletePassStats&>(out) = deletePassStats;
     out.completedUpdateVersion = completedUpdateVersion;
-    auto includeInverters = [&](const auto& inverters) {
-      for (const auto& [inverter, _] : inverters) {
-        out.minInverterVersion = std::min(out.minInverterVersion, inverter->minVersion);
-      }
-    };
-    includeInverters(busyInverters);
-    includeInverters(idleInverters);
-    includeInverters(flushingInverters);
-    uint64_t frontier = std::min(out.completedUpdateVersion, out.minInverterVersion);
+    out.minInverterDocVersion = minInverterDocVersion;
+    uint64_t frontier = deleteFrontierLocked();
+    out.liveDocsBytesWritten = liveDocsBytesWritten.load(std::memory_order_relaxed);
+    out.pinningInverterFlushes = pinningInverterFlushes;
+    out.deleteOnlyKneeFlushes = deleteOnlyKneeFlushes;
+    out.deleteOnlyFlushCap = deleteOnlyFlushCapLocked();
     boost::unordered_flat_set<const SortedDeletes*> retained;
-    auto countDeletes = [&](const MultiDeletesData& deletes) {
+    for (const auto& batch : pendingDeletes.deletes) {
+      retained.insert(batch.get());
+      if (batch->getLargestVersion() <= frontier) out.pendingRetirableDeleteBytes += batch->memSize();
+      else out.pendingHeldDeleteBytes += batch->memSize();
+    }
+    auto countCarry = [&](const MultiDeletesData& deletes) {
       for (const auto& batch : deletes.deletes) {
-        if (retained.insert(batch.get()).second) {
-          out.retainedDeleteBytes += batch->memSize();
-          if (batch->getLargestVersion() > frontier) out.frontierHeldDeleteBytes += batch->memSize();
-        }
+        if (retained.insert(batch.get()).second) out.mergeCarryDeleteBytes += batch->memSize();
       }
     };
-    countDeletes(pendingDeletes);
-    for (const auto& [_, seg] : segInfos) countDeletes(seg->personalDeletes);
-    for (const auto& seg : segmentsToDelete) countDeletes(seg->personalDeletes);
+    for (const auto& [_, seg] : segInfos) countCarry(seg->personalDeletes);
+    for (const auto& seg : segmentsToDelete) countCarry(seg->personalDeletes);
+    out.frontierHeldDeleteBytes = out.pendingHeldDeleteBytes;
+    out.retainedDeleteBytes = out.pendingRetirableDeleteBytes + out.pendingHeldDeleteBytes + out.mergeCarryDeleteBytes;
     out.segments = segInfos.size();
     out.flushing = flushingInverters.size();
     out.idle = idleInverters.size();
@@ -2992,109 +3324,12 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   return out;
 }
 
-/// A cursor into a sorted EntrySpan for k-way merge.
-namespace {
-
-struct DeletesCursor {
-  const SortedDeletes::Entry* curr;
-  const SortedDeletes::Entry* end;
-
-  bool exhausted() const { return curr >= end; }
-  void advance() { ++curr; }
-  const SortedDeletes::Entry& current() const { return *curr; }
-};
-
-struct DeletesCursorGreater {
-  bool operator()(const DeletesCursor& a, const DeletesCursor& b) const {
-    return a.current() > b.current();  // min-heap: greater means lower priority
-  }
-};
-
-/// K-way merge of pre-sorted entry spans into a single sorted, deduped vector.
-/// Drops inert facts (watermark==0). Deduplicates by id, keeping the highest watermark.
-/// If there's only one input span, returns it directly (no allocation).
-SortedDeletes::EntrySpan mergeDeleteSpans(
-    std::span<const SortedDeletes::EntrySpan> spans,
-    std::vector<SortedDeletes::Entry>& out, IndexRamBudget::Guard& scratch) {
-
-  using Entry = SortedDeletes::Entry;
-
-  if (spans.empty()) return {};
-  if (spans.size() == 1) return spans[0];
-
-  // Build cursors for non-empty spans
-  boost::container::small_vector<DeletesCursor, 8> cursors;
-  size_t total = 0;
-  for (auto& span : spans) {
-    if (!span.empty()) {
-      cursors.push_back({span.data(), span.data() + span.size()});
-      total += span.size();
-    }
-  }
-
-  if (cursors.empty()) return {};
-  if (cursors.size() == 1) {
-    return {cursors[0].curr, (size_t)(cursors[0].end - cursors[0].curr)};
-  }
-
-  scratch.forceResize((int64_t)(total * sizeof(Entry)));
-  out.reserve(total);
-  if (out.capacity() != total) scratch.forceResize((int64_t)(out.capacity() * sizeof(Entry)));
-
-  // K-way merge using a min-heap of cursors
-  DirectPQ<DeletesCursor, DeletesCursorGreater> pq(cursors, cursors.size());
-
-  while (pq.size() > 0) {
-    auto& top = pq.top();
-    // Copy the entry - the reference into the span's backing memory remains valid after
-    // advance/removeTop since entries live in detached TermValHash tables, not in the cursor.
-    Entry entry = top.current();
-
-    top.advance();
-    if (top.exhausted()) {
-      pq.removeTop();
-    } else {
-      pq.updateTop();
-    }
-
-    // Drain any duplicates with the same id from other cursors, keeping the highest watermark.
-    while (pq.size() > 0 && (std::string_view)pq.top().current() == (std::string_view)entry) {
-      const auto& candidate = pq.top().current();
-      if (candidate.val().deleteWatermark > entry.val().deleteWatermark) entry = candidate;
-
-      pq.top().advance();
-      if (pq.top().exhausted()) {
-        pq.removeTop();
-      } else {
-        pq.updateTop();
-      }
-    }
-
-    // A zero watermark is inert.
-    if (entry.val().deleteWatermark > 0) {
-      out.push_back(entry);
-    }
-  }
-
-  return out;
-}
-
-} // anonymous namespace
-
-void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData) {
-  // Collect commit-level spans
-  boost::container::small_vector<SortedDeletes::EntrySpan, 4> commitSpans;
-  for (const auto& sd : multiDeletesData.deletes) {
-    for (auto& span : sd->lists()) {
-      commitSpans.push_back(span);
-    }
-  }
-
-  // Merge commit-level deletes once - reused across all segments
-  auto mergedGuard = indexRamBudget->forceAcquire(0);
-  std::vector<SortedDeletes::Entry> mergedBuf;
-  SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf, mergedGuard);
-
+// This is where seg.liveGen can change. A snapshot segment's personal deletes
+// stay put meanwhile: a merge attaches them to a new output under indexMutex,
+// and the snapshot holds that output whole or not at all. Returns the clipped
+// facts applied, summed over segments.
+uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
+  std::atomic<uint64_t> applications = 0;
   // Apply deletes to segments in parallel.  Each task writes new liveDocs
   // filenames into its own segment's unsyncedFiles (single owner per task, no
   // synchronization needed); the commit body drains unsyncedFiles into the
@@ -3104,55 +3339,49 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData&
   // The waiting commit thread must not execute an unrelated merge or flush.
   oneapi::tbb::this_task_arena::isolate([&] {
     oneapi::tbb::task_group tg;
-    for (SegInfo* seg : segs) {
-      tg.run([this, seg, commitDeletes]() {
-        applyDeletes(*seg, commitDeletes);
+    for (SegInfo* seg : app.targets) {
+      tg.run([this, seg, &app, &applications]() {
+        // Packets apply span by span, unmerged: a document goes when any fact for
+        // its id outranks its birth, which is what a merged maximum would decide.
+        boost::container::small_vector<SortedDeletes::EntrySpan, 8> spans;
+        auto add = [&](const SortedDeletes& packet) {
+          if (packet.sourceSegId == seg->segId || !mayApplyDeletes(*seg, packet)) return;
+          for (auto& span : packet.lists()) spans.push_back(span);
+        };
+        for (const auto& packet : app.pending.deletes) add(*packet);
+        for (const auto& packet : seg->personalDeletes.deletes) {
+          if (!app.pending.deletes.contains(packet) && app.selected.deletes.contains(packet)) add(*packet);
+        }
+        applications.fetch_add(applyDeletes(*seg, spans), std::memory_order_relaxed);
       });
     }
     tg.wait();
   });
+  return applications.load(std::memory_order_relaxed);
 }
 
-void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes) {
-  if (commitDeletes.empty() && seg.personalDeletes.empty()) {
-    return;
+uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans) {
+  if (spans.empty()) {
+    return 0;
   }
 
   // Test hook: reports each segment selected for delete application this commit.
   // Called in parallel for different segments, so consumers should synchronize when applicable.
   luxir::Signal::emit("deleteAppliedToSegment", (void*)(int64_t)seg.segId);
 
-  // If this segment has personal deletes (rare - only during concurrent merges),
-  // merge them with commit deletes into a combined span.
-  SortedDeletes::EntrySpan deleteSpan = commitDeletes;
-  boost::container::small_vector<SortedDeletes::EntrySpan, 4> allSpans;
-  auto segMergedGuard = indexRamBudget->forceAcquire(0);
-  std::vector<SortedDeletes::Entry> segMergedBuf;
-
-  if (!seg.personalDeletes.empty()) {
-    for (const auto& sd : seg.personalDeletes.deletes) {
-      for (auto& span : sd->lists()) {
-        allSpans.push_back(span);
-      }
+  boost::container::small_vector<SortedDeletes::EntrySpan, 8> clipped;
+  auto clip = [&](const IdRange& range) {
+    clipped.clear();
+    for (auto span : spans) {
+      span = clipDeletes(span, range);
+      if (!span.empty()) clipped.push_back(span);
     }
-    if (!commitDeletes.empty()) {
-      allSpans.push_back(commitDeletes);
-    }
-    deleteSpan = mergeDeleteSpans(allSpans, segMergedBuf, segMergedGuard);
-  }
-
-  if (deleteSpan.empty()) {
-    return;
-  }
-
+  };
   auto range = seg.idRange.load();
   if (range) {
-    deleteSpan = clipDeletes(deleteSpan, *range);
-    if (deleteSpan.empty()) return;
+    clip(*range);
+    if (clipped.empty()) return 0;
   }
-
-  auto guard = MemPool::threadLocalPoolGuard();
-  MemPool& pool = guard.pool();
 
   // Read the segment to find documents that should be deleted
   auto sharedReader = getSegmentPostingsReader(seg);
@@ -3160,8 +3389,8 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t maxDocId = reader.maxDoc();
 
   if (!range) {
-    deleteSpan = clipDeletes(deleteSpan, *seg.idRange.load());
-    if (deleteSpan.empty()) return;
+    clip(*seg.idRange.load());
+    if (clipped.empty()) return 0;
   }
 
   // Load existing LiveDocs if they exist: the published reader's when it
@@ -3176,96 +3405,128 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.liveGen, maxDocId);
   }
 
-  // We'll allocate the FixedBitSet only when we find the first new delete
+  // The new generation's bits: copied from the existing liveDocs at the first
+  // delete, or before chunk tasks start so they only clear bits.
   std::unique_ptr<screaming::RAMFixedBitSet> liveBits;
+  auto ensureLiveBits = [&] {
+    if (liveBits) return;
+    liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
+    if (existingLiveDocs) {
+      const auto& existingBitset = existingLiveDocs->bitset();
+      size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
+      std::memcpy(liveBits->words, existingBitset.words, wordsSize);
+    }
+  };
 
-  // currLiveBits points to the FixedBitSet that should be used to check for live documents.
-  // it starts off pointing to the existing live documents, but switches to the new liveBits.
+  // currLiveBits is the existing generation, immutable while chunks collect.
   const screaming::FixedBitSet* currLiveBits = existingLiveDocs ? &existingLiveDocs->bitset() : nullptr;
   int32_t numLiveDocs = existingLiveDocs ? existingLiveDocs->numLive() : maxDocId;
-  int32_t newDeletesCount = 0;
+  std::atomic<int32_t> newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
   auto* idFieldInfo = reader.fieldInfo("id");
   if (!idFieldInfo) {
     LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
-    return;
+    return 0;
   }
 
-  TermsEnum termsEnum(pool, reader, *idFieldInfo);
-
-  // Phase 1: walk the merged delete span and collect the live candidate doc
-  // for each delete entry.
-  // The span is sorted by id, so we use seekForward() to scan the segment's terms
-  // in order, avoiding redundant binary searches across blocks.
-  // Zero watermarks are inert, including in the single-span fast path.
+  // Each chunk walks its id-sorted piece with seekForward() and collects the
+  // live doc for each hit, then gates hits in docId order against request
+  // births and clears them. Hits drain whenever they reach the chunk size, so
+  // scratch is bounded by the chunk rather than by overlapping packets or
+  // duplicate postings. Zero watermarks are inert.
   struct DeleteCandidate {
     int32_t docId;
     uint64_t deleteVersion;
   };
-  std::vector<DeleteCandidate> candidates;
-
-  for (auto& entry : deleteSpan) {
-    uint64_t deleteVersion = entry.val().deleteWatermark;
-    if (deleteVersion == 0) continue;
-    std::string_view deleteId = (std::string_view)entry;
-
-    INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
-             deleteId, deleteVersion, seg.segId);
-
-    if (termsEnum.seekForward(deleteId)) {
-      // Found the ID term, now get documents containing this ID
-      DocsOnlyEnum docsEnum(termsEnum);
-
-      for (int32_t docId = docsEnum.next(); docId != DocsEnumMeta::END; docId = docsEnum.next()) {
-        if (currLiveBits && !currLiveBits->get(docId)) {
-          continue;
-        }
-        candidates.push_back({docId, deleteVersion});
-      }
-    } // end if termsEnum.seek()
-  }
-
-  // Gate in docId order with a forward cursor over request births.
-  std::sort(candidates.begin(), candidates.end(),
-            [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
-  VersionRuns::Cursor versions(reader.versionRuns());
-  for (const auto& candidate : candidates) {
-    uint64_t docVersion = versions.birth(candidate.docId);
-
-    if (docVersion < candidate.deleteVersion) {
-      if (!liveBits) {
-        liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
-
-        if (existingLiveDocs) {
-          const auto& existingBitset = existingLiveDocs->bitset();
-          size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
-          std::memcpy(liveBits->words, existingBitset.words, wordsSize);
-        }
-      }
-
-      // a doc could appear under two delete entries if it indexed multiple id
-      // values; guard the count against clearing the same bit twice.
-      if (liveBits->get(candidate.docId)) {
-        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}",
-                 candidate.docId, seg.segId);
-        liveBits->clear(candidate.docId);
-        newDeletesCount++;
+  const size_t chunk = deleteApplyChunkEntries;
+  assert(chunk > 0);
+  auto drain = [&](std::vector<DeleteCandidate>& hits, IndexRamBudget::Guard& scratch) {
+    if (hits.empty()) return;
+    scratch.forceResize((int64_t)(hits.capacity() * sizeof(DeleteCandidate)));
+    std::sort(hits.begin(), hits.end(),
+              [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
+    VersionRuns::Cursor versions(reader.versionRuns());
+    int32_t cleared = 0;
+    for (const auto& hit : hits) {
+      // A doc goes when any fact outranks its birth; ties survive.
+      if (versions.birth(hit.docId) >= hit.deleteVersion) continue;
+      ensureLiveBits();
+      // A doc can be hit from several chunks or packets (or by several id values);
+      // only the clear that finds its bit set counts it.
+      std::atomic_ref<uint64_t> word(liveBits->words[hit.docId >> 6]);
+      uint64_t mask = (uint64_t)1 << (hit.docId & 63);
+      if (word.fetch_and(~mask, std::memory_order_relaxed) & mask) {
+        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", hit.docId, seg.segId);
+        cleared++;
       }
     }
+    newDeletesCount.fetch_add(cleared, std::memory_order_relaxed);
+    hits.clear();
+  };
+  auto apply = [&](SortedDeletes::EntrySpan span) {
+    auto guard = MemPool::threadLocalPoolGuard();
+    TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
+    std::vector<DeleteCandidate> hits;
+    auto scratch = indexRamBudget->forceAcquire(0);
+    for (auto& entry : span) {
+      uint64_t deleteVersion = entry.val().deleteWatermark;
+      if (deleteVersion == 0) continue;
+      std::string_view deleteId = (std::string_view)entry;
+
+      INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
+               deleteId, deleteVersion, seg.segId);
+
+      if (termsEnum.seekForward(deleteId)) {
+        // Found the ID term, now get documents containing this ID
+        DocsOnlyEnum docsEnum(termsEnum);
+
+        for (int32_t docId = docsEnum.next(); docId != DocsEnumMeta::END; docId = docsEnum.next()) {
+          if (currLiveBits && !currLiveBits->get(docId)) {
+            continue;
+          }
+          hits.push_back({docId, deleteVersion});
+          if (hits.size() >= chunk) drain(hits, scratch);
+        }
+      } // end if termsEnum.seek()
+    }
+    drain(hits, scratch);
+  };
+  // Split large spans into id-ordered chunks so a few big segments still use every
+  // worker; each chunk seeks forward from its own enum.
+  size_t applied = 0;
+  boost::container::small_vector<SortedDeletes::EntrySpan, 8> pieces;
+  for (auto span : clipped) {
+    applied += span.size();
+    for (size_t at = 0; at < span.size(); at += chunk) {
+      pieces.push_back(span.subspan(at, std::min(chunk, span.size() - at)));
+    }
+  }
+  if (pieces.size() == 1) {
+    apply(pieces[0]);
+  } else {
+    ensureLiveBits();
+    oneapi::tbb::task_group tg;
+    for (auto piece : pieces) {
+      tg.run([&, piece] { apply(piece); });
+    }
+    tg.wait();
   }
 
   // If we found any new documents to delete, write a new delete generation
-  if (newDeletesCount > 0) {
+  if (int32_t deleted = newDeletesCount.load(std::memory_order_relaxed); deleted > 0) {
     auto newLiveGen = seg.liveGen + 1;
-    numLiveDocs -= newDeletesCount;
+    numLiveDocs -= deleted;
 
     std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), seg.liveGen);
-    LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &seg.files);
+    liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs,
+                                                          seg.unsyncedFiles, &seg.files);
+    // The superseded generation needs no sync: it is published or never will be.
     std::erase_if(seg.files, [&](const auto& file) { return file.name == oldLiveFile; });
+    std::erase(seg.unsyncedFiles, oldLiveFile);
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
-                newDeletesCount, seg.segId, newLiveGen, numLiveDocs);
+                deleted, seg.segId, newLiveGen, numLiveDocs);
 
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -3275,6 +3536,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
       seg.liveGen = newLiveGen;
     }
   }
+  return applied;
 }
 
 } // end namespace luxir
