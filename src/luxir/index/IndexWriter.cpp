@@ -663,6 +663,9 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
   for (const auto& [name, signature] : schema->signatures(true)) {
     auto old = before.find(name);
     if (old == before.end()) continue;
+    // Templates are patterns, not fields: a template change only affects names resolved from it
+    // later, and the schema history tracks it per generation.
+    if (!name.empty() && name[0] == '_') continue;
     // Mirrors what merge enforces (SegFieldInfo::requireCompatibleType): anything that
     // changes the persisted type or its parameters would fail later at merge time.
     // Only long term handling and write-time vector normalization may change freely.

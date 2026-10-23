@@ -242,7 +242,8 @@ Setting an existing field replaces its entire definition, but a change that
 would make existing data unreadable or unmergeable is rejected with an
 invalid-request error of the form `Cannot change <property> of existing field
 '<name>': <old> -> <new>`. This applies to both modes and to fields resolved
-through templates and suffix conventions. The checked properties are `type`
+through declared variants. Templates themselves (names starting with `_`) are
+patterns and may change. The checked properties are `type`
 (field class), `multi`, `index`, `column`, `posting_flags`, `unit` (date),
 `dims`, `truncate_dims`, `metric` and `normalized` (vector), `analyzer` (text)
 and `normalizer` (string). Adding fields or templates, and changing other
