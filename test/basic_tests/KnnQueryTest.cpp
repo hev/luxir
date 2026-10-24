@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <format>
 #include <map>
 #include <memory>
 #include <random>
@@ -3161,6 +3162,53 @@ TEST_F(KnnQueryTest, identityIncludesQueryBitsButNotBuildSettings) {
     EXPECT_NE(a.hash(), b.hash());
     EXPECT_TRUE(a.equals(c));
     EXPECT_EQ(a.hash(), c.hash());
+  }
+}
+
+// All-exact compositions hand the similarity floor to the column scans,
+// which drop below-floor rows up front; the result must equal the
+// unfloored top k filtered by the floor, scores included.
+TEST_F(KnnQueryTest, exactSimilarityFloorMatchesPostFilter) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, std::nullopt, 4);
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 10; i++) {
+      h.index(flatdoc("id", std::format("s{}d{}", seg, i), "embedding_v",
+                      std::vector<float>{(float)i + 0.5f * (float)seg, 0.0f, 0.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  std::vector<std::string> dels{"s0d1"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  auto run = [&](std::optional<float> similarity, bool exact) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().countLimit().fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", {0.2f, 0, 0, 0}, 6,
+                             0, exact, 0, 0, similarity);
+    req->execute();
+    auto out = std::make_pair(resultIds(*req), resultScores(*req));
+    req->done();
+    return out;
+  };
+  for (bool exact : {false, true}) {
+    for (float similarity : {0.1f, 2.4f, 100.0f}) {
+      auto [allIds, allScores] = run(std::nullopt, exact);
+      ASSERT_EQ(allIds.size(), 6u);
+      float floor = 1.0f / (1.0f + similarity * similarity);
+      std::vector<std::string> wantIds;
+      std::vector<float> wantScores;
+      for (size_t i = 0; i < allIds.size(); i++) {
+        if (allScores[i] >= floor) {
+          wantIds.push_back(allIds[i]);
+          wantScores.push_back(allScores[i]);
+        }
+      }
+      auto [ids, scores] = run(similarity, exact);
+      EXPECT_EQ(ids, wantIds) << "similarity " << similarity;
+      EXPECT_EQ(scores, wantScores) << "similarity " << similarity;
+    }
   }
 }
 

@@ -318,7 +318,12 @@ the others scan against the shared liveness bitmap (or with no filter at all
 when they have no deletions). The shared per-segment liveness cache itself is
 never modified by queries. Once widening finishes, the final candidate pool is rescanned from
 the full-precision column, sorted by exact score, and collapsed to one hit per
-document.
+document. A `similarity` threshold is applied to those exact scores. When every
+segment is scanned exactly from the column, the threshold is also handed to
+the scans, which keep below-threshold rows out of their result heaps; with
+any approximate segment it is applied only after rescoring, since
+approximate scores do not bound the exact ones and a smaller pool would
+change the deepening decisions.
 
 ## Parallel Execution
 

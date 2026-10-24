@@ -1174,6 +1174,20 @@ public:
 
       bool candidatesExhausted = true;
 
+      // With every engine exact, the terminal similarity filter sees the
+      // engines' own scores, so they can drop below-floor hits up front.
+      // The widen loop's decisions are unchanged: an all-exact pool fills
+      // k above-floor docs or every engine reports its above-floor hits
+      // exhausted, and either way the loop ends on the same final set.
+      // Approximate scores carry unbounded (PQ) or only probabilistically
+      // bounded (RaBitQ) error, and in mixed compositions the floor would
+      // shrink the pooled doc count that drives deepening, so neither is
+      // bounded.
+      std::optional<float> exactScoreFloor;
+      if (!approximateEngine && query.getSimilarity().has_value()) {
+        exactScoreFloor = query.similarityScoreFloor();
+      }
+
       // WIDEN loop: pool candidates until targetDocReq distinct live docs (or
       // a pool/breadth/cap limit).  Two deepen axes, tried in order:
       //   DEPTH   - the engine pool was not exhausted at this candidate count:
@@ -1197,6 +1211,7 @@ public:
           .minScanFraction = query.getMinScanFraction(),
           .eligible = std::span<const std::span<const uint8_t>>(eligibleSpans),
           .perKey = perKey,
+          .minScore = exactScoreFloor,
         };
         VectorSearchResult result = engine->search(request);
         if (statsForTests) statsForTests->rounds++;
@@ -1839,7 +1854,15 @@ public:
 
         BoundedHits<Groups, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d);
         int64_t eligibleDocs = 0;
+        int64_t belowFloorDocs = 0;
         int64_t scanned = 0;
+        // Exact scores: a below-floor doc can never survive the host's
+        // similarity filter, so it never enters the heap.
+        auto belowFloor = [&request, &belowFloorDocs](const VectorEngineHit& hit) LUXIR_INLINE {
+          if (!request.minScore.has_value() || hit.score >= *request.minScore) return false;
+          belowFloorDocs++;
+          return true;
+        };
         if (segInfo == nullptr) {
           result.poolExhausted = true;
           return result;
@@ -1956,14 +1979,15 @@ public:
           keys.withKeyWalk(segOrd, domain, [&](auto keyAt) {
             scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
               auto hit = makeHit();
-              if (!heap.competitive(hit)) return;
+              if (belowFloor(hit) || !heap.competitive(hit)) return;
               const auto* key = keyAt(doc);
               if (key != nullptr) heap.offerKey(hit, *key, doc);
             });
           });
         } else scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
           unused(doc);
-          heap.offer(makeHit());
+          auto hit = makeHit();
+          if (!belowFloor(hit)) heap.offer(hit);
         });
 
         if (statsForTests) {
@@ -1974,7 +1998,7 @@ public:
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         if constexpr (Groups) result.poolExhausted = !heap.truncated;
-        else result.poolExhausted = eligibleDocs <= request.candidates;
+        else result.poolExhausted = eligibleDocs - belowFloorDocs <= request.candidates;
         return result;
       }
 
