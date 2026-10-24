@@ -4,6 +4,7 @@
 #pragma once
 
 #include <faiss/Index.h>
+#include <faiss/IndexFlat.h>
 #include <faiss/IndexIVF.h>
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/MetricType.h>
@@ -138,6 +139,93 @@ class KnnQuery final : public luxir::Query {
   }
 
 public:
+  /// One IVF list in a segment's centroid ranking.
+  struct CoarseEntry {
+    float dist;
+    faiss::idx_t listId;
+  };
+
+  /// A segment's query-to-centroid ranking, ordered lazily: entries[0,
+  /// ranked) are final, the rest are unordered.  The order is the total
+  /// order FAISS's flat-quantizer search with k = nlist produces (heap
+  /// reorder on (distance, id)): ascending (dist, listId) for L2,
+  /// descending (dist, listId) for inner product.  It is total, so the
+  /// prefix is the same however far ranking has advanced, and the lazy
+  /// selection is bit-identical to a full sort.
+  struct CoarseRanking {
+    std::vector<CoarseEntry> entries;
+    size_t ranked = 0;
+    bool similarity = false;
+
+    bool before(const CoarseEntry& a, const CoarseEntry& b) const noexcept {
+      if (a.dist != b.dist) return similarity ? a.dist > b.dist : a.dist < b.dist;
+      return similarity ? a.listId > b.listId : a.listId < b.listId;
+    }
+
+    /// Make entries[0, need) final.  Each extension at least doubles the
+    /// ranked prefix (nth_element on the rest, then sort the new chunk), so
+    /// a query that consumes r of n lists pays O(n log(r) + r log r)
+    /// instead of a full O(n log n) sort.
+    void rankThrough(size_t need) {
+      if (need <= ranked) return;
+      size_t n = entries.size();
+      size_t end = std::min(n, std::max(need, ranked + std::max(ranked, (size_t)32)));
+      auto cmp = [this](const CoarseEntry& a, const CoarseEntry& b) { return before(a, b); };
+      auto first = entries.begin() + (std::ptrdiff_t)ranked;
+      auto last = entries.begin() + (std::ptrdiff_t)end;
+      if (end < n) std::nth_element(first, last, entries.end(), cmp);
+      std::sort(first, last, cmp);
+      ranked = end;
+    }
+  };
+
+  /// FAISS's flat search takes a separate (BLAS) distance path for very
+  /// large databases (faiss::knn_L2sqr's database-parallel mode, at 10000+
+  /// vectors); at or above this many lists rankCentroids defers to the
+  /// quantizer's own full search so the distances stay bit-identical.
+  static constexpr int64_t LAZY_COARSE_MAX_LISTS = 10000;
+
+  /// Rank every IVF list of `ivf` for `query` (already in index space).
+  /// For a flat L2 / inner-product quantizer (what the builder makes),
+  /// computes each centroid distance with the same kernels FAISS's
+  /// sequential flat search uses and leaves the order to rankThrough();
+  /// lists FAISS's heap would never admit (non-finite or NaN distances)
+  /// are dropped.  Any other quantizer uses one fully ranked search.
+  static CoarseRanking rankCentroids(const faiss::IndexIVF& ivf, const float* query) {
+    CoarseRanking out;
+    out.similarity = faiss::is_similarity_metric(ivf.metric_type);
+    auto* flat = dynamic_cast<const faiss::IndexFlat*>(ivf.quantizer);
+    size_t nlist = ivf.nlist;
+    size_t d = (size_t)ivf.d;
+    bool lazy = flat != nullptr && (size_t)flat->ntotal == nlist
+      && (int64_t)nlist < LAZY_COARSE_MAX_LISTS
+      && (flat->metric_type == faiss::METRIC_L2 || flat->metric_type == faiss::METRIC_INNER_PRODUCT);
+    if (lazy) {
+      const float* xb = flat->get_xb();
+      out.entries.reserve(nlist);
+      for (size_t j = 0; j < nlist; j++) {
+        const float* c = xb + j * d;
+        if (out.similarity) {
+          float ip = faiss::fvec_inner_product(query, c, d);
+          if (ip > std::numeric_limits<float>::lowest()) out.entries.push_back({ip, (faiss::idx_t)j});
+        } else {
+          float l2 = faiss::fvec_L2sqr(query, c, d);
+          if (l2 < std::numeric_limits<float>::max()) out.entries.push_back({l2, (faiss::idx_t)j});
+        }
+      }
+      return out;
+    }
+    std::vector<faiss::idx_t> ids(nlist, (faiss::idx_t)-1);
+    std::vector<float> dists(nlist, 0.0f);
+    ivf.quantizer->search(1, query, (faiss::idx_t)nlist, dists.data(), ids.data());
+    out.entries.reserve(nlist);
+    for (size_t j = 0; j < nlist; j++) {
+      if (ids[j] >= 0) out.entries.push_back({dists[j], ids[j]});
+    }
+    out.ranked = out.entries.size();
+    return out;
+  }
+
   /// One result hit within a segment.  docId is the local docRank within the
   /// segment; score is converted to "higher is better" regardless of vector
   /// metric (see scoreFromDist).
@@ -1299,7 +1387,7 @@ public:
     /// selector and by the host after collapse.
     ///
     /// IVF indexes do not drive themselves: the CompositeVectorEngine's global
-    /// allocator calls coarseRun() (full sorted centroid ranking) and
+    /// allocator calls coarseRun() (lazily ordered centroid ranking) and
     /// liveListSize() to pick lists across ALL segments, then hands the chosen
     /// lists back through searchSelectedLists().  The plain search() override
     /// is the whole-index path for non-IVF FAISS kinds; no such aux kind
@@ -1506,17 +1594,13 @@ public:
 
       int32_t getNList() const noexcept { return nlist; }
 
-      void coarseRun(int32_t dims,
-                     std::vector<faiss::idx_t>& listIds,
-                     std::vector<float>& centroidDists) const {
+      CoarseRanking coarseRun(int32_t dims) const {
         assert(ivf != nullptr);
         assert(dims == index.d);
         unused(dims);
-        listIds.assign((size_t)nlist, (faiss::idx_t)-1);
-        centroidDists.assign((size_t)nlist, 0.0f);
         // The rotation is orthonormal, so these distances compare directly
         // with other segments' (rotated or not) in the global list ranking.
-        ivf->quantizer->search(1, preparedQuery.query, nlist, centroidDists.data(), listIds.data());
+        return rankCentroids(*ivf, preparedQuery.query);
       }
 
       /// Live vector count of one IVF list - the unit the global allocator
@@ -1944,11 +2028,6 @@ public:
       int32_t metric;
       bool parallel;
 
-      struct CoarseRun {
-        std::vector<faiss::idx_t> listIds;
-        std::vector<float> centroidDists;
-      };
-
       struct CoarseHead {
         float score = 0.0f;
         int32_t slotOrd = -1;
@@ -1964,9 +2043,10 @@ public:
       };
 
       // Coarse-selection state, persisted across deepen rounds (this IS the
-      // resumable breadth state).  Per slot: runs holds the full sorted
-      // (listId, centroidDist) ranking from coarseRun(); cursors[i] is the
-      // k-way-merge position into it.  heads/heapIndexes/heapSize back the
+      // resumable breadth state).  Per slot: runs holds the lazily ordered
+      // (listId, centroidDist) ranking from coarseRun(), ranked only as far
+      // as the cursor has reached; cursors[i] is the k-way-merge position
+      // into it.  heads/heapIndexes/heapSize back the
       // IndexedPQ of each slot's current head, keyed by centroid score -
       // updateTop() (replace-top) advances a slot in one sift, the same heap
       // discipline the doc collectors use.  selected* accumulate the
@@ -1974,7 +2054,7 @@ public:
       // selectedListLiveSizes stay 1:1 with selectedListIds because
       // search_preassigned consumes the first pair positionally and the
       // scan-task chunker prices ranges off the third.
-      std::vector<CoarseRun> runs;
+      std::vector<CoarseRanking> runs;
       std::vector<size_t> cursors;
       std::vector<CoarseHead> heads;
       std::vector<int32_t> heapIndexes;
@@ -2013,15 +2093,20 @@ public:
       }
 
       CoarseHead makeHead(int32_t slotOrd) const {
-        const auto& run = runs[(size_t)slotOrd];
-        size_t cursor = cursors[(size_t)slotOrd];
-        faiss::idx_t listId = run.listIds[cursor];
-        float dist = run.centroidDists[cursor];
+        const auto& entry = runs[(size_t)slotOrd].entries[cursors[(size_t)slotOrd]];
         return {
-          .score = scoreFromDist(dist, metric),
+          .score = scoreFromDist(entry.dist, metric),
           .slotOrd = slotOrd,
-          .listId = listId,
+          .listId = entry.listId,
         };
+      }
+
+      // Rank the slot's run through its cursor; false once it is drained.
+      bool cursorValid(size_t slotOrd) {
+        auto& run = runs[slotOrd];
+        if (cursors[slotOrd] >= run.entries.size()) return false;
+        run.rankThrough(cursors[slotOrd] + 1);
+        return true;
       }
 
       void ensureCoarseReady(const VectorSearchRequest& request) {
@@ -2041,11 +2126,8 @@ public:
         for (size_t i = 0; i < slots.size(); i++) {
           auto* ivf = slots[i].ivfEngine;
           if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
-          ivf->coarseRun(request.dims, runs[i].listIds, runs[i].centroidDists);
-          while (cursors[i] < runs[i].listIds.size() && runs[i].listIds[cursors[i]] < 0) {
-            cursors[i]++;
-          }
-          if (cursors[i] >= runs[i].listIds.size()) continue;
+          runs[i] = ivf->coarseRun(request.dims);
+          if (!cursorValid(i)) continue;
           heads[i] = makeHead((int32_t)i);
           heapIndexes.push_back((int32_t)i);
           hasIvfSlots = true;
@@ -2115,18 +2197,14 @@ public:
 
           selectedListIds[(size_t)slotOrd].push_back(listId);
           selectedCentroidDists[(size_t)slotOrd].push_back(
-            runs[(size_t)slotOrd].centroidDists[cursors[(size_t)slotOrd]]);
+            runs[(size_t)slotOrd].entries[cursors[(size_t)slotOrd]].dist);
           selectedListLiveSizes[(size_t)slotOrd].push_back(liveSize);
           if (liveTotalVectors > 0) {
             allocatedCost += (double)liveSize / (double)liveTotalVectors;
           }
 
           cursors[(size_t)slotOrd]++;
-          while (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()
-                 && runs[(size_t)slotOrd].listIds[cursors[(size_t)slotOrd]] < 0) {
-            cursors[(size_t)slotOrd]++;
-          }
-          if (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()) {
+          if (cursorValid((size_t)slotOrd)) {
             head = makeHead(slotOrd);
             pq.updateTop();
           } else {
