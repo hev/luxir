@@ -39,6 +39,7 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
+#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/RegExpParser.h"
 
 namespace luxir {
@@ -293,8 +294,10 @@ private:
     return term->data() == scratch.data() ? poolCopy(*term) : *term;
   }
 
-  // Analyzer buffers are borrowed until the next pull. Fitted term bytes
-  // belong to the pool; the returned vector only owns their views.
+  // Analyzer buffers are borrowed until the next pull. Copied term bytes
+  // belong to the pool; the returned vector only owns their views. Case
+  // expansion needs Unicode bytes before fitting, which can introduce hashes.
+  template<bool fit = true>
   std::vector<std::string_view> analyzeText(const ResolvedFieldHandle& target,
                                            std::string_view text) {
     TokenChain& tc = *fields.chain(target);
@@ -304,7 +307,8 @@ private:
     tc.setValue(text);
     tc.reset();
     while (tail.incrementToken()) {
-      terms.push_back(poolCopy(fitTerm(target, tok.text)));
+      if constexpr (fit) terms.push_back(poolCopy(fitTerm(target, tok.text)));
+      else terms.push_back(poolCopy(tok.text));
     }
     return terms;
   }
@@ -560,11 +564,14 @@ public:
   // Build a prefix query over term-backed fields. The prefix is normalized
   // (not tokenized) for analyzed TEXT fields and normalized for STRING; ID is verbatim;
   // the field and prefix views must outlive the returned query.
-  Query* createPrefixQuery(std::string_view field, std::string_view prefix) {
-    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix);
+  Query* createPrefixQuery(std::string_view field, std::string_view prefix,
+                            bool caseInsensitive = false) {
+    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix,
+                              caseInsensitive);
   }
 
-  Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix) {
+  Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix,
+                            bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
@@ -576,42 +583,53 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
+        if (caseInsensitive) {
+          return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field, prefix);
+        }
         return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
   }
 
-  Query* createWildcardQuery(std::string_view field, std::string_view pattern) {
-    return createWildcardQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern);
+  // With `caseInsensitive`, literals (after field folding) and, for regex,
+  // character classes also accept their simple Unicode case alternates.
+  Query* createWildcardQuery(std::string_view field, std::string_view pattern,
+                             bool caseInsensitive = false) {
+    return createWildcardQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern,
+                               caseInsensitive);
   }
 
-  Query* createWildcardQuery(const ResolvedFieldHandle& target, std::string_view pattern) {
+  Query* createWildcardQuery(const ResolvedFieldHandle& target, std::string_view pattern,
+                             bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     checkAutomatonField("Wildcard", target);
     if (auto* chain = fields.chain(target)) {
       FieldCodepointFolder folder(chain);
       return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
-                                &folder, automaton::compileWildcard);
+                                &folder, caseInsensitive, automaton::compileWildcard);
     }
     return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
-                              nullptr, automaton::compileWildcard);
+                              nullptr, caseInsensitive, automaton::compileWildcard);
   }
 
-  Query* createRegexQuery(std::string_view field, std::string_view pattern) {
-    return createRegexQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern);
+  Query* createRegexQuery(std::string_view field, std::string_view pattern,
+                          bool caseInsensitive = false) {
+    return createRegexQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern,
+                            caseInsensitive);
   }
 
-  Query* createRegexQuery(const ResolvedFieldHandle& target, std::string_view pattern) {
+  Query* createRegexQuery(const ResolvedFieldHandle& target, std::string_view pattern,
+                          bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     checkAutomatonField("Regex", target);
     if (auto* chain = fields.chain(target)) {
       FieldCodepointFolder folder(chain);
       return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
-                                &folder, automaton::compileRegex);
+                                &folder, caseInsensitive, automaton::compileRegex);
     }
     return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
-                              nullptr, automaton::compileRegex);
+                              nullptr, caseInsensitive, automaton::compileRegex);
   }
 
 private:
@@ -642,13 +660,13 @@ private:
   Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view label,
                             const ResolvedFieldHandle& target,
                             std::string_view field, std::string_view pattern,
-                            const automaton::CodepointFolder* folder,
+                            const automaton::CodepointFolder* folder, bool caseInsensitive,
                             automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
-                                                          const automaton::CodepointFolder*)) {
+                                                          const automaton::CodepointFolder*, bool)) {
     automaton::ByteDfa compiled;
     try {
       automaton::Budget budget;
-      compiled = compile(pattern, budget, folder);
+      compiled = compile(pattern, budget, folder, caseInsensitive);
     } catch (const std::runtime_error& e) {
       throw std::runtime_error(std::format("{} query for field '{}' pattern '{}': {}",
                                            label, field, pattern, e.what()));
@@ -682,8 +700,25 @@ private:
     std::string_view exactOrPrefixCopy = poolCopy(exactOrPrefix);
     DfaScanPlan scanPlan{poolCopy(commonPrefix), poolCopy(commonSuffix), initialState};
     automaton::ByteDfaView frozen = compiled.freeze(pool);
-    return pool.make<AutomatonQuery>(field, queryKind, patternCopy, frozen, kind,
+    return pool.make<AutomatonQuery>(field, queryKind, caseInsensitive, patternCopy, frozen, kind,
                                     exactOrPrefixCopy, scanPlan, fittedPolicy);
+  }
+
+  // An already-normalized literal, escaped and compiled without a field folder
+  // so non-idempotent normalizers run only once. Prefix adds the wildcard last.
+  Query* makeCaseInsensitiveTerm(AutomatonQuery::Kind kind, const ResolvedFieldHandle& target,
+                                 std::string_view field, std::string_view term, float boost = 1.0f) {
+    std::string escaped;
+    escaped.reserve(term.size());
+    for (char c : term) {
+      if (c == '*' || c == '?' || c == '\\') escaped.push_back('\\');
+      escaped.push_back(c);
+    }
+    bool prefix = kind == AutomatonQuery::Kind::PREFIX;
+    if (prefix) escaped.push_back('*');
+    Query* query = makeAutomatonQuery(kind, prefix ? "Prefix" : "Match",
+                                      target, field, escaped, nullptr, true, automaton::compileWildcard);
+    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 
 public:
@@ -767,28 +802,56 @@ public:
   //   * else `op`: OR -> k = 1 (disjunction), AND -> k = N (conjunction).
   // k <= 1 builds a disjunction, k >= N a conjunction, and the middle a
   // min-should-match boolean.
+  //
+  // `caseInsensitive` expands each analyzed/normalized token to indexed case
+  // alternates, scored together as synonyms. Case-erasing analysis keeps terms.
+  // Numeric and DATE fields ignore it.
   Query* createMatchQuery(std::string_view field, std::string_view value,
-                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch, boost);
+                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
+                          bool caseInsensitive = false) {
+    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch, boost, caseInsensitive);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
-                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f) {
+                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
+                          bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
-        auto terms = analyzeText(target, value);
+        auto terms = caseInsensitive ? analyzeText<false>(target, value) : analyzeText(target, value);
         if (terms.empty()) return matchNoDocs();
-        if (terms.size() == 1) return pool.make<TermQuery>(field, terms[0], boost);
-        auto clauses = pool.make_span<Query*>(terms.size());
-        for (size_t i = 0; i < terms.size(); i++) {
-          clauses[i] = pool.make<TermQuery>(field, terms[i], boost);
+        if (!caseInsensitive) {
+          if (terms.size() == 1) return pool.make<TermQuery>(field, terms[0], boost);
+          auto clauses = pool.make_span<Query*>(terms.size());
+          for (size_t i = 0; i < terms.size(); i++) {
+            clauses[i] = pool.make<TermQuery>(field, terms[i], boost);
+          }
+          return combineAnalyzedClauses(clauses, op, minMatch);
         }
+        auto* chain = fields.chain(target);
+        FieldCodepointFolder folder(chain);
+        auto makeTerm = [&](std::string_view term) -> Query* {
+          // Character mappings can span scalars or be non-idempotent. In
+          // that case use the analyzed bytes verbatim for case expansion.
+          if (chain->hasCharFilters() || !automaton::caseAlternatesFoldToSelf(term, folder)) {
+            checkAutomatonField("Match", target);
+            return makeCaseInsensitiveTerm(AutomatonQuery::Kind::MATCH, target, field, term, boost);
+          }
+          return pool.make<TermQuery>(field, fitTerm(target, term), boost);
+        };
+        if (terms.size() == 1) return makeTerm(terms[0]);
+        auto clauses = pool.make_span<Query*>(terms.size());
+        for (size_t i = 0; i < terms.size(); i++) clauses[i] = makeTerm(terms[i]);
         return combineAnalyzedClauses(clauses, op, minMatch);
       }
       case FieldType::Type::STRING:
       case FieldType::Type::ID:
+        if (caseInsensitive) {
+          checkAutomatonField("Match", target);
+          return makeCaseInsensitiveTerm(AutomatonQuery::Kind::MATCH, target, field,
+                                         normalizeLiteral(target, value, false), boost);
+        }
         return pool.make<TermQuery>(field, normalizeLiteral(target, value, true), boost);
       case FieldType::Type::INT:
       case FieldType::Type::FLOAT:
@@ -814,12 +877,15 @@ public:
   // index-time and query-time coercion agree.  Uncoercible Vals (arrays,
   // maps) throw.
   Query* createMatchQuery(std::string_view field, const luxir::api::Val& val,
-                          Operator op = Operator::OR, int minMatch = 0) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), val, op, minMatch);
+                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
+                          bool caseInsensitive = false) {
+    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), val, op, minMatch,
+                            boost, caseInsensitive);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, const luxir::api::Val& val,
-                          Operator op = Operator::OR, int minMatch = 0) {
+                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
+                          bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     if (isNumericColumnType(fieldType.type())) {
@@ -828,7 +894,8 @@ public:
       // array/uncoercible Val throws there (multi-value Match semantics are
       // undefined yet); op / min_match don't apply to a single numeric value.
       if (coerce::isNull(val)) return matchNoDocs();
-      return createRangeQuery(target, &val, nullptr, &val, nullptr);
+      Query* query = createRangeQuery(target, &val, nullptr, &val, nullptr);
+      return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
     }
     char buf[coerce::TEXT_BUF_SIZE];
     std::string_view text = coerce::isNull(val)
@@ -841,7 +908,7 @@ public:
     if (text.data() == buf) {
       text = poolCopy(text);
     }
-    return createMatchQuery(target, text, op, minMatch);
+    return createMatchQuery(target, text, op, minMatch, boost, caseInsensitive);
   }
 
   struct WeightedField {
@@ -1006,9 +1073,13 @@ public:
       for (size_t t = 0; t < terms.size(); t++) {
         // Only a singleton at weight 1 is ordinary BM25. All other weights
         // scale frequency and length, including in single-field groups.
-        clauses[t] = plainTerm
-            ? (Query*)pool.make<TermQuery>(group.fields[0], terms[t])
-            : (Query*)pool.make<CombinedFieldQuery>(group.fields, group.weights, terms[t]);
+        if (plainTerm) {
+          clauses[t] = pool.make<TermQuery>(group.fields[0], terms[t]);
+        } else {
+          auto entries = pool.make_span<CombinedFieldQuery::Term>(group.fields.size());
+          for (size_t f = 0; f < entries.size(); f++) entries[f] = {f, terms[t]};
+          clauses[t] = pool.make<CombinedFieldQuery>(group.fields, group.weights, entries);
+        }
       }
       optional[count++] = combineAnalyzedClauses(clauses, op, minMatch);
     }

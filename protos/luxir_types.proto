@@ -426,6 +426,16 @@ message Match {
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
 
+  // Match TEXT tokens and STRING/ID values regardless of simple Unicode case,
+  // after query analysis/normalization. Indexed case variants score as one word,
+  // with the query's exact case preferred slightly: frequency weight 1.0 for
+  // the analyzed/normalized query token, 0.9 for other variants. Frequencies sum
+  // before BM25 saturation, with shared statistics. Slower than a folding
+  // variant (_t, _un, _wl), recommended for frequent use. Alternates come from
+  // analyzed tokens; case-preserving stemmers can be asymmetric (KStem stems
+  // lowercase only). Numeric and DATE fields ignore it.
+  bool case_insensitive = 10;
+
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
     OR = 1;                    // a doc matches if any analyzed term matches
@@ -614,6 +624,10 @@ message BooleanQuery {
 message PrefixQuery {
   string field = 1;
   string prefix = 2;
+
+  // After whole-prefix normalization, also match simple Unicode case
+  // alternates. TEXT fields are supported. Uses a constant-score automaton.
+  bool case_insensitive = 3;
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one
@@ -624,6 +638,10 @@ message PrefixQuery {
 message WildcardQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, also match their simple Unicode
+  // case alternates (lower, upper and title forms).
+  bool case_insensitive = 3;
 }
 
 // Matches an anchored whole indexed term using `|`, concatenation, groups,
@@ -634,6 +652,11 @@ message WildcardQuery {
 message RegexQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, and every member of character
+  // classes and ranges also match their simple Unicode case alternates.
+  // Negated classes exclude all case forms of their members.
+  bool case_insensitive = 3;
 }
 
 // Matches indexed terms within byte-wise Levenshtein distance of `term`. TEXT
