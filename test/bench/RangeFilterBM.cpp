@@ -44,6 +44,7 @@ struct RangeFilterIndex {
     auto& column = inverter.getIndexHandler("column_i");
     auto& indexed = inverter.getIndexHandler("points_i");
     auto& clustered = inverter.getIndexHandler("cluster_i");
+  auto& partial = inverter.getIndexHandler("partial_i");
     auto& sort = inverter.getIndexHandler("sort_i");
     for (int32_t doc = 0; doc < size; doc++) {
       std::string text = "pad";
@@ -51,10 +52,16 @@ struct RangeFilterIndex {
       if (doc % 64 == 1 || doc % 128 == 0) text += " c";
       if (doc % 3 == 0) text += " b";
       if (doc % 10 < 1) text += " d10";
+      if (doc % 10 < 2) text += " d20";
+      if (doc % 4 == 0) text += " d25";
       if (doc % 10 < 3) text += " d30";
       if (doc % 10 < 4) text += " d40";
       if (doc % 10 < 5) text += " d50";
       if (doc % 10 < 9) text += " d90";
+      if (doc % 500 == 0) text += " d0_2";
+      if (doc % 200 == 0) text += " d0_5";
+      if (doc % 150 == 0) text += " d0_67";
+      if (doc % 64 == 0) text += " d1_56";
       text += " all";
       int64_t value = ((int64_t)doc * 1543) % size;
       inverter.startDoc();
@@ -63,6 +70,10 @@ struct RangeFilterIndex {
       column.index(inverter, value);
       indexed.index(inverter, value);
       clustered.index(inverter, (int64_t)doc);
+      // The first 45% lies above every range: settled, but short of a zone map.
+      // A multiplicative hash keeps the rest crossing every zone at any size.
+      partial.index(inverter, (int64_t)doc * 20 < (int64_t)size * 9 ? size + doc
+          : (int64_t)(((uint64_t)doc * 2654435761u) % (uint64_t)size));
       sort.index(inverter, ((int64_t)doc * 7919) % size);
       inverter.finishDoc();
     }
@@ -200,6 +211,14 @@ void rangeFilterSortBench(benchmark::State& state) {
     add(std::string("dense_") + lead, lead, "column_i", 90, Consumer::COUNT);
   }
   add("cluster_count", "d50", "cluster_i", 75, Consumer::COUNT);
+  // Sparse leads against a time-ordered range: zone production is mostly
+  // settled runs, so the verify/fill choice moves to sub-percent leads.
+  for (auto lead : {"d0_2", "d0_5", "d0_67", "d1_56"}) {
+    add(std::string("clustered_") + lead, lead, "cluster_i", 50, Consumer::COUNT);
+  }
+  for (auto lead : {"d10", "d20", "d25", "d30"}) {
+    add(std::string("partial_") + lead, lead, "partial_i", 90, Consumer::COUNT);
+  }
   add("match", "a", "column_i", 90, Consumer::MATCH);
   add("mandopt", "a", "column_i", 90, Consumer::MAND_OPT);
   add("maxscore", "a", "column_i", 90, Consumer::MAX_SCORE);

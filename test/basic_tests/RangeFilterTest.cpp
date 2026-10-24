@@ -179,7 +179,7 @@ TEST_F(RangeFilterTest, LeadOnlyAndMixedThresholdPlansResetWithFilters) {
 
 TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   // Scanning a random column costs about as much as verifying most docs.
-  // Settled zones make production cheap, so only a few candidates verify.
+  // Settled zones keep production for clustered fields, even for few candidates.
   struct Case {
     const char* field;
     int64_t candidates;
@@ -187,7 +187,7 @@ TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   };
   for (auto [field, candidates, verifies] : {Case{"column_i", 64, true},
            Case{"column_i", N * 3 / 10, true}, Case{"column_i", N * 9 / 10, false},
-           Case{"cluster_i", 64, true}, Case{"cluster_i", N * 3 / 10, false},
+           Case{"cluster_i", 64, false}, Case{"cluster_i", N * 3 / 10, false},
            Case{"cluster_i", N * 9 / 10, false}}) {
     SCOPED_TRACE(::testing::Message() << field << " " << candidates);
     NumericPredicateQuery range(field, 4096, 28671);
