@@ -40,11 +40,13 @@ PluginRegistry& PluginRegistry::global() {
 }
 
 Registries Registries::global() {
-  return {PluginRegistry::global(), QueryRegistry::global(), SearchOpRegistry::global(), HttpRouteRegistry::global()};
+  return {PluginRegistry::global(), AnalysisRegistry::global(), QueryRegistry::global(),
+          SearchOpRegistry::global(), HttpRouteRegistry::global()};
 }
 
 void Registries::freeze() {
   plugins.freeze();
+  analysis.freeze();
   query.freeze();
   searchOps.freeze();
   http.freeze();
@@ -54,6 +56,7 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   static detail::PluginInit state;
   state.run(addPlugins, [](auto addPlugins) {
     Registries r = Registries::global();
+    registerBuiltinAnalysis(r.analysis);
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {
