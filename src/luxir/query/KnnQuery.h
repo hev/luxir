@@ -1705,8 +1705,12 @@ public:
           return result;
         }
 
-        std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
-        std::vector<float> dists((size_t)request.candidates, 0.0f);
+        // FAISS output scratch from the thread-local pool, reused by every
+        // chunk task of every round instead of fresh (filled) vectors.
+        // FAISS initializes all k slots (padding with -1) itself.
+        auto scratchGuard = MemPool::threadLocalPoolGuard();
+        auto ids = scratchGuard.pool().make_span<faiss::idx_t>((size_t)request.candidates);
+        auto dists = scratchGuard.pool().make_span<float>((size_t)request.candidates);
 
         // Local stats sink, discarded: with a null stats argument FAISS does
         // plain non-atomic '+=' on the global faiss::indexIVF_stats, and
@@ -1779,8 +1783,12 @@ public:
           return result;
         }
 
-        std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
-        std::vector<float> dists((size_t)request.candidates, 0.0f);
+        // FAISS output scratch from the thread-local pool, reused by every
+        // chunk task of every round instead of fresh (filled) vectors.
+        // FAISS initializes all k slots (padding with -1) itself.
+        auto scratchGuard = MemPool::threadLocalPoolGuard();
+        auto ids = scratchGuard.pool().make_span<faiss::idx_t>((size_t)request.candidates);
+        auto dists = scratchGuard.pool().make_span<float>((size_t)request.candidates);
 
         RoundSelector roundSel(*this, request);
         faiss::SearchParameters flatParams;
@@ -2095,6 +2103,10 @@ public:
       // since post-fold they are per-round fresh budgets and may repeat or
       // shrink between rounds.
       std::vector<size_t> scannedListCount;
+      // The current round's scan worklist, kept to reuse its capacity
+      // across deepen rounds.
+      struct ScanUnit;
+      std::vector<ScanUnit> units;
       int32_t lastScannedBreadth = -1;
       double allocatedCost = 0.0;
       int32_t referenceBreadth = 1;
@@ -2426,7 +2438,7 @@ public:
         // slots for non-IVF engines.  An under-grain remainder folds into the
         // previous chunk rather than becoming a trivial task.  Boundaries do
         // not depend on the execution mode.
-        std::vector<ScanUnit> units;
+        units.clear();
         for (size_t i = 0; i < slots.size(); i++) {
           auto& slot = slots[i];
           if (slot.ivfEngine != nullptr) {
