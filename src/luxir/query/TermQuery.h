@@ -260,6 +260,10 @@ public:
           .independentTerm = Query::IndependentTermAccess::SUPPORTED,
           .docsOnly = Query::DocsOnlyAccess::SUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+          .membershipConsumption = buildContext.membershipConsumption
+                  == Query::MembershipConsumption::CANDIDATES
+              ? Query::MembershipConsumption::CANDIDATES
+              : Query::MembershipConsumption::WINDOWS,
         };
       }
 
@@ -295,7 +299,7 @@ public:
           BulkAnswer::NO,
           BulkAnswer::NO,
         };
-        plan.acceptsWindowFilter = BulkAnswer::YES;
+        plan.windowFilterConsumption = WindowFilterConsumption::FILL_OR_PROBE;
         if (!weight.needsScores() && isMembershipWindowUse(use)) {
           plan.statelessReposition = BulkAnswer::YES;
         }
@@ -1180,24 +1184,6 @@ public:
                                      : windowFilter->accepts(doc));
     }
 
-    void applyWindowFilterProbe() {
-      int32_t innerSize = windowEnd - windowStart;
-      for (int32_t word = 0; word < kWindowWords; word++) {
-        uint64_t bits = windowBits[(size_t) word];
-        while (bits != 0) {
-          int32_t bit = (int32_t) std::countr_zero(bits);
-          int32_t index = (word << 6) + bit;
-          if (index >= innerSize) {
-            break;
-          }
-          if (!windowFilter->acceptsProbe(windowStart + index)) {
-            windowBits[(size_t) word] &= ~(1ULL << bit);
-          }
-          bits &= bits - 1;
-        }
-      }
-    }
-
     void prepareOutputWindow(ScoreWindow& out) {
       out.min = windowStart;
       out.max = windowEnd;
@@ -1222,11 +1208,7 @@ public:
         applyDocSetFilter(filter);
       }
       if (windowFilter != nullptr) {
-        if (windowFilter->probes()) {
-          applyWindowFilterProbe();
-        } else {
-          windowFilter->intersect(windowBits);
-        }
+        windowFilter->intersect(windowBits, windowStart);
       }
       return true;
     }
