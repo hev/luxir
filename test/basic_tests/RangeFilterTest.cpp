@@ -178,30 +178,39 @@ TEST_F(RangeFilterTest, LeadOnlyAndMixedThresholdPlansResetWithFilters) {
 }
 
 TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
-  for (auto field : {"column_i", "cluster_i"}) {
+  // Scanning a random column costs about as much as verifying most docs.
+  // Settled zones make production cheap, so only a few candidates verify.
+  struct Case {
+    const char* field;
+    int64_t candidates;
+    bool verifies;
+  };
+  for (auto [field, candidates, verifies] : {Case{"column_i", 64, true},
+           Case{"column_i", N * 3 / 10, true}, Case{"column_i", N * 9 / 10, false},
+           Case{"cluster_i", 64, true}, Case{"cluster_i", N * 3 / 10, false},
+           Case{"cluster_i", N * 9 / 10, false}}) {
+    SCOPED_TRACE(::testing::Message() << field << " " << candidates);
     NumericPredicateQuery range(field, 4096, 28671);
     MemPool pool;
     Query::Context context(pool, *reader);
     auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
-    for (int64_t candidates : {64, N * 3 / 10, N / 2, N * 9 / 10}) {
-      auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(
-          candidates, N, Use::COUNT_WINDOWS));
-      build.membershipConsumption = Consumption::EITHER;
-      auto shape = supplier->describeScorer(build);
-      auto* plan = supplier->resolve(pool, build);
-      EXPECT_EQ(shape.membershipConsumption, plan->shape().membershipConsumption);
-      auto* scorer = plan->build(pool);
-      if (std::string_view(field) == "cluster_i") {
-        EXPECT_EQ(Consumption::WINDOWS, shape.membershipConsumption);
-        EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::ZoneMapScorer*>(scorer));
-      } else {
-        EXPECT_EQ(candidates == 64 ? Consumption::CANDIDATES : Consumption::WINDOWS,
-                  shape.membershipConsumption);
-        if (candidates > 64) {
-          EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
-              IntColReader::Iterator>*>(scorer));
-        }
-      }
+    auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(
+        candidates, N, Use::COUNT_WINDOWS));
+    build.membershipConsumption = Consumption::EITHER;
+    auto shape = supplier->describeScorer(build);
+    auto* plan = supplier->resolve(pool, build);
+    EXPECT_EQ(shape.membershipConsumption, plan->shape().membershipConsumption);
+    EXPECT_EQ(verifies ? Consumption::CANDIDATES : Consumption::WINDOWS,
+              shape.membershipConsumption);
+    auto* scorer = plan->build(pool);
+    if (verifies) {
+      EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
+          IntColReader::SparseIterator>*>(scorer));
+    } else if (std::string_view(field) == "cluster_i") {
+      EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::ZoneMapScorer*>(scorer));
+    } else {
+      EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
+          IntColReader::Iterator>*>(scorer));
     }
   }
 }

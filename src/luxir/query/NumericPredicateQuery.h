@@ -7,6 +7,7 @@
 #include <bit>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -46,6 +47,18 @@ public:
   static constexpr int64_t pointsVerifyLimit(int64_t cost) {
     return cost / kPointsVerifyWeight + (cost % kPointsVerifyWeight != 0);
   }
+
+  // Routing weight of one sparse candidate verification, in units of one
+  // column value produced by a window scan. Empirical: forced-arm runs at 10M
+  // docs tied near 30% candidates against zone production (about 1.1 under
+  // this model); verification won at 1-10% against a full scan. 1.25 leans
+  // toward production at the tie. Read once so description and resolution
+  // agree; the environment override exists for recalibration runs.
+  static constexpr double kCandidateValueWeight = 1.25;
+  static inline const double candidateValueWeight = [] {
+    const char* value = std::getenv("LUXIR_NUMERIC_CANDIDATE_WEIGHT");
+    return value != nullptr ? std::atof(value) : kCandidateValueWeight;
+  }();
 
   static inline bool disableShapesForTests = false;
 #ifndef NDEBUG
@@ -1237,7 +1250,6 @@ public:
         }
         // Compare the existing sparse decoder against production, not result
         // cardinality. Verification does not yet reuse BlockPlan proofs.
-        constexpr double candidateValueWeight = 8;
         double valuesPerDoc = std::max(1.0,
             (double)reader.numValues() / std::max(1, reader.docsWithValue()));
         double candidateWork = candidateValueWeight

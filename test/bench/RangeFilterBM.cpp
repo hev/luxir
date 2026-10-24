@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
+
 #include "bench/luxir_bench.h"
 #include "luxir/query/BooleanWeight.h"
 #include "luxir/query/NumericPredicateQuery.h"
@@ -21,7 +23,10 @@ namespace {
 struct RangeFilterIndex {
   CollectionHelper helper{"range_filter_bm"};
   std::shared_ptr<IndexReader> reader;
-  int32_t size = luxir::unit_tests ? 8192 : 131072;
+  // LUXIR_RANGE_BM_DOCS scales the fixture for cost calibration.
+  int32_t size = std::getenv("LUXIR_RANGE_BM_DOCS") != nullptr
+      ? std::atoi(std::getenv("LUXIR_RANGE_BM_DOCS"))
+      : luxir::unit_tests ? 8192 : 131072;
 
   RangeFilterIndex() {
     helper.clear();
@@ -45,7 +50,9 @@ struct RangeFilterIndex {
       if (doc % 64 == 0) text += " a";
       if (doc % 64 == 1 || doc % 128 == 0) text += " c";
       if (doc % 3 == 0) text += " b";
+      if (doc % 10 < 1) text += " d10";
       if (doc % 10 < 3) text += " d30";
+      if (doc % 10 < 4) text += " d40";
       if (doc % 10 < 5) text += " d50";
       if (doc % 10 < 9) text += " d90";
       text += " all";
@@ -189,7 +196,7 @@ void rangeFilterSortBench(benchmark::State& state) {
           rangeFilterBench(state, lead, field, percent, consumer);
         })->UseRealTime();
   };
-  for (auto lead : {"d30", "d50", "d90"}) {
+  for (auto lead : {"d10", "d30", "d40", "d50", "d90"}) {
     add(std::string("dense_") + lead, lead, "column_i", 90, Consumer::COUNT);
   }
   add("cluster_count", "d50", "cluster_i", 75, Consumer::COUNT);
