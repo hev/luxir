@@ -2573,9 +2573,23 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
       ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
           << "segment fell back to flat (below IVF training floor)";
     }
-    std::vector<std::string> dels{"del"};
+    // A far IVF segment with deletes the query never pools from: the fold
+    // must borrow its cached liveness bitmap instead of copying it.
+    for (int i = 0; i < 160; i++) {
+      h.index(flatdoc("id", "far" + std::to_string(i), "emb_vs",
+                      std::vector<std::vector<float>>{{1000.0f + (float)i, 0, 0, 0}}));
+    }
+    h.commit({"*"});
+    std::vector<std::string> dels{"del", "far7"};
     h.deleteByIds(dels, UpdateMessage::COMMIT);
+    {
+      auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+      ASSERT_EQ(reader->segments().size(), 2u);
+      ASSERT_NE(reader->segments()[1].getAuxReader("vec.emb_vs"), nullptr);
+      ASSERT_NE(reader->segments()[1].liveDocs(), nullptr);
+    }
 
+    int64_t copies0 = KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed);
     int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
     int64_t stale0 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
     auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
@@ -2592,6 +2606,8 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
     // look right, because markSeen dedups - this counter is the tripwire).
     int64_t stale1 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
     EXPECT_EQ(stale1, stale0) << "an engine returned an already-pooled rank post-fold";
+    EXPECT_EQ(KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed), copies0 + 1)
+        << "only the pooled-into segment needs a private eligible copy";
 
     auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
                              /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);

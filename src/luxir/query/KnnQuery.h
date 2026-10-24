@@ -248,6 +248,9 @@ public:
   // Number of IVF list id walks liveListSize() performed (memo misses).
   static inline std::atomic<int64_t> listLiveCountsForTests{0};
   static inline std::atomic<int64_t> seenFoldsForTests{0};
+  // Per-query writable eligible-bitmap copies made by the widen loop (one
+  // per segment that had something pooled after the fold).
+  static inline std::atomic<int64_t> eligibleCopiesForTests{0};
   // Post-fold hits that were already pooled.  The eligible contract makes
   // this impossible for conforming engines; nonzero means selector wiring
   // broke and deepen rounds silently regressed to re-returning the pool.
@@ -1003,79 +1006,80 @@ public:
       // Cross-round dedup runs in two phases.  Round 1 (the overwhelmingly
       // common only round) uses the small seenVectors hash set and passes no
       // eligible bitmaps.  The FIRST deepen of either axis folds the seen set
-      // into per-segment rank-space "eligible" bitmaps (init: the segment's
-      // cached rank-live bitmap when it has one, else all-ones; pooled ranks
+      // into per-segment rank-space "eligible" bitmaps (the segment's cached
+      // rank-live bitmap when it has one, else all-ones; pooled ranks
       // cleared), which then serve double duty: the host's dedup structure
       // (O(1) bit test instead of a hash probe, and bounded at numVectors/8
       // bytes where the hash set would grow toward the candidate cap), and
       // the engines' NOT-pooled exclusion filter via request.eligible - so
       // every post-fold round spends its whole result heap on fresh hits
       // (the resumable cursor FAISS does not provide), and kReq switches
-      // from cumulative pool depth to a per-round fresh budget.  A segment
-      // with no liveness seed gets its span only once something of its is
-      // pooled (markSeen activates it), so untouched no-delete segments
-      // keep FAISS's compiled-out no-selector fast path.  Fold cost is
-      // O(ntotal/8 + seen), paid only by queries that deepen.
+      // from cumulative pool depth to a per-round fresh budget.  Copies are
+      // made lazily, per segment, only once something of that segment is
+      // pooled (ownEligible): an untouched segment with a liveness seed
+      // borrows the shared cached bitmap read-only (its eligible set IS the
+      // live set), and an untouched no-delete segment gets no span at all,
+      // keeping FAISS's compiled-out no-selector fast path.  Fold cost is
+      // O(bytes of pooled-into segments + seen), paid only by queries that
+      // deepen.
       std::vector<std::vector<uint8_t>> eligibleStore;
       std::vector<std::span<const uint8_t>> eligibleSpans;
       bool seenFolded = false;
+      // The segment's private, writable eligible copy, seeded from what its
+      // span showed so far (the borrowed liveness bits, or all-ones).
+      auto ownEligible = [&](size_t seg) -> std::vector<uint8_t>& {
+        auto& bits = eligibleStore[seg];
+        if (bits.empty()) {
+          eligibleCopiesForTests.fetch_add(1, std::memory_order_relaxed);
+          if (rankLivePerSeg[seg] != nullptr) {
+            size_t numBytes = ((size_t)segVectorCounts[seg] + 7) / 8;
+            assert(rankLivePerSeg[seg]->numBytes == numBytes);
+            bits.assign(rankLivePerSeg[seg]->bits, rankLivePerSeg[seg]->bits + numBytes);
+          } else {
+            // No cached liveness (no deletes, or a flat slot): not-pooled
+            // only.  Flat engines filter the domain themselves, so for them
+            // the bit means just "not pooled yet" - same dedup semantics.
+            fillAllRanksSet(bits, segVectorCounts[seg]);
+          }
+          eligibleSpans[seg] = bits;
+        }
+        return bits;
+      };
       auto foldSeen = [&]() {
         if (seenFolded) return;
         seenFolded = true;
         seenFoldsForTests.fetch_add(1, std::memory_order_relaxed);
         eligibleStore.resize(numSegs);
         eligibleSpans.assign(numSegs, {});
-        std::vector<char> cleared(numSegs, 0);
         for (size_t i = 0; i < numSegs; i++) {
-          int64_t n = segVectorCounts[i];
-          if (n <= 0) continue;
-          auto& bits = eligibleStore[i];
-          if (rankLivePerSeg[i] != nullptr) {
-            size_t numBytes = ((size_t)n + 7) / 8;
-            assert(rankLivePerSeg[i]->numBytes == numBytes);
-            bits.assign(rankLivePerSeg[i]->bits, rankLivePerSeg[i]->bits + numBytes);
-          } else {
-            // No cached liveness (no deletes, or a flat slot): not-pooled
-            // only.  Flat engines filter the domain themselves, so for them
-            // the bit means just "not pooled yet" - same dedup semantics.
-            fillAllRanksSet(bits, n);
+          if (segVectorCounts[i] > 0 && rankLivePerSeg[i] != nullptr) {
+            eligibleSpans[i] = std::span<const uint8_t>(
+              rankLivePerSeg[i]->bits, rankLivePerSeg[i]->numBytes);
           }
         }
         for (uint64_t key : seenVectors) {
           size_t seg = (size_t)(key >> PACK_RANK_BITS);
           uint64_t r = key & (((uint64_t)1 << PACK_RANK_BITS) - 1);
-          eligibleStore[seg][(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
-          cleared[seg] = 1;
-        }
-        // Hand engines a span only where it can exclude something: a
-        // liveness seed or at least one pooled rank. An all-ones span would
-        // demote a selector-free scan to a per-vector always-true probe.
-        for (size_t i = 0; i < numSegs; i++) {
-          if (!eligibleStore[i].empty()
-              && (rankLivePerSeg[i] != nullptr || cleared[i])) {
-            eligibleSpans[i] = eligibleStore[i];
-          }
+          ownEligible(seg)[(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
         }
         seenVectors = boost::unordered_flat_set<uint64_t>{};
       };
       // Mark a hit seen; true if it was fresh.  Post-fold every engine
       // returns only fresh hits (eligible is binding), so a stale hit here
       // means a broken engine/selector wiring - counted for tests.  The
-      // first pooled rank of a span-less segment activates its span for the
-      // next round.
+      // first pooled rank of a segment gives it its own copy (and, for a
+      // span-less segment, activates its span for the next round).
       auto markSeen = [&](int32_t segOrd, int64_t valueRank) -> bool {
         if (!seenFolded) {
           return seenVectors.insert(packSegRank(segOrd, valueRank)).second;
         }
-        auto& bits = eligibleStore[(size_t)segOrd];
+        auto& bits = ownEligible((size_t)segOrd);
         size_t byteIdx = (size_t)(valueRank >> 3);
         uint8_t mask = (uint8_t)(1u << (valueRank & 7));
         bool fresh = (bits[byteIdx] & mask) != 0;
         bits[byteIdx] &= (uint8_t)~mask;
         if (!fresh) {
           staleHitsForTests.fetch_add(1, std::memory_order_relaxed);
-        } else if (eligibleSpans[(size_t)segOrd].empty()) {
-          eligibleSpans[(size_t)segOrd] = bits;
         }
         return fresh;
       };
