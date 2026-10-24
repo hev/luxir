@@ -289,7 +289,10 @@ avoids applying equal work to every segment. For an IVF segment with deletions
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Flat-scanned segments with deletions use a
+simply borrows the liveDocs bits). Per-list live counts are memoized on the
+same cached bitmap: the first query to price a list under a given delete
+generation counts its ids against the bitmap, later queries reuse the count.
+Flat-scanned segments with deletions use a
 cheap upper bound instead (exact counting there would scan the field per
 query); the bound only errs toward slightly leaner initial effort, which
 auto-deepening recovers.

@@ -1872,19 +1872,25 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
     for (const auto& id : ids) EXPECT_NE(id, deletedId);
   };
 
+  auto walks = []() { return KnnQuery::listLiveCountsForTests.load(std::memory_order_relaxed); };
   int64_t builds0 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks0 = walks();
   runAndCheck("d40");
   int64_t builds1 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks1 = walks();
   EXPECT_EQ(builds1, builds0 + 1) << "first query builds the bitmap";
+  EXPECT_GT(walks1, walks0) << "first query counts its lists' live sizes";
   runAndCheck("d40");
   int64_t builds2 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds2, builds1) << "second query must reuse the cached bitmap";
+  EXPECT_EQ(walks(), walks1) << "second query must reuse the memoized list counts";
 
   std::vector<std::string> dels2{"d41"};
   h.deleteByIds(dels2, UpdateMessage::COMMIT);
   runAndCheck("d41");
   int64_t builds3 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
+  EXPECT_GT(walks(), walks1) << "new liveGen must recount list sizes";
 }
 
 // Filtered query on an IVF segment with deletes: the domain is filter

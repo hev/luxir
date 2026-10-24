@@ -245,6 +245,8 @@ public:
   // Lets tests assert the per-liveGen cache reuses across queries and
   // rebuilds when new deletes commit.
   static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
+  // Number of IVF list id walks liveListSize() performed (memo misses).
+  static inline std::atomic<int64_t> listLiveCountsForTests{0};
   static inline std::atomic<int64_t> seenFoldsForTests{0};
   // Post-fold hits that were already pooled.  The eligible contract makes
   // this impossible for conforming engines; nonzero means selector wiring
@@ -799,7 +801,7 @@ public:
               // segment's EXACT live vector count.
               rankLivePerSeg[i] = vauxPerSeg[i]->rankLiveBitmap(
                 seg.segInfo.live_gen, [&]() {
-                  return buildRankLiveBitmap(seg, vr, segCount);
+                  return buildRankLiveBitmap(seg, vr, segCount, vauxPerSeg[i]->getNList());
                 });
               segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
             } else {
@@ -1516,8 +1518,9 @@ public:
       /// Live vector count of one IVF list - the unit the global allocator
       /// charges against the scan-fraction budget (cost = liveListSize / N).
       /// Uses the ACTUAL invlist length so list imbalance prices correctly
-      /// (full selection always sums to ~N).  Under deletes this reads the
-      /// cached rank-space liveness bitmap per id (no rank -> doc resolve);
+      /// (full selection always sums to ~N).  Under deletes this counts the
+      /// cached rank-space liveness bitmap per id (no rank -> doc resolve)
+      /// once per list and liveGen, memoized on the shared RankLiveBitmap;
       /// liveness only (not the query domain), matching the live-N
       /// denominator.
       int64_t liveListSize(faiss::idx_t listId) const {
@@ -1527,6 +1530,13 @@ public:
         if (rawSize == 0) return 0;
         if (liveDocs == nullptr) return (int64_t)rawSize;
 
+        std::atomic<int64_t>* memo = (size_t)listId < rankLive->numLists
+          ? &rankLive->listLive[(size_t)listId] : nullptr;
+        if (memo != nullptr) {
+          int64_t cached = memo->load(std::memory_order_relaxed);
+          if (cached >= 0) return cached;
+        }
+        listLiveCountsForTests.fetch_add(1, std::memory_order_relaxed);
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
         const faiss::idx_t* listIds = ivf->invlists->get_ids((size_t)listId);
@@ -1535,6 +1545,7 @@ public:
           liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         }
         ivf->invlists->release_ids((size_t)listId, listIds);
+        if (memo != nullptr) memo->store(liveSize, std::memory_order_relaxed);
         return liveSize;
       }
 
@@ -2491,7 +2502,8 @@ private:
   /// segment's cached live count is the cardinality.
   static RankLiveBitmap buildRankLiveBitmap(IndexReader::Segment& seg,
                                             VectorReader& vr,
-                                            int64_t numVectors) {
+                                            int64_t numVectors,
+                                            int32_t nlist) {
     rankLiveBitmapBuildsForTests.fetch_add(1, std::memory_order_relaxed);
     LiveDocs& live = *seg.liveDocs();
     const screaming::FixedBitSet& liveBits = live.bitset();
@@ -2503,8 +2515,10 @@ private:
       static_assert(std::endian::native == std::endian::little,
                     "liveDocs words double as the LSB-first byte bitmap");
       assert((int64_t)live.size() == numVectors);
-      return {(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
-              seg.liveDocsShared()};
+      RankLiveBitmap out{(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
+                         seg.liveDocsShared()};
+      out.initListLive((size_t)std::max(0, nlist));
+      return out;
     }
 
     auto owned = std::make_shared<std::vector<uint8_t>>();
@@ -2545,7 +2559,9 @@ private:
       });
     }
     const uint8_t* data = bits.data();
-    return {data, numBytes, numVectors - cleared, std::move(owned)};
+    RankLiveBitmap out{data, numBytes, numVectors - cleared, std::move(owned)};
+    out.initListLive((size_t)std::max(0, nlist));
+    return out;
   }
 
   /// O(1) UPPER BOUND on a segment's live vector count, used as the budget
