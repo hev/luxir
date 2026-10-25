@@ -2698,10 +2698,12 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
   }
 }
 
-// Flat slots answer deepen rounds from the exact ranking their first scan
-// retained. Many small multi-valued flat segments beside a deepening IVF
+// Flat slots answer deepen rounds from the exact ranking a retaining scan
+// kept. Many small multi-valued flat segments beside a deepening IVF
 // segment, with deletes: the output must be bit-identical to rescanning every
 // round, serial and parallel; a full scan fraction must match exact search.
+// By default the first two scans stay plain, so a two-round query never
+// retains; retaining from the first scan serves its second round.
 TEST_F(KnnQueryTest, flatSlotsRetainRankingAcrossDeepenRounds) {
   KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
@@ -2739,37 +2741,43 @@ TEST_F(KnnQueryTest, flatSlotsRetainRankingAcrossDeepenRounds) {
     std::vector<float> scores;
     int64_t rounds = 0;
   };
-  auto run = [&](bool retain, bool parallel, float minScanFraction, bool exact) {
+  auto run = [&](bool retain, bool parallel, float minScanFraction, bool exact,
+                 int32_t refine) {
     SearchOverridesGuard retainGuard(KnnQuery::disableFlatRetainForTests);
     KnnQuery::disableFlatRetainForTests = !retain;
     KnnQuery::Stats stats;
     SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
     KnnQuery::statsForTests = &stats;
     auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4, /*nprobe=*/0,
-                           /*refineCandidates=*/300, exact, minScanFraction);
+                           refine, exact, minScanFraction);
     req->execute(parallel);
     Run out{resultIds(*req), resultScores(*req), stats.rounds.load()};
     req->done();
     return out;
   };
-  for (float fraction : {0.0f, 1.0f}) {
+  // refine 300 deepens once, 600 twice.
+  for (int32_t after : {0, 2}) for (int32_t refine : {300, 600}) for (float fraction : {0.0f, 1.0f}) {
+    SearchOverridesGuard afterGuard(KnnQuery::flatRetainAfterScans);
+    KnnQuery::flatRetainAfterScans = after;
     int64_t served0 = KnnQuery::flatRoundsServedForTests.load();
-    Run base = run(false, false, fraction, false);
+    Run base = run(false, false, fraction, false, refine);
     EXPECT_EQ(KnnQuery::flatRoundsServedForTests.load(), served0);
     if (fraction == 0.0f) {
-      EXPECT_GT(base.rounds, 1) << "query never deepened";
+      EXPECT_EQ(base.rounds, refine == 300 ? 2 : 3);
     }
     ASSERT_EQ(base.ids.size(), 4u);
     for (bool parallel : {false, true}) {
-      Run retained = run(true, parallel, fraction, false);
+      Run retained = run(true, parallel, fraction, false, refine);
       EXPECT_EQ(retained.ids, base.ids);
       EXPECT_EQ(retained.scores, base.scores);
       EXPECT_EQ(retained.rounds, base.rounds);
     }
     if (fraction == 0.0f) {
-      EXPECT_GT(KnnQuery::flatRoundsServedForTests.load(), served0);
+      int64_t served = KnnQuery::flatRoundsServedForTests.load() - served0;
+      if (after == 2 && refine == 300) EXPECT_EQ(served, 0);
+      else EXPECT_GT(served, 0) << "after=" << after << " refine=" << refine;
     } else {
-      EXPECT_EQ(base.ids, run(false, false, 0.0f, true).ids);
+      EXPECT_EQ(base.ids, run(false, false, 0.0f, true, refine).ids);
     }
   }
 }

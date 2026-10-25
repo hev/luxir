@@ -250,8 +250,12 @@ public:
   static inline std::atomic<int64_t> flatRoundsServedForTests{0};
   // Test/benchmark seam: rescan flat slots every round (the old behavior).
   static inline bool disableFlatRetainForTests = false;
-  // A flat slot's retaining pass keeps this many times its round's cut past
-  // the already pooled docs, so later deepen rounds skip the column scan.
+  // A flat slot scans plainly this many times per query before a scan
+  // retains its ranking (round 1 and the first deepen round stay as cheap
+  // as a rescan; tests lower it to reach served rounds sooner), and the
+  // retaining pass keeps FLAT_RETAIN_FACTOR times its round's cut past the
+  // already pooled docs, so later deepen rounds skip the column scan.
+  static inline int32_t flatRetainAfterScans = 2;
   static constexpr int64_t FLAT_RETAIN_FACTOR = 4;
   // Post-fold hits that were already pooled.  The eligible contract makes
   // this impossible for conforming engines; nonzero means selector wiring
@@ -309,6 +313,13 @@ public:
     if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
     return a.valueRank < b.valueRank;
   }
+
+  // betterHit as a functor type, so sort and selection inline the order.
+  struct BetterHit {
+    bool operator()(const VectorEngineHit& a, const VectorEngineHit& b) const noexcept {
+      return betterHit(a, b);
+    }
+  };
 
   /// Strict total order on collapsed doc hits (same shape as betterHit).
   static bool betterDoc(const DocHit& a, const DocHit& b) noexcept {
@@ -1713,11 +1724,13 @@ public:
       int32_t dims;
       int32_t metric;
       bool normalizeColumnOnCosineRescore;
-      // Doc mode: the exact ranking kept by the last retaining pass, the
-      // query it scored, its eligible doc count (-1: none yet) and the
-      // column's rank count.  See search() and serveRetained().
+      // Doc mode: the query the last pass scored and its plain passes so
+      // far, and the exact ranking the last retaining pass kept, its
+      // eligible doc count (-1: none yet) and the column's rank count.  See
+      // search() and serveRetained().
       std::vector<VectorEngineHit> retained;
       std::vector<float> retainedQuery;
+      int32_t queryScans = 0;
       int64_t retainedEligible = -1;
       int64_t retainedRanks = 0;
 
@@ -1753,6 +1766,12 @@ public:
         }
 
         if constexpr (!Groups) {
+          if (!sameQuery(request)) {
+            retainedQuery.assign(request.query, request.query + dims);
+            retained.clear();
+            retainedEligible = -1;
+            queryScans = 0;
+          }
           if (serveRetained(request, result)) return result;
         }
         int64_t eligibleDocs = 0;
@@ -1891,11 +1910,16 @@ public:
               if (key != nullptr) heap.offerKey(hit, *key, doc);
             }, std::true_type{});
           });
-        } else if (disableFlatRetainForTests) {
+        } else if (disableFlatRetainForTests || queryScans < flatRetainAfterScans) {
+          // The first scans of a query are plain passes, as cheap as they
+          // get: a query that stops by its first deepen round (most do)
+          // never pays for retention, whose bigger selection costs more than
+          // one rescan saves.  Only a second deepen round retains (below).
           scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
             unused(doc);
             heap.offer(makeHit());
           }, std::true_type{});
+          queryScans++;
         } else {
           // Retaining pass: rank every eligible doc, pooled or not, and keep
           // headroom past this round's cut, so later deepen rounds are
@@ -1910,16 +1934,31 @@ public:
           }
           int64_t limit = std::min(numVals, cleared + mulClamped(
               request.candidates, FLAT_RETAIN_FACTOR, numVals));
-          BoundedHits<false, VectorEngineHit, betterHit> keep(limit, groupPlan);
+          // Top-limit selection by buffer-and-prune: append hits that beat
+          // the last prune's cut, nth_element back to limit when the buffer
+          // doubles.  Amortized O(1) per hit, unlike a limit-sized heap.
+          retained.clear();
+          retained.reserve((size_t)(2 * limit));
+          VectorEngineHit cut{};
+          bool haveCut = false;
+          auto prune = [&] {
+            std::nth_element(retained.begin(), retained.begin() + (limit - 1),
+                             retained.end(), BetterHit{});
+            retained.resize((size_t)limit);
+            cut = retained.back();
+            haveCut = true;
+          };
           scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
             unused(doc);
-            keep.offer(makeHit());
+            VectorEngineHit hit = makeHit();
+            if (haveCut && !betterHit(hit, cut)) return;
+            retained.push_back(hit);
+            if ((int64_t)retained.size() == 2 * limit) prune();
           }, std::false_type{});
-          retained = keep.take();
-          std::sort(retained.begin(), retained.end(), betterHit);
+          if ((int64_t)retained.size() > limit) prune();
+          std::sort(retained.begin(), retained.end(), BetterHit{});
           retainedEligible = eligibleDocs;
           retainedRanks = numVals;
-          retainedQuery.assign(request.query, request.query + dims);
           if (serveRetained(request, result)) return result;
           // Exclusion bits that are not this slot's top-ranked emissions
           // (only a test engine wrapper can send those): plain pass.
@@ -1938,6 +1977,11 @@ public:
       }
 
     private:
+      // True when this engine's previous passes scored this query vector.
+      bool sameQuery(const VectorSearchRequest& request) const {
+        return !retainedQuery.empty()
+            && std::equal(retainedQuery.begin(), retainedQuery.end(), request.query);
+      }
       // Serve a doc-mode round from the ranking a previous pass retained:
       // the top request.candidates not-pooled docs, and poolExhausted iff no
       // more remain - exactly what a pass honoring request.eligible returns,
@@ -1952,10 +1996,7 @@ public:
       // arguments (the domain is fixed per engine).
       bool serveRetained(const VectorSearchRequest& request,
                          VectorSearchResult& result) const {
-        if (retainedEligible < 0
-            || !std::equal(retainedQuery.begin(), retainedQuery.end(), request.query)) {
-          return false;
-        }
+        if (retainedEligible < 0 || !sameQuery(request)) return false;
         std::span<const uint8_t> elig =
           (size_t)segOrd < request.eligible.size()
             ? request.eligible[(size_t)segOrd]
@@ -2384,8 +2425,8 @@ public:
         // already drained at this depth - omitting them from this round's
         // exhaustion accounting is correct.  Flat (below-threshold) engines are
         // breadth-independent: they get a unit every round, and a doc-mode
-        // flat slot answers later rounds from the exact ranking its first
-        // scan retained, rescanning only once that ranking runs out; they
+        // flat slot answers rounds after its third from the exact ranking
+        // its third scan retained, rescanning only once that runs out; they
         // honor request.eligible like every engine (a doc whose pooled best vector is
         // excluded can never improve an exact score, so the whole doc is
         // skipped), which keeps search() a pure function of its arguments (the

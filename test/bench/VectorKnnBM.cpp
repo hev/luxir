@@ -277,9 +277,9 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
 }
 
 // flatSegments > 0 appends that many small segments without overlays after
-// the build, each 1/100 of nDocs, so deepening queries mix many exact column
-// slots into every round; range(1) == 0 then makes those slots rescan their
-// column each round instead of serving it from their retained ranking.
+// the build, each 1/100 of nDocs, so the query mixes exact column slots into
+// its rounds; range(1) == 0 then makes those slots rescan their column each
+// round instead of serving later rounds from a retained ranking.
 void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
                   bool skew = false, int32_t flatSegments = 0) {
   int64_t nDocs = luxir::unit_tests
@@ -985,8 +985,9 @@ LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf, true, true)->Arg(50'000);
 // == 1).  IVF-only: the flat column engine doc-collapses during its scan
 // and so never deepens on multiplicity.
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf_skew, true, true, true)->Arg(50'000);
-// The same deepening query beside 40 small flat segments; retain = 0 is the
-// rescan-every-round baseline for the flat slots' retained ranking.
+// The skew query beside 40 small flat segments, whose docs fill the pool
+// target in round 1 (folds == 0): retention must cost a single-round query
+// nothing, so retain = 1 must match retain = 0 (the rescan baseline).
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf_skew_flat_tail, true, true, true, 40)
     ->ArgNames({"nDocs", "retain"})->Args({50'000, 0})->Args({50'000, 1});
 

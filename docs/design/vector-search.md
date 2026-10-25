@@ -318,9 +318,12 @@ pool. The shared per-segment liveness cache itself is never modified by
 queries.
 
 Exact column (flat) slots take part in every round with their share of the
-request, floored at k, but scan the column only once. The first scan scores
-every eligible document and keeps the best few times the round's cut (plus
-the already pooled documents) as an exact ranking; later rounds take the
+request, floored at k. Their first two scans (round 1 and the first deepen
+round, where the measured deepening queries stop) are plain passes: keeping
+a deeper ranking costs more than the one rescan it would save. A third scan
+scores every eligible
+document and keeps the best few times the round's cut (plus the already
+pooled documents) as an exact ranking; later rounds take the
 next not-pooled documents from it and report exhaustion from its counts,
 which is exactly what a fresh scan excluding the pooled ranks would return,
 since the scores are the same exact scores under the same total order. The
