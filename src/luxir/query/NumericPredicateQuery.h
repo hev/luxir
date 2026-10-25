@@ -327,7 +327,8 @@ public:
     }
 
     void intersectCandidateBits(std::span<uint64_t> words, int32_t min) override {
-      docid = withTest([this, words, min](auto test) {
+      // Keep each value loop's registers independent of the filter dispatch.
+      docid = withTest([this, words, min](auto test) LUXIR_NOINLINE {
         int32_t current = docid;
         for (size_t w = 0; w < words.size(); w++) {
           uint64_t candidates = words[w];
