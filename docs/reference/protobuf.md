@@ -1455,8 +1455,8 @@ Search effort for IVF indexes.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.knnquery.ivf.nprobe"></a>[`nprobe`](#field-luxir.knnquery.ivf.nprobe) | 1 | `int32` | singular | Merge-stable IVF effort: lists to probe if this field were one IVF index with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap search effort. |
-| <a id="field-luxir.knnquery.ivf.min_scan_fraction"></a>[`min_scan_fraction`](#field-luxir.knnquery.ivf.min_scan_fraction) | 2 | `float` | singular | Minimum fraction of live vectors to scan, in \[0,1\]. 0 = no floor. |
+| <a id="field-luxir.knnquery.ivf.nprobe"></a>[`nprobe`](#field-luxir.knnquery.ivf.nprobe) | 1 | `int32` | singular | Merge-stable IVF effort: lists to probe if the eligible vectors (live, and matching any filter) were one IVF index with nlist=sqrt(eligible vectors). 0 = adaptive default; positive values cap search effort. |
+| <a id="field-luxir.knnquery.ivf.min_scan_fraction"></a>[`min_scan_fraction`](#field-luxir.knnquery.ivf.min_scan_fraction) | 2 | `float` | singular | Minimum fraction of eligible vectors to scan, in \[0,1\]. 0 = no floor. |
 
 <a id="message-luxir.linearfusion"></a>
 
@@ -2945,7 +2945,7 @@ Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COS
 
 ### google.protobuf.NullValue
 
-\`NullValue\` is a singleton enumeration to represent the null value for the \`Value\` type union.<br><br>The JSON representation for \`NullValue\` is JSON \`null\`.
+Represents a JSON \`null\`.<br><br>\`NullValue\` is a sentinel, using an enum with only one value to represent the null value for the \`Value\` type union.<br><br>A field of type \`NullValue\` with any value other than \`0\` is considered invalid. Most ProtoJSON serializers will emit a \`Value\` with a \`null\_value\` set as a JSON \`null\` regardless of the integer value, and so will round trip to a \`0\` value.
 
 | Value | Number | Description |
 |---|---|---|
