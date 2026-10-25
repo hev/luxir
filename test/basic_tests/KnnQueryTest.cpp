@@ -2659,6 +2659,82 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
   }
 }
 
+// Flat slots answer deepen rounds from the exact ranking their first scan
+// retained. Many small multi-valued flat segments beside a deepening IVF
+// segment, with deletes: the output must be bit-identical to rescanning every
+// round, serial and parallel; a full scan fraction must match exact search.
+TEST_F(KnnQueryTest, flatSlotsRetainRankingAcrossDeepenRounds) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+
+  auto vecs = [](float x, int n) {
+    std::vector<std::vector<float>> out;
+    for (int i = 0; i < n; i++) out.push_back({x + (float)i * 0.01f, (float)(i % 3) * 0.1f, 0, 0});
+    return out;
+  };
+  // Dense near docs make IVF candidates collapse, so the query deepens.
+  for (int i = 0; i < 6; i++) {
+    h.index(flatdoc("id", "z" + std::to_string(i), "emb_vs", vecs((float)i * 0.3f, 30)));
+  }
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs", vecs(5.0f + (float)i * 0.2f, 1)));
+  }
+  h.commit({"*"});
+  for (int seg = 0; seg < 10; seg++) {
+    for (int j = 0; j < 20; j++) {
+      float x = 0.11f + (float)seg * 0.07f + (float)j * 0.45f;
+      h.index(flatdoc("id", std::format("s{}_{}", seg, j), "emb_vs", vecs(x, 1 + j % 3)));
+    }
+    h.commit();
+  }
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 11u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr);
+  }
+  h.deleteByIds({"z2", "s3_0", "s7_1"}, UpdateMessage::COMMIT);
+
+  struct Run {
+    std::vector<std::string> ids;
+    std::vector<float> scores;
+    int64_t rounds = 0;
+  };
+  auto run = [&](bool retain, bool parallel, float minScanFraction, bool exact) {
+    SearchOverridesGuard retainGuard(KnnQuery::disableFlatRetainForTests);
+    KnnQuery::disableFlatRetainForTests = !retain;
+    KnnQuery::Stats stats;
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4, /*nprobe=*/0,
+                           /*refineCandidates=*/300, exact, minScanFraction);
+    req->execute(parallel);
+    Run out{resultIds(*req), resultScores(*req), stats.rounds.load()};
+    req->done();
+    return out;
+  };
+  for (float fraction : {0.0f, 1.0f}) {
+    int64_t served0 = KnnQuery::flatRoundsServedForTests.load();
+    Run base = run(false, false, fraction, false);
+    EXPECT_EQ(KnnQuery::flatRoundsServedForTests.load(), served0);
+    if (fraction == 0.0f) {
+      EXPECT_GT(base.rounds, 1) << "query never deepened";
+    }
+    ASSERT_EQ(base.ids.size(), 4u);
+    for (bool parallel : {false, true}) {
+      Run retained = run(true, parallel, fraction, false);
+      EXPECT_EQ(retained.ids, base.ids);
+      EXPECT_EQ(retained.scores, base.scores);
+      EXPECT_EQ(retained.rounds, base.rounds);
+    }
+    if (fraction == 0.0f) {
+      EXPECT_GT(KnnQuery::flatRoundsServedForTests.load(), served0);
+    } else {
+      EXPECT_EQ(base.ids, run(false, false, 0.0f, true).ids);
+    }
+  }
+}
+
 TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
   KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
