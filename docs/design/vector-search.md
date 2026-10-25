@@ -312,15 +312,22 @@ the plan:
 - A segment with no eligible vector gets no engine and no share of the IVF
   budget.
 - A filtered IVF segment is scored exactly over its eligible rows when that
-  reads no more bytes than its IVF search would: `eligible * row_bytes <=
-  nlist * row_bytes + p * (vectors * id_bytes + eligible * code_bytes)`,
-  where `p` is the round-1 scan fraction. The terms are the coarse centroid
-  ranking, the probed lists' ids (each tested against the bitmap), and the
-  eligible codes scored. This is the Lucene and Elasticsearch rule (exact when
-  the filter matches no more documents than the approximate search would
-  visit) priced per byte, so one full-precision row counts as many cheap codes.
-  It ignores the terminal rescore and deepen rounds, which only favor exact
-  more. Unfiltered segments keep the approximate path.
+  reads at most `r` times the bytes its IVF search would: `eligible *
+  row_bytes <= r * (nlist * row_bytes + p * (vectors * id_bytes + eligible *
+  code_bytes))`, where `p` is the round-1 scan fraction. The terms are the
+  coarse centroid ranking, the probed lists' ids (each tested against the
+  bitmap), and the eligible codes scored. This is the Lucene and
+  Elasticsearch rule (exact when the filter matches no more documents than
+  the approximate search would visit) priced per byte, so one full-precision
+  row counts as many cheap codes. The bytes leave out the IVF path's per-list
+  and per-id work, the terminal rescore and deepen rounds, all of which favor
+  exact; `r = 8` is calibrated on `BM_VectorKnnFiltered` (200k 64-d vectors,
+  4 segments, RaBitQ-1): exact was faster up to 5% selectivity, where the
+  byte ratio is about 6, and slower from 10%, where it is about 13. At 1%
+  the IVF path was 2-5x slower than exact and, for a filter correlated with
+  the vector clusters, recalled only a third to a half of the true top 10:
+  the eligible vectors sit in a few lists far from the query, where 1-bit
+  codes cannot order them. Unfiltered segments keep the approximate path.
 - The doc target and the candidate cap are bounded by the eligible count, so a
   filter matching fewer documents than the target stops once they are pooled.
 

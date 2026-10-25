@@ -343,9 +343,10 @@ too few documents.
 
 The filter's selectivity shapes the search. Segments with no matching vector
 are skipped, IVF lists with no matching vector are not scanned, and a segment
-whose matching vectors are few enough that scoring them all exactly reads no
-more than its index search would is scored exactly instead (so a very
-selective filter returns the exact filtered top-k). A filter that matches
+whose matching vectors are few enough that scoring them all exactly costs
+no more than its index search would (in the benchmarks, up to about 5% of
+the segment's vectors) is scored exactly instead, so a selective filter
+returns the exact filtered top-k. A filter that matches
 fewer than `k` documents returns all of them without scanning the rest of the
 index. Repeated filters reuse a per-segment cached form of the filter.
 

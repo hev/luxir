@@ -270,10 +270,16 @@ public:
   // scored exactly over its eligible rows when that reads no more than
   // exactFallbackCostRatio times what its IVF search would (see
   // exactCheaperThanIvf).  0 disables the fallback.  Mutable for tests.
-  static inline double exactFallbackCostRatio = 1.0;
+  // Calibrated on BM_VectorKnnFiltered (200k 64-d vectors, RaBitQ-1, 4
+  // segments): per byte a scored row is ~8x cheaper than the IVF path's
+  // per-list and per-id work, so exact wins up to ~5% selectivity (ratio
+  // ~6 there) and loses from 10% (ratio ~13).  At 1% IVF was 2-5x slower
+  // than exact and lost recall on cluster-correlated filters.
+  static inline double exactFallbackCostRatio = 8.0;
 
   /// Whether scoring a filtered segment's eligible rows from the column is
-  /// cheaper than its IVF search, in bytes read, the scan's bound resource:
+  /// cheaper than its IVF search, in bytes read weighted by
+  /// exactFallbackCostRatio:
   ///   exact = eligible * rowBytes
   ///   ivf   = nlist * rowBytes                    (coarse centroid ranking)
   ///         + p * (vectors * idBytes              (probed lists' ids, each
@@ -284,7 +290,8 @@ public:
   /// documents than the approximate search would visit) priced per byte, so
   /// a full-precision row counts as many cheap codes.  It ignores the
   /// terminal rescore (paid by IVF only) and later deepen rounds, both of
-  /// which only favor exact more.  Only filtered segments are considered:
+  /// which only favor exact more, and IVF's per-list and per-id overheads,
+  /// which the ratio prices.  Only filtered segments are considered:
   /// unfiltered IVF segments are large by construction (the build threshold)
   /// and keep their merge-stable effort.
   static bool exactCheaperThanIvf(int64_t eligible, int64_t vectors, int32_t nlist,

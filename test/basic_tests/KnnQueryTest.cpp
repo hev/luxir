@@ -3248,6 +3248,16 @@ TEST_F(KnnFilterTest, filteredMatchesExactAcrossFieldShapes) {
   }
 }
 
+// The default exact-fallback ratio, at the shapes it was calibrated on
+// (50k 64-d vectors per segment, 223 lists, 16-byte RaBitQ-1 codes, the
+// round-1 scan fraction of each eligible total): 1% and 5% filters score
+// exactly, a 10% filter keeps the IVF path.
+TEST_F(KnnFilterTest, defaultExactFallbackCoversFivePercentFilters) {
+  EXPECT_TRUE(KnnQuery::exactCheaperThanIvf(500, 50'000, 223, 16, 64, 0.1508));
+  EXPECT_TRUE(KnnQuery::exactCheaperThanIvf(2'500, 50'000, 223, 16, 64, 0.1008));
+  EXPECT_FALSE(KnnQuery::exactCheaperThanIvf(5'000, 50'000, 223, 16, 64, 0.0842));
+}
+
 // A filter matching fewer docs than k returns exactly those docs: the doc
 // target is capped by the eligible count, so the IVF path stops once they are
 // pooled instead of deepening through every list, and with the fallback on
