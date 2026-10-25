@@ -3356,6 +3356,40 @@ TEST_F(KnnQueryTest, exactSimilarityFloorMatchesPostFilter) {
   }
 }
 
+// The flat docs scan applies the floor at its heap: with the floor between
+// every pair of neighboring scores (0 to all docs above it, around the
+// slot's candidate count), hits equal the post-filtered top k and the
+// above-floor exhaustion ends the query in one round.
+TEST_F(KnnQueryTest, exactSimilarityFloorAtEveryCut) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, std::nullopt, 4);
+  for (int i = 0; i < 12; i++) {
+    h.index(flatdoc("id", std::format("d{}", i), "embedding_v",
+                    std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit();
+  for (int above = 0; above <= 12; above++) {
+    // L2 distance i from the query at 0; the floor admits d0..d{above-1}.
+    float similarity = (float)above - 0.5f;
+    KnnQuery::Stats stats;
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().countLimit().fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", {0, 0, 0, 0}, 6,
+                             0, false, 0, 0, std::optional<float>(std::max(similarity, 0.0f)));
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    std::vector<std::string> want;
+    for (int i = 0; i < std::min(above, 6); i++) want.push_back(std::format("d{}", i));
+    if (above == 0) want = {"d0"};  // similarity 0 admits the exact match
+    EXPECT_EQ(ids, want) << above;
+    EXPECT_EQ(stats.rounds.load(), 1) << above;
+  }
+}
+
 // The lazy coarse ranking must reproduce FAISS's full k = nlist quantizer
 // search exactly (distances and order, ties included), however far it has
 // been advanced.  Duplicate centroids force exact distance ties on both

@@ -320,7 +320,9 @@ never modified by queries. Once widening finishes, the final candidate pool is r
 the full-precision column, sorted by exact score, and collapsed to one hit per
 document. A `similarity` threshold is applied to those exact scores. When every
 segment is scanned exactly from the column, the threshold is also handed to
-the scans, which keep below-threshold rows out of their result heaps; with
+the scans, which return only above-threshold rows and report exhaustion over
+them (a document-mode scan keeps one extra heap slot to tell whether more
+than its cut clear the threshold, so its per-row loop is unchanged); with
 any approximate segment it is applied only after rescoring, since
 approximate scores do not bound the exact ones and a smaller pool would
 change the deepening decisions.

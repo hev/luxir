@@ -1860,16 +1860,19 @@ public:
           return result;
         }
 
-        BoundedHits<Groups, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d);
-        int64_t eligibleDocs = 0;
-        int64_t belowFloorDocs = 0;
-        int64_t scanned = 0;
         // Exact scores: a below-floor doc can never survive the host's
-        // similarity filter, so it never enters the heap.
-        auto belowFloor = [&request, &belowFloorDocs](const VectorEngineHit& hit) LUXIR_INLINE {
-          if (!request.minScore.has_value() || hit.score >= *request.minScore) return false;
-          belowFloorDocs++;
-          return true;
+        // similarity filter.  Docs mode keeps the plain per-doc scan (a
+        // floor test there cost single-valued scans ~4%) and applies the
+        // floor to the heap instead: one extra slot tells whether more than
+        // request.candidates docs clear the floor.  Exact scores are never
+        // NaN (finiteScore), so the floor cut is a prefix of the ranking.
+        bool docFloor = !Groups && request.minScore.has_value();
+        BoundedHits<Groups, VectorEngineHit, betterHit> heap(
+            request.candidates + (docFloor ? 1 : 0), groupPlan, groupV2d);
+        int64_t eligibleDocs = 0;
+        int64_t scanned = 0;
+        auto belowFloor = [&request](const VectorEngineHit& hit) LUXIR_INLINE {
+          return request.minScore.has_value() && hit.score < *request.minScore;
         };
         if (segInfo == nullptr) {
           result.poolExhausted = true;
@@ -1994,8 +1997,7 @@ public:
           });
         } else scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
           unused(doc);
-          auto hit = makeHit();
-          if (!belowFloor(hit)) heap.offer(hit);
+          heap.offer(makeHit());
         });
 
         if (statsForTests) {
@@ -2006,7 +2008,15 @@ public:
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         if constexpr (Groups) result.poolExhausted = !heap.truncated;
-        else result.poolExhausted = eligibleDocs - belowFloorDocs <= request.candidates;
+        else if (docFloor) {
+          // Above-floor docs <= candidates iff the (candidates + 1)-th best
+          // eligible doc is missing or below the floor.
+          size_t cut = (size_t)request.candidates;
+          result.poolExhausted = result.hits.size() <= cut || belowFloor(result.hits[cut]);
+          size_t above = 0;
+          while (above < result.hits.size() && above < cut && !belowFloor(result.hits[above])) above++;
+          result.hits.resize(above);
+        } else result.poolExhausted = eligibleDocs <= request.candidates;
         return result;
       }
 
