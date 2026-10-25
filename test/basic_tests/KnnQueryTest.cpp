@@ -3344,3 +3344,98 @@ TEST_F(KnnFilterTest, filterRankBitmapCachedPerFilterAndLiveGen) {
   EXPECT_EQ(std::find(after.ids.begin(), after.ids.end(), first.ids[0]), after.ids.end());
   EXPECT_EQ(after.ids, runFiltered(*luxirNode, "emb_v", query, 5, "red", true).ids);
 }
+
+// Edge cardinalities of the rank-space filter, in every field shape: no
+// eligible doc (no engine, no hits, nothing scanned), exactly one eligible doc
+// (that doc, with its exact score), and a filter admitting every doc (equal to
+// the unfiltered exact search, with the approximate path forced).
+TEST_F(KnnFilterTest, filterEdgeCardinalitiesMatchExact) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
+  SearchOverridesGuard fallback(KnnQuery::exactFallbackCostRatio);
+  CollectionHelper h("main");
+  std::vector<float> query{120.0f, 0.0f, 0.0f, 0.0f};
+  for (Shape shape : {Shape::DENSE, Shape::SPARSE, Shape::MULTI}) {
+    h.clear();
+    std::string field = shape == Shape::MULTI ? "emb_vs" : "emb_v";
+    if (shape == Shape::MULTI) installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+    else installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+    indexSegment(h, shape, "a", 300, 0.0f, [](int i) { return i == 133; });
+    indexSegment(h, shape, "b", 300, 300.0f, [](int) { return false; });
+    h.commit({"*"});
+    for (double ratio : {0.0, 1.0}) {
+      KnnQuery::exactFallbackCostRatio = ratio;
+      KnnQuery::Stats stats;
+      SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+      KnnQuery::statsForTests = &stats;
+      auto none = runFiltered(*luxirNode, field, query, 5, "green", false);
+      KnnQuery::statsForTests = nullptr;
+      EXPECT_TRUE(none.ids.empty());
+      EXPECT_EQ(stats.lists.load() + stats.vectors.load(), 0);
+
+      auto one = runFiltered(*luxirNode, field, query, 5, "red", false);
+      EXPECT_EQ(one.ids, std::vector<std::string>{"a133"}) << ratio;
+      EXPECT_EQ(one.ids, runFiltered(*luxirNode, field, query, 5, "red", true).ids);
+    }
+    // Every doc of segment b is blue: its filtered top-k is the unfiltered one.
+    std::vector<float> farQuery{600.0f, 0.0f, 0.0f, 0.0f};
+    auto* req = makeKnnReq(*luxirNode, field, farQuery, 8, 0, 0, true);
+    req->execute();
+    auto exact = resultIds(*req);
+    req->done();
+    KnnQuery::exactFallbackCostRatio = 0.0;
+    auto every = runFiltered(*luxirNode, field, farQuery, 8, "blue", false, 1.0f);
+    EXPECT_EQ(every.ids, exact);
+  }
+}
+
+// A filter bitmap cached for one segment set stays correct after a commit adds
+// a segment whose nearest red docs beat the cached ones, and after a delete of
+// one of them: each query equals the exact filtered top-k.
+TEST_F(KnnFilterTest, cachedFilterStaysExactAcrossCommits) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  indexSegment(h, Shape::DENSE, "a", 240, 0.0f, [](int i) { return i % 2 == 0; });
+  h.commit({"*"});
+  std::vector<float> query{100.2f, 0.0f, 0.0f, 0.0f};
+  auto check = [&](std::string_view when) {
+    auto approx = runFiltered(*luxirNode, "emb_v", query, 6, "red", false);
+    EXPECT_EQ(approx.ids, runFiltered(*luxirNode, "emb_v", query, 6, "red", true).ids) << when;
+    return approx;
+  };
+  auto before = check("first");
+  EXPECT_EQ(check("repeat").ids, before.ids);
+
+  indexSegment(h, Shape::DENSE, "b", 40, 100.0f, [](int i) { return i % 3 == 0; });
+  h.commit({"*"});
+  auto after = check("after commit");
+  EXPECT_NE(after.ids, before.ids);
+
+  std::vector<std::string> dels{after.ids[0]};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+  auto deleted = check("after delete");
+  EXPECT_EQ(std::find(deleted.ids.begin(), deleted.ids.end(), after.ids[0]), deleted.ids.end());
+}
+
+// Deleting the only doc a filter admits leaves an empty eligible set: the
+// liveness folded into the filter domain is what empties it, so the query
+// returns nothing and scans nothing, with or without a cached filter bitmap.
+TEST_F(KnnFilterTest, deletingLastEligibleDocEmptiesFilter) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  indexSegment(h, Shape::DENSE, "a", 200, 0.0f, [](int i) { return i == 77; });
+  h.commit({"*"});
+  std::vector<float> query{77.2f, 0.0f, 0.0f, 0.0f};
+  EXPECT_EQ(runFiltered(*luxirNode, "emb_v", query, 5, "red", false).ids, std::vector<std::string>{"a77"});
+
+  std::vector<std::string> dels{"a77"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+  KnnQuery::Stats stats;
+  SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
+  EXPECT_TRUE(runFiltered(*luxirNode, "emb_v", query, 5, "red", false).ids.empty());
+  EXPECT_TRUE(runFiltered(*luxirNode, "emb_v", query, 5, "red", true).ids.empty());
+  EXPECT_EQ(stats.lists.load() + stats.vectors.load(), 0);
+}
