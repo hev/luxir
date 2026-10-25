@@ -2707,6 +2707,8 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
 TEST_F(KnnQueryTest, flatSlotsRetainRankingAcrossDeepenRounds) {
   KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
+  // A background merge mid-test would reshape the slots between runs.
+  h.getIndexWriter()->mergePolicy->setMergeFactor(1000);
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
 
   auto vecs = [](float x, int n) {
@@ -2763,10 +2765,11 @@ TEST_F(KnnQueryTest, flatSlotsRetainRankingAcrossDeepenRounds) {
     Run base = run(false, false, fraction, false, refine);
     EXPECT_EQ(KnnQuery::flatRoundsServedForTests.load(), served0);
     if (fraction == 0.0f) {
-      EXPECT_EQ(base.rounds, refine == 300 ? 2 : 3);
+      EXPECT_EQ(base.rounds, refine == 300 ? 2 : 3) << "after=" << after << " refine=" << refine;
     }
     ASSERT_EQ(base.ids.size(), 4u);
     for (bool parallel : {false, true}) {
+      SCOPED_TRACE(std::format("after={} refine={} fraction={} parallel={}", after, refine, fraction, parallel));
       Run retained = run(true, parallel, fraction, false, refine);
       EXPECT_EQ(retained.ids, base.ids);
       EXPECT_EQ(retained.scores, base.scores);
