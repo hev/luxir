@@ -1940,6 +1940,70 @@ public:
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 
+  // Metadata-only rejection, independent of exact/scoring cursor state. A
+  // possible run is a superset of matches; [target, begin) is proven empty.
+  class MembershipProof {
+  protected:
+    struct Range { int32_t begin, end; };
+
+  private:
+    Range possible{0, 0};
+    int32_t knownFrom = 0;
+
+    [[gnu::noinline]] int32_t seekPossible(int32_t target) {
+      if (target == PostingsReader::END) return target;
+      if (target >= knownFrom && target < possible.begin) return possible.begin;
+      possible = nextRange(target);
+      knownFrom = target;
+      assert(possible.begin >= target && possible.end >= possible.begin);
+      assert(possible.end > target);
+      return possible.begin;
+    }
+
+  protected:
+    // Targets can move backward when a prepared window is intersected.
+    virtual Range nextRange(int32_t target) = 0;
+
+  public:
+    virtual void reset() { possible = {0, 0}; knownFrom = 0; }
+
+    [[gnu::always_inline]] int32_t nextPossible(int32_t target) {
+      assert(target >= 0);
+      if (target >= possible.begin && target < possible.end) return target;
+      return seekPossible(target);
+    }
+
+    // After nextPossible(base) == base, [base, possibleEnd()) needs no mask.
+    int32_t possibleEnd() const { return possible.end; }
+
+    [[gnu::noinline]] void intersect(std::span<uint64_t> words, int32_t base) {
+      int32_t end = (int32_t)std::min<int64_t>(PostingsReader::END,
+          (int64_t)base + (int64_t)words.size() * 64);
+      if (base >= possible.begin && end <= possible.end) return;
+      for (int32_t doc = base; doc < end;) {
+        int32_t next = nextPossible(doc);
+        int32_t stop = std::min(next, end);
+        if (doc < stop) {
+          int32_t first = doc - base;
+          int32_t last = stop - base - 1;
+          int32_t firstWord = first >> 6;
+          int32_t lastWord = last >> 6;
+          uint64_t firstMask = ~0ULL << (first & 63);
+          uint64_t lastMask = ~0ULL >> (63 - (last & 63));
+          if (firstWord == lastWord) {
+            words[(size_t)firstWord] &= ~(firstMask & lastMask);
+          } else {
+            words[(size_t)firstWord] &= ~firstMask;
+            std::fill(words.begin() + firstWord + 1, words.begin() + lastWord, 0);
+            words[(size_t)lastWord] &= ~lastMask;
+          }
+        }
+        if (next >= end) break;
+        doc = std::min(possible.end, end);
+      }
+    }
+  };
+
   /// A segment-pool-owned, single-consumption scorer construction token.
   /// Resolving records the exact shape, demand, and supplier cost before any
   /// scorer is built. A parent may retain the token, but must consume it at
@@ -1998,6 +2062,13 @@ public:
     // Like build(), this borrows the originating supplier graph; keep that
     // graph alive while consulting the plan, including after consumption.
     [[gnu::cold]] virtual bool supportsReset() const noexcept { return false; }
+
+    // An optional independent resource. Only consumers that schedule from
+    // proofs build it; constructing a scorer does not change its protocols.
+    virtual MembershipProof* buildMembershipProof(MemPool& targetPool) {
+      unused(targetPool);
+      return nullptr;
+    }
 
     Scorer* build(MemPool& targetPool) {
       consume();

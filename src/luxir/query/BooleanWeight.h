@@ -2302,6 +2302,7 @@ private:
   std::span<float> groupScores;
   std::span<BufferedTerm> leadGroupTerms;
   WindowFilter* windowFilter = nullptr;
+  std::span<Query::MembershipProof*> membershipProofs;
   int32_t maxDoc;
   float minCompetitiveScore = std::numeric_limits<float>::lowest();
   double scoreBoundFactor = 1.0;
@@ -2320,6 +2321,7 @@ private:
   bool denseScoredEligible = false;
   bool denseScoredCostRejected = false;
   bool competitivePruning = true;
+  int32_t candidateProofCount;
   const uint8_t* denseScoredNorms = nullptr;
   TermQuery::Scorer* candidatePostingsLead = nullptr;
   TermQuery::Scorer* candidateLeadScoreScorer = nullptr;
@@ -3331,7 +3333,26 @@ private:
     return total;
   }
 
+  [[gnu::noinline]] int32_t proofLowerBoundAll(int32_t target) {
+    for (;;) {
+      int32_t before = target;
+      for (auto* proof : membershipProofs) {
+        target = proof->nextPossible(target);
+        if (target == PostingsReader::END) return target;
+      }
+      if (target == before) return target;
+    }
+  }
+
+  [[gnu::always_inline]] int32_t proofLowerBound(int32_t target) {
+    assert(!membershipProofs.empty());
+    if (membershipProofs.size() == 1) return membershipProofs.front()->nextPossible(target);
+    return proofLowerBoundAll(target);
+  }
+
   int32_t ratchetDenseWindow(int32_t min, int32_t max) {
+    if (!membershipProofs.empty()) min = proofLowerBound(min);
+    if (min >= max) return min;
     for (size_t c = 0; c < denseClauses.size(); c++) {
       // A bounded exact seek retains late-range jumps without verifying
       // past the caller's span. Its approximation may be unconfirmed at the
@@ -3346,6 +3367,7 @@ private:
       }
       if (doc > min) {
         min = doc;
+        if (!membershipProofs.empty()) min = proofLowerBound(min);
       }
       if (min >= max) {
         break;
@@ -3456,6 +3478,10 @@ private:
       applyDocSetToWindow(windowBits, windowBase, windowEnd, filter);
     }
     if (windowFilter != nullptr) {
+      for (auto* proof : membershipProofs.first((size_t)candidateProofCount)) {
+        // The ratchet established a possible start for every proof.
+        if (windowEnd > proof->possibleEnd()) proof->intersect(windowBits, windowBase);
+      }
       windowFilter->intersect(windowBits, windowBase);
     }
     return true;
@@ -3670,12 +3696,15 @@ private:
     }
     int32_t target = min;
     while (target < windowEnd) {
+      if (!membershipProofs.empty()) target = proofLowerBound(target);
+      if (target >= windowEnd) return target;
       int32_t doc = scorerCountSeek<TermFast, TermTailFast>(
           0, target, windowEnd);
       if (doc >= windowEnd) {
         return doc;  // sound resume point (or END); covers doc == END
       }
-      target = doc;
+      target = membershipProofs.empty() ? doc : proofLowerBound(doc);
+      if (target != doc) continue;
 
       bool matched = true;
       for (size_t c = 1; c < scorers.size(); c++) {
@@ -3836,6 +3865,7 @@ public:
     for (auto* term : candidateProhibitedTerms) term->reset();
     if (candidateLeadScoreScorer != nullptr) candidateLeadScoreScorer->reset();
     if (windowFilter != nullptr) windowFilter->reset();
+    for (auto* proof : membershipProofs) proof->reset();
     for (size_t i = 0; i < candidateFilterProbes.size(); i++) {
       candidateFilterProbes[i].reset(candidateFilterDocSets[i]);
     }
@@ -3877,7 +3907,9 @@ public:
                         std::span<const ConjunctionClauseLayout>
                             plannedProhibitedClauses,
                         ConjunctionRoute plannedRoute,
-                        WindowFilter* membershipFilter)
+                        WindowFilter* membershipFilter,
+                        std::span<Query::MembershipProof*> membershipProofs,
+                        int32_t candidateProofCount)
       : scorers(scorers),
         prohibitedScorers(prohibitedScorers),
         candidateProhibitedTerms(candidateProhibitedTerms),
@@ -3918,11 +3950,13 @@ public:
             ((size_t) kChunk + 63) >> 6),
         groupScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
         windowFilter(membershipFilter),
+        membershipProofs(membershipProofs),
         maxDoc(maxDoc),
         candidateBatchSize(
             countLeadIsDocSet || candidatePostingsLead != nullptr
                 ? filteredConjunctionBatchSizeForTests : kChunk),
         countLeadIsDocSet(countLeadIsDocSet),
+        candidateProofCount(candidateProofCount),
         candidatePostingsLead(candidatePostingsLead),
         candidateLeadScoreScorer(candidateLeadScoreScorer),
         candidateFilters(candidateFilters),
@@ -10289,6 +10323,23 @@ class BooleanQuery::Weight final : public Query::Weight {
         }
         membershipFilter = targetPool.make<WindowFilter>(targetPool, filters, true);
       }
+      boost::container::small_vector<Query::MembershipProof*, 8> proofs;
+      int32_t candidateProofCount = 0;
+      if (plan.mode == ConjunctionMode::EXHAUSTIVE && isMembershipWindowUse(plan.use)) {
+        auto collectProof = [&](Query::ScorerPlan* child) {
+          if (child != nullptr) {
+            if (auto* proof = child->buildMembershipProof(targetPool)) proofs.push_back(proof);
+          }
+        };
+        for (const auto& entry : plan.candidateFilters) collectProof(entry.plan);
+        candidateProofCount = (int32_t)proofs.size();
+        for (const auto& entry : plan.entries) collectProof(entry.plan);
+      }
+      std::span<Query::MembershipProof*> membershipProofs;
+      if (!proofs.empty()) {
+        membershipProofs = targetPool.make_span<Query::MembershipProof*>(proofs.size());
+        std::copy(proofs.begin(), proofs.end(), membershipProofs.begin());
+      }
       auto* bulk = targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
           targetPool,
           std::span<Query::Scorer*>(arr, plan.entries.size()),
@@ -10301,7 +10352,8 @@ class BooleanQuery::Weight final : public Query::Weight {
           candidateLeadScoreScorer, candidateFilters,
           candidateFilterDocSets, plan.negatedCount, false,
           clauseLayouts,
-          prohibitedLayouts.first(prohibitedCount), plan.route, membershipFilter);
+          prohibitedLayouts.first(prohibitedCount), plan.route, membershipFilter,
+          membershipProofs, candidateProofCount);
 
 #ifndef NDEBUG
       ConjunctionRoute builtRoute = ConjunctionRoute::GENERIC;

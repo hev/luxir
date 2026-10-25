@@ -26,6 +26,10 @@ protected:
   CollectionHelper helper;
   std::shared_ptr<IndexReader> reader;
 
+  static bool possible(int32_t doc) {
+    return (doc >= 4096 && doc < 12288) || (doc >= 16384 && doc < 24576);
+  }
+
   void SetUp() override {
     SchemaBuilder schema;
     auto& field = schema.field("points_i");
@@ -45,8 +49,17 @@ protected:
       if (doc % 32 == 0) body += " dense_b";
       if (doc % 4 == 0) body += " excluded";
       docs.push_back(flatdoc("id", std::to_string(doc), "body_w", body,
-          "column_i", value, "points_i", value, "cluster_i", doc));
+          "column_i", value, "points_i", value, "cluster_i", doc,
+          "proof_i", possible(doc) ? doc : N + doc,
+          "proof2_i", doc >= 8192 && doc < 20480 ? doc : N + doc,
+          "partial_i", doc < N / 4 ? N + doc : value,
+          "striped_i", (doc / 512) % 2 == 0 ? 0 : N));
       if (doc % 5 != 0) docs.back().push_back({"multi_is", vec_i(value, value + 1000)});
+      if (doc % 5 != 0) docs.back().push_back({"holes_i", (int64_t)(possible(doc) ? doc : N + doc)});
+      if (doc >= 2048 && doc < N - 2048 && doc % 5 != 0) {
+        docs.back().push_back({"edge_i", (int64_t)(doc >= 8192 && doc < 12288 ? N + doc : doc)});
+      }
+      docs.back().push_back({"cluster_is", vec_i(doc, doc + 1)});
     }
     ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     reader = std::make_shared<IndexReader>(helper.getIndexWriter()->dir);
@@ -54,17 +67,21 @@ protected:
   }
 
   std::vector<int32_t> membership(Query& query, Use use, DocSet* domain = nullptr,
-                                  Query* enclosing = nullptr, bool reposition = false) {
+                                  std::span<Query*> enclosing = {}, bool reposition = false,
+                                  int32_t min = 0, int32_t max = N) {
     MemPool pool;
     Query::Context context(pool, *reader);
     auto& segment = reader->segments()[0];
     auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, segment);
     Query::ScorerSupplier::BulkScorerContext bulkContext;
-    std::array<Query::ScorerSupplier*, 1> filters;
-    if (enclosing != nullptr) {
-      filters[0] = enclosing->createWeight(context, 0)->scorerSupplier(pool, segment);
-      bulkContext = {filters[0]->cost(), filters, true};
+    std::vector<Query::ScorerSupplier*> filters;
+    int64_t filterCost = INT64_MAX;
+    for (auto* filter : enclosing) {
+      auto* child = filter->createWeight(context, 0)->scorerSupplier(pool, segment);
+      filters.push_back(child);
+      filterCost = std::min(filterCost, child->cost());
     }
+    if (!filters.empty()) bulkContext = {filterCost, filters, true};
     auto plan = supplier->planBulk(use, bulkContext);
     EXPECT_EQ(Answer::YES, plan.available);
     if (plan.available != Answer::YES) return {};
@@ -82,13 +99,13 @@ protected:
     std::vector<int32_t> result;
     DocSetBuilder builder(N);
     int64_t count = 0;
-    for (int32_t cursor = 0; cursor < N;) {
+    for (int32_t cursor = min; cursor < max;) {
       int32_t next;
       if (use == Use::COUNT_WINDOWS) {
-        next = bulk->countNextWindow(count, &builder, domain, cursor, N);
+        next = bulk->countNextWindow(count, &builder, domain, cursor, max);
       } else {
         ScoreWindow out;
-        next = bulk->matchNextWindow(out, domain, cursor, N);
+        next = bulk->matchNextWindow(out, domain, cursor, max);
         result.insert(result.end(), out.docs.begin(), out.docs.begin() + out.size);
       }
       EXPECT_GT(next, cursor);
@@ -150,12 +167,13 @@ TEST_F(RangeFilterTest, SparseCandidateFiltersFollowDomain) {
   NumericPredicateQuery range("column_i", 0, 59000);
   std::array<Query*, 2> required{&a, &b};
   BooleanQuery body(required, {}, {}, {});
+  std::array<Query*, 1> filters{&range};
   RAMBitDocSet domain(N);
   domain.mutableBits().set(1);
   int64_t verified = 0;
   NumericVerificationObserver observe([&](int32_t) { verified++; });
   for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
-    EXPECT_TRUE(membership(body, use, &domain, &range).empty());
+    EXPECT_TRUE(membership(body, use, &domain, filters).empty());
   }
   EXPECT_EQ(0, verified);
 }
@@ -171,7 +189,7 @@ TEST_F(RangeFilterTest, LeadOnlyAndMixedThresholdPlansResetWithFilters) {
       SkipStatsScope stats;
       auto expected = membership(query, use);
       EXPECT_FALSE(expected.empty());
-      EXPECT_EQ(expected, membership(query, use, nullptr, nullptr, true));
+      EXPECT_EQ(expected, membership(query, use, nullptr, {}, true));
       EXPECT_GT(SkipStats::conjDenseCountWindows + SkipStats::conjDenseMatchWindows, 0);
     }
   }
@@ -179,7 +197,7 @@ TEST_F(RangeFilterTest, LeadOnlyAndMixedThresholdPlansResetWithFilters) {
 
 TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   // Scanning a random column costs about as much as verifying most docs.
-  // Settled zones keep production for clustered fields, even for few candidates.
+  // Proofs keep settled-zone skips when sparse candidates are cheaper.
   struct Case {
     const char* field;
     int64_t candidates;
@@ -187,8 +205,8 @@ TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   };
   for (auto [field, candidates, verifies] : {Case{"column_i", 64, true},
            Case{"column_i", N * 3 / 10, true}, Case{"column_i", N * 9 / 10, false},
-           Case{"cluster_i", 64, false}, Case{"cluster_i", N * 3 / 10, false},
-           Case{"cluster_i", N * 9 / 10, false}}) {
+           Case{"cluster_i", 64, true}, Case{"cluster_i", N * 3 / 10, false},
+           Case{"cluster_i", N * 9 / 10, false}, Case{"cluster_is", 64, false}}) {
     SCOPED_TRACE(::testing::Message() << field << " " << candidates);
     NumericPredicateQuery range(field, 4096, 28671);
     MemPool pool;
@@ -200,18 +218,251 @@ TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
     auto shape = supplier->describeScorer(build);
     auto* plan = supplier->resolve(pool, build);
     EXPECT_EQ(shape.membershipConsumption, plan->shape().membershipConsumption);
+    if (std::string_view(field) == "cluster_is") {
+      EXPECT_EQ(nullptr, plan->buildMembershipProof(pool));
+    }
     EXPECT_EQ(verifies ? Consumption::CANDIDATES : Consumption::WINDOWS,
               shape.membershipConsumption);
     auto* scorer = plan->build(pool);
     if (verifies) {
       EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
           IntColReader::SparseIterator>*>(scorer));
-    } else if (std::string_view(field) == "cluster_i") {
+    } else if (std::string_view(field).starts_with("cluster_")) {
       EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::ZoneMapScorer*>(scorer));
     } else {
       EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
           IntColReader::Iterator>*>(scorer));
     }
+  }
+}
+
+TEST_F(RangeFilterTest, ProofsSkipProductionInDenseAndSparseMembership) {
+  NumericPredicateQuery first("proof_i", 0, N - 1), second("proof2_i", 0, N - 1);
+  TermQuery b("body_w", "b");
+  std::array<Query*, 2> filters{&first, &second};
+  for (auto [lead, step] : {std::pair{"threshold", 256}, {"rare", 2048}, {"dense_a", 16}}) {
+    TermQuery a("body_w", lead);
+    std::array<Query*, 2> required{&a, &b};
+    BooleanQuery body(required, {}, {}, {});
+    std::vector<int32_t> expected;
+    for (int32_t doc = 0; doc < N; doc += step) {
+      if (doc % 3 == 0 && possible(doc) && doc >= 8192 && doc < 20480) expected.push_back(doc);
+    }
+    for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
+      SkipStatsScope stats;
+      int64_t verified = 0;
+      NumericVerificationObserver observe([&](int32_t doc) {
+        EXPECT_TRUE(possible(doc) && doc >= 8192 && doc < 20480);
+        verified++;
+      });
+      EXPECT_EQ(expected, membership(body, use, nullptr, filters));
+      EXPECT_LE(verified, (int64_t)expected.size() * 2);
+      EXPECT_LT(SkipStats::countBulkFillDocs, N / 3);
+      if (step == 2048) {
+        EXPECT_EQ(0, SkipStats::conjDenseCountWindows + SkipStats::conjDenseMatchWindows);
+        EXPECT_LT(SkipStats::advanceCalls, 2 * N / step);
+      } else {
+        EXPECT_GT(SkipStats::conjDenseCountWindows + SkipStats::conjDenseMatchWindows, 0);
+        EXPECT_LE(SkipStats::conjDenseCountWindows + SkipStats::conjDenseMatchWindows, 4);
+      }
+    }
+  }
+}
+
+TEST_F(RangeFilterTest, ProofsRejectInsideWindowsAfterExactElimination) {
+  TermQuery a("body_w", "threshold"), b("body_w", "b"), excluded("body_w", "excluded");
+  NumericPredicateQuery range("striped_i", 0, 0);
+  std::array<Query*, 2> required{&a, &b};
+  std::array<Query*, 1> filters{&range}, prohibited{&excluded};
+  BooleanQuery query(required, {}, {}, filters), negative(required, {}, prohibited, filters);
+  RAMBitDocSet domain(N);
+  domain.mutableBits().set(768);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 0; doc < N; doc += 768) {
+    if ((doc / 512) % 2 == 0) expected.push_back(doc);
+  }
+  for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
+    int64_t verified = 0;
+    NumericVerificationObserver observe([&](int32_t doc) {
+      EXPECT_EQ(0, (doc / 512) % 2);
+      EXPECT_EQ(0, doc % 768);
+      verified++;
+    });
+    EXPECT_EQ(expected, membership(query, use));
+#ifndef NDEBUG
+    EXPECT_EQ((int64_t)expected.size(), verified);
+#endif
+    verified = 0;
+    EXPECT_TRUE(membership(query, use, &domain).empty());
+    EXPECT_TRUE(membership(negative, use).empty());
+    EXPECT_EQ(0, verified);
+  }
+}
+
+TEST_F(RangeFilterTest, PartlySettledScanSharesProofsWithCandidateConsumption) {
+  NumericPredicateQuery range("partial_i", 0, N - 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(N, N, Use::COUNT_WINDOWS));
+  build.membershipConsumption = Consumption::WINDOWS;
+  auto* plan = supplier->resolve(pool, build);
+  EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
+      IntColReader::Iterator>*>(plan->build(pool)));
+  auto* proof = plan->buildMembershipProof(pool);
+  ASSERT_NE(nullptr, proof);
+  EXPECT_EQ(N / 4, proof->nextPossible(0));
+
+  TermQuery a("body_w", "threshold"), b("body_w", "b");
+  std::array<Query*, 2> required{&a, &b};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery query(required, {}, {}, filters);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 0; doc < N; doc += 768) {
+    if (doc >= N / 4 && 2 * ((doc * 1543) % N) < N) expected.push_back(doc);
+  }
+  for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
+    SkipStatsScope stats;
+    NumericVerificationObserver observe([&](int32_t doc) { EXPECT_GE(doc, N / 4); });
+    EXPECT_EQ(expected, membership(query, use));
+    EXPECT_EQ(1, SkipStats::numericPredicateSparseVerifyArms);
+    EXPECT_EQ(6, SkipStats::conjDenseCountWindows + SkipStats::conjDenseMatchWindows);
+    EXPECT_LT(SkipStats::countBulkFillDocs, N / 3);
+  }
+}
+
+TEST_F(RangeFilterTest, SparseColumnProofsRespectBoundsAndReset) {
+  TermQuery a("body_w", "threshold"), b("body_w", "b");
+  NumericPredicateQuery range("holes_i", 0, N - 1);
+  std::array<Query*, 2> required{&a, &b};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery query(required, {}, {}, filters);
+  for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
+    for (auto [min, max] : {std::pair{0, N}, {6500, 23000}, {24576, N}, {0, 4096}}) {
+      std::vector<int32_t> expected;
+      for (int32_t doc = min; doc < max; doc++) {
+        if (doc % 768 == 0 && doc % 5 != 0 && possible(doc)) expected.push_back(doc);
+      }
+      NumericVerificationObserver observe([&](int32_t doc) {
+        EXPECT_GE(doc, min);
+        EXPECT_LT(doc, max);
+      });
+      EXPECT_EQ(expected, membership(query, use, nullptr, {}, false, min, max));
+    }
+    auto expected = membership(query, use);
+    EXPECT_EQ(expected, membership(query, use, nullptr, {}, true));
+  }
+}
+
+TEST_F(RangeFilterTest, SparseProofRetainsMissingBoundaryGaps) {
+  NumericPredicateQuery range("edge_i", 0, N - 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  auto* plan = supplier->resolve(pool, supplier->makePlanContext(
+      Query::Demand::fromCandidatesAndSpan(N, N, Use::COUNT_WINDOWS)));
+  auto* proof = plan->buildMembershipProof(pool);
+  ASSERT_NE(nullptr, proof);
+  NumericVerificationObserver observe([](int32_t) { FAIL() << "proof decoded a value"; });
+  EXPECT_EQ(2048, proof->nextPossible(0));
+  EXPECT_EQ(PostingsReader::END, proof->nextPossible(N - 2048));
+  proof->reset();
+  EXPECT_EQ(2048, proof->nextPossible(0));
+}
+
+TEST_F(LuxirTest, RangeProofIndexSpansBitmapWords) {
+  constexpr int32_t N = 65 * 4096 + 17;
+  auto possible = [](int32_t doc) {
+    return doc >= 512 && doc < 65 * 4096
+        && (doc < 63 * 4096 + 512 || doc >= 64 * 4096 + 512);
+  };
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  auto& inverter = writer->obtainInverter();
+  auto& field = inverter.getIndexHandler("proof_i");
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    field.index(inverter, (int64_t)(possible(doc) ? 0 : 1));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter, true);
+  helper.commit();
+  IndexReader reader(writer->dir);
+  ASSERT_EQ(1u, reader.segments().size());
+  MemPool pool;
+  Query::Context context(pool, reader);
+  NumericPredicateQuery range("proof_i", 0, 0);
+  auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader.segments()[0]);
+  auto* plan = supplier->resolve(pool, supplier->makePlanContext(
+      Query::Demand::fromCandidatesAndSpan(N, N, Use::COUNT_WINDOWS)));
+  auto* proof = plan->buildMembershipProof(pool);
+  ASSERT_NE(nullptr, proof);
+  NumericVerificationObserver observe([](int32_t) { FAIL() << "proof decoded a value"; });
+  for (int32_t base : {0, 62 * 4096, 63 * 4096, 64 * 4096, 65 * 4096, 512}) {
+    int32_t expected = base;
+    while (expected < N && !possible(expected)) expected++;
+    EXPECT_EQ(expected == N ? PostingsReader::END : expected, proof->nextPossible(base));
+    std::array<uint64_t, 64> bits;
+    bits.fill(~0ULL);
+    proof->intersect(bits, base);
+    for (int32_t i = 0; i < 4096; i++) {
+      EXPECT_EQ(possible(base + i), (bits[(size_t)(i >> 6)] & (1ULL << (i & 63))) != 0);
+    }
+  }
+  proof->reset();
+  EXPECT_EQ(512, proof->nextPossible(0));
+  EXPECT_EQ(63 * 4096 + 512, proof->possibleEnd());
+}
+
+TEST_F(RangeFilterTest, ProofResourcesAreIndependentOfScorerCursors) {
+  for (auto field : {"proof_i", "holes_i"}) {
+    for (auto consumption : {Consumption::WINDOWS, Consumption::CANDIDATES}) {
+      NumericPredicateQuery range(field, 0, N - 1);
+      MemPool pool;
+      Query::Context context(pool, *reader);
+      auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+      auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(N, N, Use::COUNT_WINDOWS));
+      build.membershipConsumption = consumption;
+      auto* plan = supplier->resolve(pool, build);
+      auto* scorer = plan->build(pool);
+      auto* proof = plan->buildMembershipProof(pool);
+      ASSERT_NE(nullptr, proof);
+      {
+        NumericVerificationObserver observe([](int32_t) { FAIL() << "proof decoded a value"; });
+        for (int32_t target : {0, 4095, 4096, 4609, 5001, 12287, 12288, 16383, 24576, N, 0}) {
+          int32_t bound = proof->nextPossible(target);
+          EXPECT_GE(bound, target);
+          for (int32_t doc = target; doc < std::min(bound, N); doc++) {
+            EXPECT_FALSE(possible(doc) && (std::string_view(field) != "holes_i" || doc % 5 != 0));
+          }
+        }
+        for (int32_t base : {4001, 4050, 4095, 12287, 24576, 4096, 5001}) {
+          std::array<uint64_t, 64> bits;
+          bits.fill(~0ULL);
+          proof->intersect(bits, base);
+          for (int32_t bit = 0; bit < 4096; bit++) {
+            bool kept = (bits[(size_t)(bit >> 6)] & (1ULL << (bit & 63))) != 0;
+            if (std::string_view(field) == "proof_i") {
+              EXPECT_EQ(possible(base + bit), kept);
+            } else if (possible(base + bit) && (base + bit) % 5 != 0) {
+              EXPECT_TRUE(kept);
+            }
+          }
+        }
+        EXPECT_EQ(-1, scorer->docId());
+        proof->reset();
+        EXPECT_GT(proof->nextPossible(0), 0);
+      }
+      EXPECT_EQ(4096, scorer->advanceWindow(0, N));
+    }
+  }
+  for (auto field : {"column_i", "points_i", "cluster_is"}) {
+    NumericPredicateQuery range(field, 0, 65535);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    auto* plan = supplier->resolve(pool, supplier->makePlanContext(Query::Demand::fromLeadCost(N)));
+    EXPECT_EQ(nullptr, plan->buildMembershipProof(pool));
   }
 }
 

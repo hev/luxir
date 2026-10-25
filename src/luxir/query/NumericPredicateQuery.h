@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+
 #include <algorithm>
 #include <bit>
 #include <cassert>
@@ -51,20 +53,19 @@ public:
   // Routing weights of one sparse candidate verification, in units of one
   // column value of window production. Against a full scan, forced-arm runs
   // favored verification at 1-10% candidates (10M docs) and 30-40% (131k).
-  // A producer also ratchets its siblings past windows it rejects, which this
-  // model does not price: on a time-ordered range, verification lost 24-87%
-  // to zone production at sub-percent leads, so zone arms keep the
-  // conservative weight. Read once so description and resolution agree; the
-  // environment overrides exist for recalibration.
-  static constexpr double kScanCandidateValueWeight = 1.25;
-  static constexpr double kZoneCandidateValueWeight = 8;
-  static inline const double scanCandidateValueWeight = [] {
+  // Membership proofs retain the producer's OUTSIDE skips for single-valued
+  // candidate filters. Multivalued zone producers keep the conservative
+  // weight when those proofs cannot be reproduced. Read once so description
+  // and resolution agree; the zone override applies only to that fallback.
+  static constexpr double kCandidateValueWeight = 1.25;
+  static constexpr double kUnprovenZoneCandidateValueWeight = 8;
+  static inline const double candidateValueWeight = [] {
     const char* value = std::getenv("LUXIR_NUMERIC_CANDIDATE_WEIGHT");
-    return value != nullptr ? std::atof(value) : kScanCandidateValueWeight;
+    return value != nullptr ? std::atof(value) : kCandidateValueWeight;
   }();
-  static inline const double zoneCandidateValueWeight = [] {
+  static inline const double unprovenZoneCandidateValueWeight = [] {
     const char* value = std::getenv("LUXIR_NUMERIC_ZONE_CANDIDATE_WEIGHT");
-    return value != nullptr ? std::atof(value) : kZoneCandidateValueWeight;
+    return value != nullptr ? std::atof(value) : kUnprovenZoneCandidateValueWeight;
   }();
 
   static inline bool disableShapesForTests = false;
@@ -434,6 +435,71 @@ public:
         fn(run.relation, rank, end);
         rank = end;
       }
+    }
+  };
+
+  class ColumnProof final : public Query::MembershipProof {
+    std::span<Range> outside;
+    size_t cursor = 0;
+
+    Range nextRange(int32_t target) override {
+      if (cursor > 0 && target < outside[cursor - 1].end) cursor = 0;
+      cursor = (size_t)screaming::gallopLowerBound(
+          (int64_t)cursor, (int64_t)outside.size(), target + 1,
+          [&](int64_t i) { return outside[(size_t)i].end; });
+      if (cursor < outside.size() && target >= outside[cursor].begin) {
+        target = outside[cursor++].end;
+      }
+      return {target, cursor < outside.size() ? outside[cursor].begin : PostingsReader::END};
+    }
+
+  public:
+    ColumnProof(MemPool& pool, IntColReader& reader,
+                std::span<const BlockPlan> plans, const uint64_t* outsideBlocks) {
+      assert(!reader.multiValued());
+      boost::container::small_vector<Range, 8> ranges;
+      for (int64_t word = 0; word < (reader.numBlocks() + 63) / 64; word++) {
+        for (uint64_t bits = outsideBlocks[word]; bits != 0; bits &= bits - 1) {
+          int64_t block = word * 64 + std::countr_zero(bits);
+          const auto& plan = plans[(size_t)block];
+          uint32_t count = (uint32_t)reader.valuesInBlock(block);
+          // Index rejection once. Possible windows then touch no leaf metadata.
+          plan.forEachRun(count, [&](BlockRelation relation, uint32_t begin, uint32_t end) {
+            if (relation != BlockRelation::OUTSIDE) return;
+            int32_t base = (int32_t)(block * IntColReader::BLOCK_SIZE);
+            Range range{base + (int32_t)begin, base + (int32_t)end};
+            if (!ranges.empty() && ranges.back().end == range.begin) ranges.back().end = range.end;
+            else ranges.push_back(range);
+          });
+        }
+      }
+      assert(!ranges.empty());
+      int32_t afterLast = (int32_t)reader.numValues();
+      if (!reader.denseDocsWithValue()) {
+        const auto& bits = reader.docsWithValueBitSet();
+        screaming::BitSet::Selector selector(
+            bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
+        int32_t first = selector.select(0);
+        afterLast = selector.select((int32_t)reader.numValues() - 1) + 1;
+        for (auto& range : ranges) {
+          if (range.begin != 0) range.begin = selector.select(range.begin);
+          range.end = range.end == reader.numValues()
+              ? PostingsReader::END : selector.select(range.end);
+        }
+        if (first > 0 && ranges.front().begin > 0) ranges.insert(ranges.begin(), Range{0, first});
+      } else if (ranges.back().end == reader.numValues()) {
+        ranges.back().end = PostingsReader::END;
+      }
+      if (ranges.back().end != PostingsReader::END && afterLast < PostingsReader::END) {
+        ranges.push_back({afterLast, PostingsReader::END});
+      }
+      outside = pool.make_span<Range>(ranges.size());
+      std::copy(ranges.begin(), ranges.end(), outside.begin());
+    }
+
+    void reset() override {
+      MembershipProof::reset();
+      cursor = 0;
     }
   };
 
@@ -1107,12 +1173,18 @@ public:
       IntColReader& reader;
       PointsReader* points;
       std::span<const BlockPlan> plans;
-      std::span<const PointsReader::OrdinalRange> pointRanges;
+      // Only columns need the rejection index; points use ordinal ranges.
+      union {
+        std::span<const PointsReader::OrdinalRange> pointRanges;
+        uint64_t* outsideBlocks;
+      };
       uint64_t pointValueCount;
       int64_t estimatedCost;
       Query::MatchState matchState;
       bool allMatch;
       bool useZoneMap;
+      bool hasOutside = false;
+      int32_t possibleDocs;
       double zoneProductionWork = 0;
 
       struct Selection {
@@ -1257,12 +1329,17 @@ public:
           return {arm, Consumption::CANDIDATES};
         }
         // Compare the existing sparse decoder against production, not result
-        // cardinality. Verification does not yet reuse BlockPlan proofs.
+        // cardinality. Single-valued candidate filters reject OUTSIDE runs
+        // before decoding; multivalued filters retain their prior policy.
         double valuesPerDoc = std::max(1.0,
             (double)reader.numValues() / std::max(1, reader.docsWithValue()));
-        double candidateWork = (useZoneMap ? zoneCandidateValueWeight
-                                           : scanCandidateValueWeight)
-            * (double)demand.candidates * valuesPerDoc;
+        bool unsupportedProofs = reader.multiValued() && hasOutside;
+        int64_t candidates = points == nullptr && !reader.multiValued()
+            ? std::min<int64_t>(demand.candidates, possibleDocs)
+            : demand.candidates;
+        double candidateWork = (useZoneMap && unsupportedProofs
+            ? unprovenZoneCandidateValueWeight : candidateValueWeight)
+            * (double)candidates * valuesPerDoc;
         double spanFraction = std::min(1.0,
             (double)demand.span / std::max(1, segment.maxDoc()));
         double productionWork = points != nullptr ? (double)estimatedCost
@@ -1343,6 +1420,13 @@ public:
         }
 
       public:
+        Query::MembershipProof* buildMembershipProof(MemPool& targetPool) override {
+          if (supplier.points != nullptr || supplier.reader.multiValued()
+              || !supplier.hasOutside) return nullptr;
+          return targetPool.make<ColumnProof>(
+              targetPool, supplier.reader, supplier.plans, supplier.outsideBlocks);
+        }
+
         [[gnu::cold]] bool supportsReset() const noexcept override {
           return unscoredResetUse() && !supplier.weight.needsScores();
         }
@@ -1422,21 +1506,33 @@ public:
             reader(reader), points(points),
             plans(plans), pointRanges(pointRanges),
             pointValueCount(pointValueCount), estimatedCost(estimatedCost),
-            matchState(matchState), allMatch(allMatch) {
+            matchState(matchState), allMatch(allMatch), possibleDocs(reader.docsWithValue()) {
         useZoneMap = false;
         if (points != nullptr) return;
+        outsideBlocks = nullptr;
         int64_t prunableValues = 0;
         for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
           plans[(size_t)blockNum].forEachRun(
               (uint32_t)reader.valuesInBlock(blockNum),
               [&](BlockRelation relation, uint32_t begin, uint32_t end) {
-                if (relation != BlockRelation::CROSSES) {
-                  prunableValues += end - begin;
-                  if (relation == BlockRelation::INSIDE) {
-                    zoneProductionWork += (end - begin + 63) / 64;
-                  }
-                } else {
+                if (relation == BlockRelation::CROSSES) {
                   zoneProductionWork += 2.0 * (end - begin);
+                  return;
+                }
+                prunableValues += end - begin;
+                if (relation == BlockRelation::INSIDE) {
+                  zoneProductionWork += (end - begin + 63) / 64;
+                  return;
+                }
+                hasOutside = true;
+                if (!reader.multiValued()) {
+                  possibleDocs -= (int32_t)(end - begin);
+                  if (outsideBlocks == nullptr) {
+                    auto words = planPool.make_span<uint64_t>((size_t)(reader.numBlocks() + 63) / 64);
+                    std::fill(words.begin(), words.end(), 0);
+                    outsideBlocks = words.data();
+                  }
+                  outsideBlocks[blockNum >> 6] |= 1ULL << (blockNum & 63);
                 }
               });
         }
