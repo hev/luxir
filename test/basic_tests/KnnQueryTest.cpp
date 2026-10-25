@@ -1935,6 +1935,112 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   EXPECT_GT(walks(), walks1) << "new liveGen must recount list sizes";
 }
 
+// Memoized per-list live counts are per delete generation: each delete commit
+// must recount, a repeat query must not, and a commit that empties almost every
+// list must still give exact results (empty lists memoize as 0).
+TEST_F(KnnQueryTest, ivfDeletesRecountListsPerGeneration) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  auto walks = []() { return KnnQuery::listLiveCountsForTests.load(std::memory_order_relaxed); };
+  auto check = [&](const std::vector<std::string>& want) {
+    auto* req = makeKnnReq(*luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+                           /*nprobe=*/0, /*refineCandidates=*/200,
+                           /*exact=*/false, /*minScanFraction=*/1.0f);
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    EXPECT_EQ(ids, want);
+  };
+
+  check({"d40", "d41", "d39", "d42", "d38"});
+  std::vector<std::string> first10;
+  for (int i = 0; i < 10; i++) first10.push_back("d" + std::to_string(i));
+  h.deleteByIds(first10, UpdateMessage::COMMIT);
+  int64_t w1 = walks();
+  check({"d40", "d41", "d39", "d42", "d38"});
+  int64_t w2 = walks();
+  EXPECT_GT(w2, w1) << "a new delete generation must recount";
+  check({"d40", "d41", "d39", "d42", "d38"});
+  EXPECT_EQ(walks(), w2) << "a repeat query at the same generation must not recount";
+
+  std::vector<std::string> most;
+  for (int i = 10; i < 155; i++) most.push_back("d" + std::to_string(i));
+  h.deleteByIds(most, UpdateMessage::COMMIT);
+  check({"d155", "d156", "d157", "d158", "d159"});
+  check({"d155", "d156", "d157", "d158", "d159"});
+}
+
+// Eligible bitmaps are copied per segment only once something of it is
+// pooled: with several IVF segments that have deletes but no hits in the
+// result, a deepening query must give exact results and copy at most the
+// segments it actually pooled into.  The multi-vector "z" doc fills the pool
+// with its own ranks, which forces the deepen.
+TEST_F(KnnQueryTest, ivfDeepenCopiesEligibleOnlyForPooledSegments) {
+  KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  std::vector<std::vector<float>> zvecs;
+  for (int i = 0; i < 40; i++) zvecs.push_back({(float)i * 0.001f, 0, 0, 0});
+  h.index(flatdoc("id", std::string("z"), "emb_vs", zvecs));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{2, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{3, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("del"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0, 0}, {0.6f, 0, 0, 0}}));
+  for (int i = 0; i < 155; i++) {
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{{50.0f + (float)i, 0, 0, 0}}));
+  }
+  h.commit({"*"});
+  for (int seg = 0; seg < 5; seg++) {
+    for (int i = 0; i < 160; i++) {
+      float x = 1000.0f * (float)(seg + 1) + (float)i;
+      h.index(flatdoc("id", std::format("far{}_{}", seg, i),
+                      "emb_vs", std::vector<std::vector<float>>{{x, 0, 0, 0}}));
+    }
+    h.commit({"*"});
+  }
+  std::vector<std::string> dels{"del"};
+  for (int seg = 0; seg < 5; seg++) dels.push_back(std::format("far{}_7", seg));
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+  {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 6u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr);
+  }
+
+  int64_t copies0 = KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed);
+  int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
+                         /*nprobe=*/0, /*refineCandidates=*/8,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  req->execute();
+  auto ids = resultIds(*req);
+  req->done();
+  EXPECT_GT(KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed), folds0)
+      << "query never deepened; fold path unexercised";
+  EXPECT_EQ(KnnQuery::eligibleCopiesForTests.load(std::memory_order_relaxed) - copies0, 1)
+      << "every segment copied its eligible bits, not just the pooled ones";
+
+  auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
+                           /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+  ASSERT_EQ(ids.size(), 4u);
+  EXPECT_EQ(ids, exactIds);
+  EXPECT_EQ(ids, (std::vector<std::string>{"z", "b", "c", "d"}));
+}
+
 // Filtered query on an IVF segment with deletes: the domain is filter
 // intersect liveDocs (NOT the liveDocs docset itself), so eligibility goes
 // through the resolve-based selector while the allocator's live accounting
