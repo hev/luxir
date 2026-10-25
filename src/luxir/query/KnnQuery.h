@@ -1787,9 +1787,12 @@ public:
           (size_t)segOrd < request.eligible.size()
             ? request.eligible[(size_t)segOrd]
             : std::span<const uint8_t>{};
-        bool skipPooled = true;
-        auto pooledInRun = [&elig, &skipPooled](int64_t begin, int64_t end) {
-          if (!skipPooled || elig.empty()) return false;
+        // skipPooled is a compile-time tag (std::true_type / false_type): as
+        // a runtime flag captured by reference it was re-tested per rank and
+        // slowed plain single-valued scans by ~12%.
+        auto pooledInRun = [&elig](int64_t begin, int64_t end, auto skipPooled) LUXIR_INLINE {
+          if constexpr (!decltype(skipPooled)::value) return false;
+          if (elig.empty()) return false;
           for (int64_t r = begin; r < end; r++) {
             if (((elig[(size_t)(r >> 3)] >> (r & 7)) & 1) == 0) return true;
           }
@@ -1808,7 +1811,7 @@ public:
         // pass.  liveDocs/domain are applied as a per-run predicate.
         StrColReader& col = vr.strColReader();
         RowReadAhead::Gate gate;
-        auto scan = [&](auto emit) {
+        auto scan = [&](auto emit, auto skipPooled) {
           RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
                              (size_t)col.fixedValueSize(), numVals);
           std::optional<MonoReader::BulkValues> aheadValDoc;
@@ -1840,7 +1843,7 @@ public:
               } while (end < numVals && (int32_t)valDoc.value() == docId);
               unused(idx);
               readAhead(rank);
-              if (docEligible(docId) && !pooledInRun(rank, end)) {
+              if (docEligible(docId) && !pooledInRun(rank, end, skipPooled)) {
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
                   if constexpr (Groups) scanned += end - rank;
@@ -1857,7 +1860,7 @@ public:
             // Single-valued (dense identity or sparse select): one-vector runs.
             for (int64_t rank = 0; rank < numVals; rank++) {
               readAhead(rank);
-              if (pooledInRun(rank, rank + 1)) continue;
+              if (pooledInRun(rank, rank + 1, skipPooled)) continue;
               int32_t docId = v2d.resolve(rank);
               if (!docEligible(docId)) continue;
               eligibleDocs++;
@@ -1886,13 +1889,13 @@ public:
               if (!heap.competitive(hit)) return;
               const auto* key = keyAt(doc);
               if (key != nullptr) heap.offerKey(hit, *key, doc);
-            });
+            }, std::true_type{});
           });
         } else if (disableFlatRetainForTests) {
           scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
             unused(doc);
             heap.offer(makeHit());
-          });
+          }, std::true_type{});
         } else {
           // Retaining pass: rank every eligible doc, pooled or not, and keep
           // headroom past this round's cut, so later deepen rounds are
@@ -1908,11 +1911,10 @@ public:
           int64_t limit = std::min(numVals, cleared + mulClamped(
               request.candidates, FLAT_RETAIN_FACTOR, numVals));
           BoundedHits<false, VectorEngineHit, betterHit> keep(limit, groupPlan);
-          skipPooled = false;
           scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
             unused(doc);
             keep.offer(makeHit());
-          });
+          }, std::false_type{});
           retained = keep.take();
           std::sort(retained.begin(), retained.end(), betterHit);
           retainedEligible = eligibleDocs;
@@ -1921,12 +1923,11 @@ public:
           if (serveRetained(request, result)) return result;
           // Exclusion bits that are not this slot's top-ranked emissions
           // (only a test engine wrapper can send those): plain pass.
-          skipPooled = true;
           eligibleDocs = 0;
           scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
             unused(doc);
             heap.offer(makeHit());
-          });
+          }, std::true_type{});
         }
 
         result.hits = heap.take();
