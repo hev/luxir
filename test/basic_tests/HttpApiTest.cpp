@@ -3275,9 +3275,9 @@ TEST_F(HttpApiTest, schemaSetAndReplaceAllModes) {
   // set on an EXISTING name replaces that WHOLE definition (not a property merge).
   auto redefine = httpRequest(port(), http::verb::post, "/collections/main/_schema",
                               R"({"fields": {"published": {"type": "date"}}})");
-  ASSERT_EQ(200, redefine.result_int()) << redefine.body();
-  EXPECT_EQ(redefine.body().find("\"index\": \"range\""), std::string::npos)
-      << "whole-definition set dropped the old index property: " << redefine.body();
+  ASSERT_EQ(400, redefine.result_int()) << redefine.body();
+  EXPECT_NE(redefine.body().find("Cannot change index of existing field 'published'"), std::string::npos)
+      << redefine.body();
 
   // mode=replace_all: title/published gone, reserved fields materialized.
   auto replace = httpRequest(port(), http::verb::post,
