@@ -43,6 +43,8 @@ const QueryRegistry& globalQueryRegistry() { return Registries::global().query; 
 
 const SearchOpRegistry& globalSearchOpRegistry() { return Registries::global().searchOps; }
 
+const SortKindRegistry& globalSortKindRegistry() { return Registries::global().sortKinds; }
+
 const StorageRegistry& globalStorageRegistry() { return Registries::global().storage; }
 
 const CollationRegistry& globalCollationRegistry() { return Registries::global().collation; }
@@ -57,6 +59,7 @@ void Registries::freeze() {
   fieldTypes.freeze();
   query.freeze();
   searchOps.freeze();
+  sortKinds.freeze();
   http.freeze();
 }
 

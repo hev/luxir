@@ -12,6 +12,7 @@
 
 #include "CountingStorage.h"
 #include "ExampleSearch.h"
+#include "ExampleSort.h"
 #include "luxir/api/build.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
@@ -444,6 +445,7 @@ class ExamplePlugin : public Plugin {
   static void registerSearch(Registries& r) {
     r.query.add("doc_ids", ::example::docIdsDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
+    r.sortKinds.add("abs_diff", ::example::makeAbsDiff);
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       const std::string* echo = request.queryParam("echo");
       response.body = R"({"pong":")" + (echo ? *echo : std::string()) + R"("})";

@@ -6,6 +6,7 @@
 #include "luxir/query/PostingsUnion.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SortField.h"
+#include "luxir/search/SortKindRegistry.h"
 #include "luxir/util/heap.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/value/ValueExpr.h"
@@ -94,6 +95,12 @@ public:
       : descriptor(descriptor) {
       if (descriptor.getKind() == SortClause::COLUMN) {
         comparator = descriptor.getSortField().createComparator(*reader);
+      } else if (descriptor.getKind() == SortClause::PLUGIN) {
+        comparator = descriptor.getSortKind().createComparator(*reader);
+        if (comparator == nullptr) {
+          throw RequestError("sort kind " + std::string(descriptor.getSortKindName()) +
+                             "() made no comparator");
+        }
       } else if (descriptor.getKind() == SortClause::EXPR) {
         expr = std::make_unique<ExprState>();
         expr->fields.resize(descriptor.getValueProgram().nodes.size());
@@ -244,6 +251,8 @@ public:
   LeafDescent leafDescent = LeafDescent::UNDECIDED;
   int32_t nextProbeDoc = 0;
   bool candidatesDisabled = false;
+  // The primary comparator offers no competitiveDocs source in this segment.
+  bool competitiveDocsUnsupported = false;
 
   class ExpressionBindings {
   public:
@@ -334,6 +343,7 @@ public:
     candidateReach = 0;
     nextProbeDoc = 0;
     candidatesDisabled = false;
+    competitiveDocsUnsupported = false;
     if (segmentSourceCost > 0) {
       priorSourceDocs += std::min<int64_t>(segmentSourceCost, segmentMaxDoc);
     }
@@ -528,6 +538,7 @@ public:
       int cmp = 0;
       switch (clause.descriptor.getKind()) {
         case SortClause::COLUMN:
+        case SortClause::PLUGIN:
           if (source == CompareSource::CURRENT_DOC) {
             if constexpr (Member) {
               cmp = clause.comparator->compareCurrent(docA.slot, docA.doc, docB.doc);
@@ -1036,6 +1047,50 @@ private:
   // narrow and cheap enough, the postings union activates and each consult
   // surfaces the next candidate doc as a one-doc range.
   CompetitiveRange candidateRange(int32_t segment, int32_t from) {
+    if (!competitiveDocsUnsupported && topCount > 0
+        && clauses[0].comparator != nullptr
+        && clauses[0].comparator->offersCompetitiveDocs()) {
+      // Until the heap fills, consult again about topCount docs on: the
+      // source has no bound to offer before that.
+      if (pq.size() < (size_t)topCount) {
+        nextProbeDoc = (int32_t)std::min<int64_t>((int64_t)from + std::max<int64_t>(topCount, 16),
+                                                  (int64_t)PostingsReader::END);
+        return {from, nextProbeDoc};
+      }
+      if (from < nextProbeDoc) return {from, nextProbeDoc};
+      int32_t begin = from;
+      int32_t end = from;
+      // The source's docs left, assuming they spread evenly over the
+      // segment; the docs left when its cost is unknown.
+      int64_t left = std::max<int64_t>(0, (int64_t)segmentMaxDoc - from);
+      if (segmentSourceCost > 0 && segmentMaxDoc > 0) {
+        left = std::min<int64_t>(segmentSourceCost, segmentMaxDoc) * left / segmentMaxDoc;
+      }
+      auto status = clauses[0].comparator->competitiveDocs(
+          pq.top().slot, from, left, begin, end);
+      if (status == FieldComparator::CompetitiveDocStatus::READY) {
+        nextProbeDoc = 0;
+        if (begin == PostingsReader::END) {
+          skipCount(SkipStats::fieldSortCandidateTerminations);
+          return {begin, begin};
+        }
+        // A run must start at or after from and hold a doc: an answer before
+        // from would revisit collected docs, an empty one would stall the
+        // query on the same doc.
+        begin = std::max(begin, from);
+        end = std::max(end, begin + 1);
+        return {begin, end};
+      }
+      if (status == FieldComparator::CompetitiveDocStatus::PENDING) {
+        if (end > from) {
+          nextProbeDoc = end;
+          return {from, end};
+        }
+        return {from, probeDeferral(from)};
+      }
+      competitiveDocsUnsupported = true;
+      nextProbeDoc = 0;
+    }
     if (candidatesDisabled || segmentPool == nullptr || topCount == 0
         || clauses[0].comparator == nullptr) {
       candidatesDisabled = true;

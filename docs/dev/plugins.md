@@ -172,6 +172,105 @@ field set. A free-form result is a `Map`. Nested op
 results go in the `DocList`'s `ops` (route them in `getTargetForSub`). `format=docs`
 accepts only `top_docs` and `fusion` ops.
 
+## Sort kinds
+
+`Registries::sortKinds` (`src/luxir/search/SortKindRegistry.h`) lets a plugin
+sort with its own comparator. A plugin claims a function name; a sort clause
+whose whole expression is a call to that name, `name(args...)`, or that call
+under `min(...)` or `max(...)`, is the plugin's:
+
+```json
+{"sort": ["min(abs_diff(sizes_is, 42))", "id"]}
+{"sort": {"expr": "abs_diff(size_i, $target)", "vars": {"target": 42}, "dir": "desc"}}
+```
+
+- The claim decides only that root form. Anywhere else, including a larger
+  expression such as `abs_diff(size_i, 42) + 1`, the name is read by the value
+  language, so a plugin can claim the name of a value function and sort its
+  root form faster while the function keeps working inside expressions. Unclaimed
+  expressions sort as before.
+- Arguments are literals: a bare name (usually a field), a number, a quoted
+  string, or a `$variable` from the clause's `vars` holding a number or a
+  string. Anything else (a nested expression) is a request error naming the
+  argument.
+- `min` and `max` reach the maker as `ctx.mode` (`SortKindMode::MIN`, `MAX`;
+  `SINGLE` without one). What they mean is the kind's; for a multi-valued
+  field they usually pick the nearest or farthest value, and a kind can
+  require one there.
+- Names are `[a-z0-9_]+`, do not start with a digit, and may not be `min`,
+  `max` or `col`. A duplicate, a null maker, or an add after the freeze
+  throws.
+
+The maker receives a `SortKindContext`: the claimed `name`, the whole `expr`,
+`mode`, `descending` and the parsed `args`, with accessors that check and
+convert them (`arity`, `field(i)`, which resolves a field as value expressions
+do, `number`, `integer`, `string`), `fail(message)` for a request error naming
+the expression, `note(text)` for `?explain=resolved`, and the request's
+`schema` (read-only) and field resolver. Whitespace may separate a name from
+its `(`: `min (abs_diff (x, 1))` is claimed too. It returns a `SortKindSource`, shared by every
+collector the request makes (threads, collapse member folds, `head_sort`), so
+it is immutable:
+
+```cpp
+class AbsDiffSource : public luxir::SortKindSource {
+public:
+  std::unique_ptr<luxir::FieldComparator> createComparator(luxir::IndexReader& reader) const override;
+  void value(luxir::IndexReader& reader, const luxir::IndexReader::Segment& segment, int32_t doc,
+             luxir::api::Val& out, std::pmr::memory_resource& mr) const override;
+};
+
+r.sortKinds.add("abs_diff", [](luxir::SortKindContext& ctx) -> std::shared_ptr<const luxir::SortKindSource> {
+  ctx.arity(2, 2);
+  const auto& field = ctx.field(0);
+  // ... check the field type, refuse SINGLE on a multi-valued field ...
+  return std::make_shared<AbsDiffSource>(field.physicalName, ctx.integer(1), ctx.mode, ctx.descending);
+});
+```
+
+- `createComparator` makes a `FieldComparator` (`src/luxir/search/FieldComparator.h`)
+  over the reader, in the clause's direction. The collector calls
+  `setSegment`, then `copy`, `compare`, `compareBottom` and `setBottom` with
+  slots it grows through `growSlots`, and merges per-thread collectors through
+  the two-comparator `compare` and `copy`. Docs without a value rank last in
+  both directions, tied among themselves; ties fall to later clauses, then to
+  document order. `ValueSortComparator<T>` implements all of it for one
+  `int64_t` or `double` key per doc: the subclass sets up its readers in
+  `setSegment` and reads a doc's key in `read(doc, out)`, called in any doc
+  order.
+- `value` gives a doc's sort value (the key the comparator ranks by) for the
+  `_sort_` return field and collapse ranks (`_group_.rank`). Leave `out` unset
+  for a doc without one. It must agree with the comparator: the same key, and
+  no value exactly for the docs the comparator ranks as missing.
+- A plugin clause works as any other: as a primary or secondary clause, under
+  collapse, `head_sort` and diversify, and with `offset` paging. The routes
+  that read a sort column's leaf bounds and value envelope apply to column
+  clauses only; a plugin prunes through `competitiveDocs`.
+
+A comparator that knows where its competitive docs are can let the collector
+jump over the rest: it returns true from `offersCompetitiveDocs()` and answers
+`competitiveDocs(bottomSlot, from, sourceDocs, begin, end)`. When the plugin
+clause is the primary one, the heap is full and the query permits pruning, the
+collector asks it for the first run `[begin, end)` at or after `from` that may
+still enter the heap (`begin == END`: none in this segment), and advances the
+query to `begin`. Set both ends, with `from <= begin < end`; the collector
+clamps a run that starts before `from` or holds no doc, so a malformed answer
+cannot stall the query or repeat docs. The bottom comes as a slot, without its
+doc, so docs tied with it must stay in the run. `sourceDocs`
+estimates the docs the query would still produce, the work a lookup has to
+undercut. `PENDING` means not yet (no bound, or one too wide to pay off; an
+`end` past `from` names the doc to ask again at), and `UNSUPPORTED` means
+never in this segment.
+
+The example plugin registers `abs_diff(field, center)`, which sorts an INT
+field by `|x - center|` (`min()` and `max()` for a multi-valued field, which
+requires one). Ascending on the nearest value, its competitive docs lie within
+the bottom's distance of the center: it counts them from the field's points
+index (`"index": "range"`), reads them once they are under an eighth of
+`sourceDocs` and again each time the bottom distance halves, and counts the
+docs it ruled out in `example::AbsDiffStats` (`test/plugins/example/ExampleSort.h`).
+`PluginSortTest` checks it against brute force and against the value
+expression `abs(x - center)`, which sorts the same docs without pruning.
+
 ## HTTP routes
 
 `Registries::http` (`src/luxir/server/HttpRouteRegistry.h`) adds routes to the HTTP
