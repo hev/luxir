@@ -720,7 +720,10 @@ public:
       return {doc, iter.rank()};
     }
 
-    void fillSingle(std::span<uint64_t> words, int32_t min, int32_t max) {
+    // Separate functions keep each loop's per-value work inlined and its
+    // registers independent of the other loop.
+    LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
+                                   int32_t max) {
       auto [doc, rank] = firstDocRank(min);
       int64_t nvals = reader.numValues();
       while (doc < max && rank < nvals) {
@@ -762,7 +765,8 @@ public:
       }
     }
 
-    void fillMulti(std::span<uint64_t> words, int32_t min, int32_t max) {
+    LUXIR_NOINLINE void fillMulti(std::span<uint64_t> words, int32_t min,
+                                  int32_t max) {
       auto [doc, docRank] = firstDocRank(min);
       while (doc < max && docRank < reader.docsWithValue()) {
         auto [start, end] = reader.getStartEndValueRank(docRank);
