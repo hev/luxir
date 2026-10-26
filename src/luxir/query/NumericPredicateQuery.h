@@ -32,6 +32,9 @@ namespace luxir {
 class NumericPredicateQuery final : public Query {
   std::string_view field;
   PointsReader::ValueRange envelope;
+  // hi - lo, so matchesValue's range test is one subtract and one compare.
+  // An empty range (hi < lo) wraps; every scorer entry point rejects it first.
+  uint64_t envelopeWidth;
   std::span<const int64_t> exactValues;
   std::span<const PointsReader::ValueRange> exactIntervals;
   // Normally SEGMENT_STABLE; REQUEST_STABLE when a bound came from the request
@@ -78,13 +81,14 @@ public:
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi,
                         FilterKeyScope filterKeyScope = FilterKeyScope::SEGMENT_STABLE)
     : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi},
-      filterKeyScope(filterKeyScope) {}
+      envelopeWidth((uint64_t)hi - (uint64_t)lo), filterKeyScope(filterKeyScope) {}
 
   NumericPredicateQuery(std::string_view field,
                         std::span<const int64_t> exactValues,
                         std::span<const PointsReader::ValueRange> intervals)
     : Query(QueryKind::NUMERIC_PREDICATE), field(field),
       envelope{exactValues.front(), exactValues.back()},
+      envelopeWidth((uint64_t)envelope.hi - (uint64_t)envelope.lo),
       exactValues(exactValues), exactIntervals(intervals) {
     assert(exactValues.size() > 1);
     assert(!intervals.empty());
@@ -141,9 +145,12 @@ public:
   }
 
   // The range test is inlined into every per-value loop; the exact-set
-  // search stays out of line.
+  // search stays out of line. One unsigned compare: a short-circuit lower
+  // bound mispredicts on about half the values of an interior range.
   LUXIR_INLINE bool matchesValue(int64_t value) const {
-    if (exactValues.empty()) return envelope.lo <= value && value <= envelope.hi;
+    if (exactValues.empty()) {
+      return (uint64_t)value - (uint64_t)envelope.lo <= envelopeWidth;
+    }
     return matchesExact(value);
   }
 
@@ -393,8 +400,10 @@ public:
     uint16_t checkEnd = 0;
     uint16_t insideBegin = 0;
     uint16_t insideEnd = 0;
-    // Read only for CROSSES runs of residual-comparable blocks.
-    NumColumnFormat::ResidualBounds residualBounds = {};
+    // Read only for CROSSES runs of residual-comparable blocks: matching
+    // residuals are [residualLower, residualLower + residualWidth].
+    uint32_t residualLower = 0;
+    uint32_t residualWidth = 0;
 
     struct Run {
       BlockRelation relation;
@@ -567,8 +576,15 @@ public:
     if (!anyCrossing || isExactSet()) return plan;
     auto block = reader.blockInfo(blockNum);
     if (block.residualComparable()) {
-      plan.residualBounds = NumColumnFormat::residualBounds(
+      auto bounds = NumColumnFormat::residualBounds(
           block, envelope.lo, envelope.hi);
+      // No lattice point falls in the range, so nothing in the block matches.
+      if (bounds.lower > bounds.upper) {
+        assert(!anyInside);
+        return BlockPlan();
+      }
+      plan.residualLower = bounds.lower;
+      plan.residualWidth = bounds.upper - bounds.lower;
     }
     return plan;
   }
@@ -628,7 +644,7 @@ public:
                                                         residualCount);
         }
         uint32_t v = residuals[valueRank - residualStart];
-        return plan.residualBounds.lower <= v && v <= plan.residualBounds.upper;
+        return (uint32_t)(v - plan.residualLower) <= plan.residualWidth;
       }
       if (valueRank < rawStart || valueRank >= rawStart + (int64_t)rawCount) {
         rawStart = reader.decodeValueSubBlock(valueRank, raw, rawCount);
@@ -1788,7 +1804,10 @@ public:
       if (reader->numValues() == 0) return nullptr;
       int64_t colMin = reader->getMin();
       int64_t colMax = reader->getMax();
-      if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
+      if (query.getHi() < query.getLo() || colMax < query.getLo()
+          || query.getHi() < colMin) {
+        return nullptr;
+      }
       bool allMatch = query.covers(colMin, colMax);
       return targetPool.make<PredicateScorer<IntColReader::Iterator>>(
           *reader, query, allMatch, constantScore);
@@ -1800,7 +1819,8 @@ public:
       if (!segInfo) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
       if (reader->numValues() == 0) return nullptr;
-      if (reader->getMax() < query.getLo() || query.getHi() < reader->getMin()) {
+      if (query.getHi() < query.getLo() || reader->getMax() < query.getLo()
+          || query.getHi() < reader->getMin()) {
         return nullptr;
       }
       auto plans = classifyBlocks(targetPool, *reader, query);
