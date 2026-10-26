@@ -391,6 +391,35 @@ public:
     return CompetitiveDocStatus::UNSUPPORTED;
   }
 
+  // Optional seed windows for a primary comparator that knows where a
+  // segment's best keys lie but not which docs the query matches (a plugin
+  // sort kind reading a points index). Before a plain sweep of the segment
+  // the collector asks for a few doc runs [begin, end) likely to hold the
+  // best keys and runs the query over them first, so the heap fills with
+  // real matches only; then it sweeps the segment from its start, through
+  // competitiveDocs, without the docs it already collected. Seeding changes
+  // only the visit order, so any answer is sound: the collector sorts and
+  // merges the runs, clamps them to the segment and drops empty ones. A
+  // comparator that offers windows reads docs out of order (the runs, then
+  // the sweep from doc 0). `matches` is the heap's depth and `sourceDocs`
+  // estimates the docs the query produces in the segment, so about
+  // matches * maxDoc / sourceDocs docs hold the matches the heap needs.
+  // `bottomSlot` is the heap bottom when earlier segments filled it, else -1.
+  // Leave `out` empty to sweep unseeded. offersSeedWindows is asked after
+  // setSegment, so it may answer per segment. The collector seeds only a
+  // query-driven windowed sweep it can reposition: the exact-domain and
+  // column-seeded routes need a column's KeyBatch, and a pull scorer cannot
+  // rewind.
+  struct SeedRequest {
+    int64_t matches = 0;
+    int64_t sourceDocs = 0;
+    int32_t bottomSlot = -1;
+  };
+  virtual bool offersSeedWindows() const { return false; }
+  virtual void seedWindows(const SeedRequest& request, std::vector<SeedWindow>& out) {
+    unused(request, out);
+  }
+
   enum MissingValue {
     MISSING_FIRST,
     MISSING_LAST

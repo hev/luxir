@@ -1103,6 +1103,13 @@ inline int64_t nextVisitedLeaf(std::span<const uint64_t> visited,
   return std::min(leafCount, (int64_t)(w << 6) + std::countr_zero(bits));
 }
 
+// A doc run [begin, end) of one segment: a primary comparator's seed window
+// (FieldComparator::seedWindows).
+struct SeedWindow {
+  int32_t begin;
+  int32_t end;
+};
+
 // Collect match-only windows in doc order. Scores are intentionally absent
 // from this path; collectors receive the unscored sentinel literal.
 // allowPruning: when true and no domain builder is attached, a collector
@@ -1113,15 +1120,19 @@ inline int64_t nextVisitedLeaf(std::span<const uint64_t> visited,
 // uncounted. visitedBlocks (with its block geometry) marks key blocks an
 // earlier seeded pass already enumerated: the walk jumps them, and window
 // production stops before the next visited block, coalescing unvisited runs.
+// visitedRuns (sorted, disjoint) are doc runs a seed-window pass already
+// collected: the walk jumps them the same way.
 template <typename Collector>
 void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                               DocSetBuilder* builder, Collector& collector,
                               int32_t maxDoc, bool allowPruning = false,
                               std::span<const uint64_t> visitedBlocks = {},
-                              int32_t visitedBlockSize = 0) {
+                              int32_t visitedBlockSize = 0,
+                              std::span<const SeedWindow> visitedRuns = {}) {
   assert(bulk != nullptr);
   assert(visitedBlocks.empty() || visitedBlockSize > 0);
   int32_t cursor = 0;
+  size_t run = 0;
   constexpr bool hasSortRanges =
       requires { collector.nextCompetitiveRange(segnum, (int32_t)0); };
   [[maybe_unused]] bool sortPrune = false;
@@ -1155,6 +1166,16 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
       int64_t limit = ((int64_t)rangeEnd + visitedBlockSize - 1) / visitedBlockSize;
       int64_t next = nextVisitedLeaf(visitedBlocks, block + 1, limit);
       rangeEnd = (int32_t)std::min<int64_t>(rangeEnd, next * visitedBlockSize);
+    }
+    if (run < visitedRuns.size()) {
+      while (run < visitedRuns.size() && visitedRuns[run].end <= cursor) run++;
+      if (run < visitedRuns.size()) {
+        if (visitedRuns[run].begin <= cursor) {
+          cursor = visitedRuns[run].end;
+          continue;
+        }
+        rangeEnd = std::min(rangeEnd, visitedRuns[run].begin);
+      }
     }
     feedMatchWindows(segnum, bulk, filter, builder, collector, cursor,
                      rangeEnd);
@@ -2201,6 +2222,34 @@ void collectTopKMatchWindowedSeeded(
   bulk->reposition(0);
   collectTopKMatchWindowed(segnum, bulk, filter, nullptr, collector,
                            maxDoc, true, visited, plan.leafSize);
+}
+
+// Seed-window two-pass driver for a primary comparator that offers seed
+// windows (FieldComparator::seedWindows): run the query over the windows,
+// which fills the heap with real matches holding keys near the best, rebind
+// the comparators for the rewind, then reposition the same product and sweep
+// the segment from its start through the competitive ranges, jumping the
+// windows. Only the visit order changes, so the results are the unseeded
+// path's; each match is collected once, so hitCount keeps pruned-path
+// semantics. The plan must support reposition.
+template <typename Collector>
+void collectTopKMatchWindowedSeedWindows(int32_t segnum, BulkScorer* bulk,
+                                         DocSet* filter, Collector& collector,
+                                         int32_t maxDoc) {
+  assert(bulk != nullptr);
+  std::span<const SeedWindow> windows = collector.takeSeedWindows();
+  if (!windows.empty()) {
+    skipCount(SkipStats::fieldSortSeedWindowActivations);
+    for (const SeedWindow& window : windows) {
+      feedMatchWindows(segnum, bulk, filter, nullptr, collector, window.begin,
+                       window.end);
+      skipCount(SkipStats::fieldSortSeedWindows);
+    }
+    collector.rebindAfterSeeding();
+    bulk->reposition(0);
+  }
+  collectTopKMatchWindowed(segnum, bulk, filter, nullptr, collector, maxDoc,
+                           true, {}, 0, windows);
 }
 
 // Rank score windows into a top-k collector. This is intentionally only a

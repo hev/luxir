@@ -30,6 +30,13 @@ struct AbsDiffStats {
   // PENDING_AT names a doc to be asked again at.
   enum class Answer { OWN, MALFORMED, PENDING, PENDING_AT, UNSUPPORTED };
   static inline std::atomic<Answer> answer{Answer::OWN};
+  // Segments seedWindows answered with windows, and the windows it offered.
+  static inline std::atomic<int64_t> seededSegments{0};
+  static inline std::atomic<int64_t> seedWindows{0};
+  // Test-only: what seedWindows answers. NONE offers none; MALFORMED adds
+  // unsorted, overlapping, empty and out-of-range windows to its own.
+  enum class SeedAnswer { OWN, NONE, MALFORMED };
+  static inline std::atomic<SeedAnswer> seedAnswer{SeedAnswer::OWN};
 };
 
 // |x - center| of one segment's INT column: the value under SINGLE, the
@@ -79,7 +86,10 @@ public:
 // knows where its competitive docs are: within the bottom's distance of the
 // center, which the field's points index finds. It offers them through
 // competitiveDocs once they are few against the docs the query would still
-// produce, and reads them again each time the bottom distance halves.
+// produce, and reads them again each time the bottom distance halves. Before
+// the sweep it offers the docs of the points nearest the center as seed
+// windows, so the bottom is near its final distance from the first consult
+// whatever the doc order.
 class AbsDiffComparator : public luxir::ValueSortComparator<int64_t> {
   int64_t center;
   bool prunes;
@@ -122,6 +132,46 @@ public:
   }
 
   bool offersCompetitiveDocs() const override { return prunes; }
+
+  bool offersSeedWindows() const override { return points.has_value(); }
+
+  // The docs of the points index leaves holding the points nearest the
+  // center: enough points for the heap's matches at the query's density.
+  void seedWindows(const SeedRequest& request, std::vector<luxir::SeedWindow>& out) override {
+    if (!points || AbsDiffStats::seedAnswer.load() == AbsDiffStats::SeedAnswer::NONE) return;
+    int64_t count = (int64_t)points->pointCount();
+    int64_t density = std::max<int64_t>(1, request.sourceDocs);
+    int64_t want = (int64_t)std::min<__int128>(
+        count, std::max<__int128>(1, (__int128)request.matches * maxDoc / density));
+    int64_t mid = (int64_t)points->ordinalOfFirstAtLeast(center, residualScratch, rawScratch);
+    // The `want` points nearest the center lie within `want` ordinals of mid.
+    int64_t lo = std::max<int64_t>(0, mid - want);
+    int64_t hi = std::min(count, mid + want);
+    if (lo >= hi) return;
+    std::vector<int32_t> docs;
+    for (int64_t leaf = lo / points->maxPointsPerLeaf(); leaf <= (hi - 1) / points->maxPointsPerLeaf(); leaf++) {
+      for (const auto& point : points->decodeLeaf((uint32_t)leaf)) docs.push_back(point.docid);
+    }
+    std::sort(docs.begin(), docs.end());
+    docs.erase(std::unique(docs.begin(), docs.end()), docs.end());
+    size_t first = out.size();
+    for (int32_t doc : docs) {
+      if (out.size() > first && out.back().end == doc) out.back().end++;
+      else out.push_back({doc, doc + 1});
+    }
+    if (AbsDiffStats::seedAnswer.load() == AbsDiffStats::SeedAnswer::MALFORMED) {
+      std::reverse(out.begin(), out.end());
+      size_t own = out.size();
+      for (size_t i = 0; i < own; i++) out.push_back({out[i].begin - 2, out[i].end + 1});
+      out.push_back({-5, 3});
+      out.push_back({maxDoc - 2, maxDoc + 100});
+      out.push_back({std::numeric_limits<int32_t>::max() - 1, std::numeric_limits<int32_t>::max()});
+      out.push_back({7, 7});
+      out.push_back({20, 10});
+    }
+    AbsDiffStats::seededSegments++;
+    AbsDiffStats::seedWindows += (int64_t)out.size();
+  }
 
   CompetitiveDocStatus competitiveDocs(int32_t bottomSlot, int32_t from, int64_t sourceDocs,
                                        int32_t& begin, int32_t& end) override {

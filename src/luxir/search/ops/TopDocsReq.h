@@ -2214,6 +2214,15 @@ public:
                     plan.available != Query::ScorerSupplier::BulkAnswer::YES
                     || plan.supportsMatchWindows
                         != Query::ScorerSupplier::BulkAnswer::YES;
+                // A primary comparator's seed windows (a plugin sort kind's)
+                // fill the heap with real matches near the best keys before
+                // the pruned sweep, through the same repositioned product.
+                bool seedWindows = !plannedNo && maySkipNoncompetitiveDocs
+                    && builderPtr == nullptr && !disableFieldSortSeeding
+                    && fieldCollector->offersSeedWindows()
+                    && plan.supportsReposition()
+                        == Query::ScorerSupplier::BulkAnswer::YES
+                    && !plan.hasConstantCount();
                 auto* bulk = plannedNo
                     ? nullptr : supplier->buildBulk(poolGuard.pool(), plan);
                 if (plannedNo) {
@@ -2229,10 +2238,16 @@ public:
                         *fieldCollector, poolGuard.pool(), seg);
                   }
                   skipCount(SkipStats::fieldSortBulkCollections);
-                  collectTopKMatchWindowed(
-                      segnum, bulk, collectorFilter, builderPtr,
-                      *fieldCollector, seg.maxDoc(),
-                      maySkipNoncompetitiveDocs);
+                  if (seedWindows) {
+                    collectTopKMatchWindowedSeedWindows(
+                        segnum, bulk, collectorFilter, *fieldCollector,
+                        seg.maxDoc());
+                  } else {
+                    collectTopKMatchWindowed(
+                        segnum, bulk, collectorFilter, builderPtr,
+                        *fieldCollector, seg.maxDoc(),
+                        maySkipNoncompetitiveDocs);
+                  }
                   fieldCollector->recordSegmentSkipStats(segnum);
                   usedBulk = true;
                 }

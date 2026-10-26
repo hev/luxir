@@ -253,6 +253,11 @@ public:
   bool candidatesDisabled = false;
   // The primary comparator offers no competitiveDocs source in this segment.
   bool competitiveDocsUnsupported = false;
+  // The current segment, to rebind the comparators after a seed pass.
+  const IndexReader::Segment* currentSegment = nullptr;
+  // The primary comparator's seed windows for the current segment, sorted,
+  // disjoint and inside it (takeSeedWindows).
+  std::vector<SeedWindow> seedRuns;
 
   class ExpressionBindings {
   public:
@@ -350,6 +355,8 @@ public:
     segmentSourceCost = sourceCost;
     segmentWalkCard = 0;
     segmentMaxDoc = segment.maxDoc();
+    currentSegment = &segment;
+    seedRuns.clear();
     for (auto& clause : clauses) {
       clause.resetCache();
       if (clause.comparator != nullptr) {
@@ -669,6 +676,63 @@ public:
     ensureSlotCapacity((int64_t)slot + 1);
     copy(slot, other, candidate.slot, candidate.doc);
     head = SortDoc(candidate.doc, candidate.score, slot);
+  }
+
+  // Whether the primary comparator offers seed windows (seedWindows) the
+  // seed-window driver can run: a ranking heap and no EXPR clause (the
+  // caller binds value programs once per segment, and rebindAfterSeeding
+  // does not rewind them).
+  bool offersSeedWindows() const {
+    return topCount > 0 && !hasExpr && clauses[0].comparator != nullptr
+        && clauses[0].comparator->offersSeedWindows();
+  }
+
+  // The primary comparator's seed windows for the current segment, sorted,
+  // merged where they overlap or touch, clamped to the segment, without empty
+  // ones: whatever the comparator answers, each doc is in at most one window
+  // and the windows ascend, as window production needs.
+  std::span<const SeedWindow> takeSeedWindows() {
+    seedRuns.clear();
+    if (!offersSeedWindows()) return {};
+    FieldComparator::SeedRequest request;
+    request.matches = topCount;
+    request.sourceDocs = segmentSourceCost > 0
+        ? std::min<int64_t>(segmentSourceCost, segmentMaxDoc) : segmentMaxDoc;
+    request.bottomSlot = heapFull() ? pq.top().slot : -1;
+    clauses[0].comparator->seedWindows(request, seedRuns);
+    for (SeedWindow& window : seedRuns) {
+      window.begin = std::clamp(window.begin, 0, segmentMaxDoc);
+      window.end = std::clamp(window.end, 0, segmentMaxDoc);
+    }
+    std::erase_if(seedRuns, [](const SeedWindow& w) { return w.begin >= w.end; });
+    std::sort(seedRuns.begin(), seedRuns.end(),
+              [](const SeedWindow& a, const SeedWindow& b) { return a.begin < b.begin; });
+    size_t kept = 0;
+    for (const SeedWindow& window : seedRuns) {
+      if (kept > 0 && window.begin <= seedRuns[kept - 1].end) {
+        seedRuns[kept - 1].end = std::max(seedRuns[kept - 1].end, window.end);
+      } else {
+        seedRuns[kept++] = window;
+      }
+    }
+    seedRuns.resize(kept);
+    return seedRuns;
+  }
+
+  // After a seed pass, before the sweep rewinds to the segment start: the
+  // later clauses' comparators may read through forward-only cursors, so
+  // they are bound to the segment again (slot values survive) and given the
+  // bottom. The primary comparator offered the windows and reads in any
+  // order; collapse identity reads reset on a backward read themselves.
+  void rebindAfterSeeding() {
+    assert(currentSegment != nullptr);
+    for (size_t i = 1; i < clauses.size(); i++) {
+      clauses[i].resetCache();
+      if (clauses[i].comparator != nullptr) {
+        clauses[i].comparator->setSegment(*currentSegment);
+      }
+    }
+    if (heapFull()) setBottom();
   }
 
   struct CompetitiveRange {

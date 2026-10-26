@@ -261,6 +261,45 @@ undercut. `PENDING` means not yet (no bound, or one too wide to pay off; an
 `end` past `from` names the doc to ask again at), and `UNSUPPORTED` means
 never in this segment.
 
+`competitiveDocs` is consulted only once the heap is full, and the bottom is
+only as good as the docs the scan has met. When doc order is unrelated to the
+key (or opposed to it, as in a spatially sorted segment whose nearest docs come
+last), the bottom matures late and the prune fires late. The comparator cannot
+seed a bound itself: it does not see the query, and the k-th best key over all
+docs is no bound over the matches. Instead it can offer seed windows: it
+returns true from `offersSeedWindows()` (asked after `setSegment`, so per
+segment) and answers `seedWindows(request, out)` with a few doc runs
+`[begin, end)` likely to hold the segment's best keys (a geo distance sort: the
+docs of the BKD leaves nearest the origin). Before a plain sweep of the segment
+the collector runs the query over those runs, so the heap fills with real
+matches only, then rewinds the same query to the segment start and sweeps it
+through `competitiveDocs`, jumping the runs it already collected. Only the visit
+order changes, so the results are the unseeded ones for any query, ties and
+document order included.
+
+- `request.matches` is the heap's depth and `request.sourceDocs` estimates the
+  docs the query produces in the segment: about
+  `matches * maxDoc / sourceDocs` docs hold the matches the heap needs.
+  `request.bottomSlot` is the heap bottom when earlier segments filled it,
+  else -1. Leave `out` empty to sweep unseeded.
+- Any answer is safe: the collector clamps the runs to the segment, drops
+  empty ones, and sorts and merges overlapping ones, so a doc is collected
+  once.
+- The comparator reads docs out of order (the runs, then the sweep from doc 0);
+  `ValueSortComparator::read` must already allow that. The collector binds the
+  later clauses' comparators to the segment again before the sweep, and
+  collapse and diversify identities reset on a backward read, so a seeded
+  primary clause works under both.
+- The collector seeds only a query-driven windowed sweep it can reposition
+  (match-all, terms, Booleans, ranges, filters; no score or value-expression
+  clause, no exact count or domain to produce). The column routes that seed
+  from a column's leaf bounds, and the pull-scorer path, which cannot rewind,
+  stay unseeded. There is no separate hook for a known exact domain (match-all,
+  filter-only): running the windows through the query already holds the heap
+  to real matches, and `sourceDocs` sizes the runs for the domain's density.
+- `LUXIR_DISABLE_FIELD_SORT_SEEDING` (`disableFieldSortSeeding`) turns it off
+  along with the column seeding, for A/B runs.
+
 The example plugin registers `abs_diff(field, center)`, which sorts an INT
 field by `|x - center|` (`min()` and `max()` for a multi-valued field, which
 requires one). Ascending on the nearest value, its competitive docs lie within
@@ -268,8 +307,12 @@ the bottom's distance of the center: it counts them from the field's points
 index (`"index": "range"`), reads them once they are under an eighth of
 `sourceDocs` and again each time the bottom distance halves, and counts the
 docs it ruled out in `example::AbsDiffStats` (`test/plugins/example/ExampleSort.h`).
-`PluginSortTest` checks it against brute force and against the value
-expression `abs(x - center)`, which sorts the same docs without pruning.
+It seeds from the points index leaves holding the points nearest the center,
+enough for the heap at the query's density, and counts the seeded segments and
+windows there too.
+`PluginSortTest` checks it against brute force, against the value
+expression `abs(x - center)`, which sorts the same docs without pruning, and
+seeded against unseeded, including a corpus whose nearest docs come last.
 
 ## HTTP routes
 

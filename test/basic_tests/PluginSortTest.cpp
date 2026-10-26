@@ -14,6 +14,7 @@
 
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/plugin/Registries.h"
+#include "luxir/search/SearchOverrides.h"
 #include "luxir/server/Collection.h"
 #include "luxir/server/HttpServer.h"
 #include "plugins/example/ExampleSort.h"
@@ -90,33 +91,41 @@ protected:
     if (rows.empty()) {
       for (int i = 0; i < SEGMENTS * PER_SEGMENT; i++) rows.push_back(row(i));
     }
-    // Main is reset before every test. The numeric templates build no points
-    // index, which the abs_diff prune reads.
+    reindex(rows, PER_SEGMENT);
+    server = std::make_unique<HttpServer>(*LuxirTest::luxirNode, 1, 0);
+    server->start();
+  }
+  void TearDown() override {
+    example::AbsDiffStats::answer = example::AbsDiffStats::Answer::OWN;
+    example::AbsDiffStats::seedAnswer = example::AbsDiffStats::SeedAnswer::OWN;
+    disableFieldSortSeeding = savedDisableSeeding;
+    server->shutdown();
+  }
+
+  bool savedDisableSeeding = disableFieldSortSeeding;
+
+  // Main holds `corpus`, `perSegment` docs to a segment. The numeric
+  // templates build no points index, which the abs_diff prune reads.
+  void reindex(const std::vector<Row>& corpus, int perSegment) {
     helper.clear();
     std::pmr::monotonic_buffer_resource arena;
     api::SchemaDef def;
     std::string error;
     ASSERT_TRUE(api::read_json(def, R"j({"fields":{"x_i":{"type":"int","index":"range"},)j"
-        R"j("n_is":{"type":"int","index":"range","multi":true},"small_i":{"type":"int"},"g_s":{"type":"string"}}})j",
-        arena, &error)) << error;
+        R"j("n_is":{"type":"int","index":"range","multi":true},"small_i":{"type":"int","index":"range"},)j"
+        R"j("g_s":{"type":"string"}}})j", arena, &error)) << error;
     helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
-    for (int segment = 0; segment < SEGMENTS; segment++) {
+    for (size_t start = 0; start < corpus.size(); start += (size_t)perSegment) {
       std::vector<Doc> docs;
-      for (int i = segment * PER_SEGMENT; i < (segment + 1) * PER_SEGMENT; i++) {
-        const Row& r = rows[(size_t)i];
-        Doc doc = flatdoc("id", docId(i), "small_i", r.small, "g_s", r.group);
+      for (size_t i = start; i < std::min(corpus.size(), start + (size_t)perSegment); i++) {
+        const Row& r = corpus[i];
+        Doc doc = flatdoc("id", docId(r.i), "small_i", r.small, "g_s", r.group);
         if (r.x) doc.push_back({"x_i", *r.x});
         if (!r.n.empty()) doc.push_back({"n_is", r.n});
         docs.push_back(std::move(doc));
       }
       ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     }
-    server = std::make_unique<HttpServer>(*LuxirTest::luxirNode, 1, 0);
-    server->start();
-  }
-  void TearDown() override {
-    example::AbsDiffStats::answer = example::AbsDiffStats::Answer::OWN;
-    server->shutdown();
   }
 
   using Json = glz::generic_i64;
@@ -378,4 +387,119 @@ TEST_F(PluginSortTest, badArgumentsAreRequestErrors) {
   EXPECT_NE(std::string::npos, error(R"j("abs_diff(17, x_i)")j").find("argument 1 must be a field name"));
   EXPECT_NE(std::string::npos, error(R"j({"expr":"abs_diff(x_i, $c)","vars":{"c":"far"}})j").find("must be an integer"));
   EXPECT_NE(std::string::npos, error(R"j("abs_diff(nope_xyz, 17)")j").find("nope_xyz"));
+}
+
+// Seed windows change only the visit order: every form of query sorts as
+// brute force and as the unseeded path, the windows were run, and no doc is
+// collected twice (a limit holding every doc returns each once).
+TEST_F(PluginSortTest, seedWindowsKeepTheResults) {
+  auto key = [](const Row& r) { return absDiff(r.x); };
+  std::string filter = R"j(,"filter":[{"range":{"field":"small_i","gte":0}}])j";
+  struct Case {
+    std::string sort;
+    int64_t limit;
+    int64_t offset = 0;
+    std::string extra = "";
+    bool seeds = true;  // seeding is for the ascending prune
+  };
+  std::vector<Case> cases = {
+      {R"j("abs_diff(x_i, 17)")j", 10},
+      {R"j("abs_diff(x_i, 17)")j", 25, 300},
+      {R"j("abs_diff(x_i, 17) desc")j", 20, 0, "", false},
+      {R"j("abs_diff(x_i, 17)")j", 15, 0, filter},
+      {R"j("min(abs_diff(n_is, 17))")j", 30},
+      {R"j(["abs_diff(x_i, 17)", "g_s desc"])j", 40},
+      // small_i has 11 values: ties fall to the later clause, or doc order.
+      {R"j(["abs_diff(small_i, 2)", "x_i desc"])j", 50},
+      {R"j("abs_diff(small_i, 2)")j", 700, 100},
+      {R"j("abs_diff(x_i, 17)")j", (int64_t)rows.size()},
+  };
+  for (const auto& c : cases) {
+    disableFieldSortSeeding = true;
+    auto unseeded = sorted(c.sort, c.limit, c.offset, c.extra);
+    disableFieldSortSeeding = false;
+    example::AbsDiffStats::seededSegments = 0;
+    auto seeded = sorted(c.sort, c.limit, c.offset, c.extra);
+    EXPECT_EQ(unseeded, seeded) << c.sort << c.extra;
+    EXPECT_EQ(c.seeds ? SEGMENTS : 0, example::AbsDiffStats::seededSegments.load()) << c.sort;
+    auto unique = seeded;
+    std::ranges::sort(unique);
+    EXPECT_EQ(unique.end(), std::ranges::adjacent_find(unique)) << c.sort;
+  }
+  EXPECT_EQ(bruteForce(rows, key, false, 300, 25), sorted(R"j("abs_diff(x_i, 17)")j", 25, 300));
+  EXPECT_EQ(bruteForce(rows, key, false, 0, rows.size()), sorted(R"j("abs_diff(x_i, 17)")j", (int64_t)rows.size()));
+  EXPECT_EQ(sorted(R"j(["abs(x_i - 17)", "g_s desc"])j", 40), sorted(R"j(["abs_diff(x_i, 17)", "g_s desc"])j", 40));
+  auto small = [](const Row& r) -> std::optional<int64_t> { return std::abs(r.small - 2); };
+  EXPECT_EQ(bruteForce(rows, small, false, 100, 700), sorted(R"j("abs_diff(small_i, 2)")j", 700, 100));
+}
+
+// The best keys at the end of the segment: unseeded, the bottom only tightens
+// as the scan reaches them, so the prune never pays off; seeded, the heap
+// holds them before the sweep and the first consult skips nearly everything.
+TEST_F(PluginSortTest, seedWindowsPruneFromTheFirstConsult) {
+  constexpr int N = 8000;
+  std::vector<Row> corpus;
+  for (int i = 0; i < N; i++) {
+    // Three docs share each distance, nearest last.
+    corpus.push_back(Row{i, CENTER + (N - 1 - i) / 3, i % 7, {}, "g" + std::to_string(i % 5)});
+  }
+  reindex(corpus, N);
+  auto key = [](const Row& r) { return absDiff(r.x); };
+  std::string filter = R"j(,"filter":[{"range":{"field":"small_i","gte":2}}])j";
+  for (const std::string& extra : {std::string(), filter}) {
+    std::vector<Row> domain;
+    for (const auto& r : corpus) if (extra.empty() || r.small >= 2) domain.push_back(r);
+    disableFieldSortSeeding = true;
+    example::AbsDiffStats::skippedDocs = 0;
+    auto unseeded = sorted(R"j("abs_diff(x_i, 17)")j", 10, 0, extra);
+    int64_t unseededSkips = example::AbsDiffStats::skippedDocs.load();
+    disableFieldSortSeeding = false;
+    example::AbsDiffStats::skippedDocs = 0;
+    example::AbsDiffStats::seedWindows = 0;
+    auto seeded = sorted(R"j("abs_diff(x_i, 17)")j", 10, 0, extra);
+    int64_t seededSkips = example::AbsDiffStats::skippedDocs.load();
+    EXPECT_EQ(bruteForce(domain, key, false, 0, 10), seeded) << extra;
+    EXPECT_EQ(unseeded, seeded) << extra;
+    EXPECT_GT(example::AbsDiffStats::seedWindows.load(), 0) << extra;
+    EXPECT_GT(seededSkips, N * 9 / 10) << extra;
+    EXPECT_LT(unseededSkips, N / 10) << extra;
+    // A page further down, still under the prune.
+    EXPECT_EQ(bruteForce(domain, key, false, 40, 20), sorted(R"j("abs_diff(x_i, 17)")j", 20, 40, extra)) << extra;
+  }
+}
+
+// Whatever seedWindows answers - none, or windows unsorted, overlapping,
+// empty, reversed and past the segment - each doc is collected once.
+TEST_F(PluginSortTest, malformedSeedWindowsAreClampedSafely) {
+  using SeedAnswer = example::AbsDiffStats::SeedAnswer;
+  auto all = (int64_t)rows.size();
+  auto expectedTop = sorted(R"j("abs(x_i - 17)")j", 30);
+  auto expectedAll = sorted(R"j("abs(x_i - 17)")j", all);
+  std::string filter = R"j(,"filter":[{"range":{"field":"small_i","gte":0}}])j";
+  auto expectedFiltered = sorted(R"j("abs(x_i - 17)")j", 30, 0, filter);
+  for (auto answer : {SeedAnswer::NONE, SeedAnswer::MALFORMED}) {
+    example::AbsDiffStats::seedAnswer = answer;
+    example::AbsDiffStats::seedWindows = 0;
+    EXPECT_EQ(expectedTop, sorted(R"j("abs_diff(x_i, 17)")j", 30)) << (int)answer;
+    EXPECT_EQ(expectedAll, sorted(R"j("abs_diff(x_i, 17)")j", all)) << (int)answer;
+    EXPECT_EQ(expectedFiltered, sorted(R"j("abs_diff(x_i, 17)")j", 30, 0, filter)) << (int)answer;
+    EXPECT_EQ(answer == SeedAnswer::MALFORMED, example::AbsDiffStats::seedWindows.load() > 0);
+  }
+}
+
+// Under collapse and diversify the windows fill the groups with real
+// matches; the groups are the unseeded and the value expression's.
+TEST_F(PluginSortTest, seedWindowsUnderCollapseAndDiversify) {
+  for (const std::string& extra : {std::string(R"j(,"collapse":{"field":"g_s"})j"),
+                                   std::string(R"j(,"diversify":{"field":"g_s","max_per_key":2})j")}) {
+    auto expected = sorted(R"j("abs(x_i - 17)")j", 12, 0, extra);
+    disableFieldSortSeeding = true;
+    EXPECT_EQ(expected, sorted(R"j("abs_diff(x_i, 17)")j", 12, 0, extra)) << extra;
+    disableFieldSortSeeding = false;
+    example::AbsDiffStats::seededSegments = 0;
+    EXPECT_EQ(expected, sorted(R"j("abs_diff(x_i, 17)")j", 12, 0, extra)) << extra;
+    EXPECT_EQ(SEGMENTS, example::AbsDiffStats::seededSegments.load()) << extra;
+    EXPECT_EQ(sorted(R"j(["abs(x_i - 17)", "g_s"])j", 12, 4, extra),
+              sorted(R"j(["abs_diff(x_i, 17)", "g_s"])j", 12, 4, extra)) << extra;
+  }
 }
