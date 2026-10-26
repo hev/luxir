@@ -14,6 +14,7 @@
 
 #include <boost/sort/spreadsort/integer_sort.hpp>
 
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PointsMaterialize.h"
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
@@ -143,6 +144,7 @@ public:
     Relation relation;
     int64_t estimatedCost;
     uint64_t materializeUpperBound;
+    bool runEncodedLeaves;  // most of the estimate is in CONTIG/BITSET leaves
 
     BKDReader::Scratch scratch(MemPool& pool) const {
       size_t size = bkd->maxPointsPerLeaf();
@@ -196,11 +198,21 @@ public:
       return {docs.first(size), nullptr};
     }
 
+    // Against the BKD arm, one candidate verification (a random column
+    // decode plus the relation test) costs about one emitted point where
+    // leaves list doc ids one by one. Where most of the estimate sits in
+    // CONTIG or BITSET leaves (an index-sorted segment), materialization
+    // emits runs and words instead, and verification is priced like the 1-D
+    // points arm's (NumericPredicateQuery::kPointsVerifyWeight): equal
+    // pricing picked verification for nearly as many candidates as matches,
+    // which the Hilbert index-sort benchmark measured up to 2x slower than
+    // the BKD arm.
     ScorerArm selectScorerArm(int64_t candidateCost) const {
-      if (candidateCost < estimatedCost) {
-        return ScorerArm::SPARSE_VERIFY;
+      if (bkd == nullptr) {
+        return candidateCost < estimatedCost ? ScorerArm::SPARSE_VERIFY : ScorerArm::SCAN;
       }
-      return bkd != nullptr ? ScorerArm::BKD : ScorerArm::SCAN;
+      int64_t limit = runEncodedLeaves ? NumericPredicateQuery::pointsVerifyLimit(estimatedCost) : estimatedCost;
+      return candidateCost < limit ? ScorerArm::SPARSE_VERIFY : ScorerArm::BKD;
     }
 
     static Query::ScorerShape shapeFor(ScorerArm arm) {
@@ -272,7 +284,8 @@ public:
           relation(weight.query.makeRelation()),
           estimatedCost((int64_t)std::min<uint64_t>(
               estimate.estimatedCount, (uint64_t)reader.docsWithValue())),
-          materializeUpperBound(estimate.upperBound) {}
+          materializeUpperBound(estimate.upperBound),
+          runEncodedLeaves(2 * estimate.runEncoded > estimate.estimatedCount) {}
 
     int64_t cost() override { return estimatedCost; }
 

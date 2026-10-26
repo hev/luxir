@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory_resource>
+#include <random>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -510,6 +511,49 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
 
   QueryState multiState(pool, *reader, "geo_multi", boxes[2]);
   EXPECT_EQ(-1, countForTests(multiState.weight, segment));
+}
+
+// Sparse verification against the BKD arm: where a query's leaves list doc
+// ids one by one, a verification costs about one emitted point; where most of
+// them are CONTIG or BITSET runs (spatially ordered doc ids, as an index sort
+// writes them), verification needs fewer than 1/8 of the estimate.
+TEST_F(GeoBoxQueryTest, verifyArmWeightFollowsLeafDocEncoding) {
+  // Sparse enough that a shuffled leaf's doc ids encode as FOR, not BITSET.
+  constexpr int32_t N = 16384;
+  for (bool ordered : {true, false}) {
+    SCOPED_TRACE(ordered ? "spatially ordered doc ids" : "shuffled doc ids");
+    CollectionHelper helper;
+    helper.clear();
+    setGeoSchema(helper);
+    std::vector<int32_t> slots(N);
+    for (int32_t i = 0; i < N; i++) slots[(size_t)i] = i;
+    if (!ordered) std::shuffle(slots.begin(), slots.end(), std::mt19937(7));
+    std::vector<Doc> docs;
+    for (int32_t doc = 0; doc < N; doc++) {
+      // Points on a diagonal: doc order is spatial order when ordered.
+      double t = (double)slots[(size_t)doc] / N;
+      docs.push_back(flatdoc("id", "g" + std::to_string(doc), "geo_single",
+                             std::vector<double>{-60 + 120 * t, -120 + 240 * t}));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT, true).success);
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+
+    MemPool pool;
+    QueryState state(pool, *reader, "geo_single", {-50, 50, -100, 100});
+    auto* supplier = state.weight->scorerSupplier(pool, reader->segments()[0]);
+    ASSERT_NE(nullptr, supplier);
+    int64_t cost = supplier->cost();
+    ASSERT_GT(cost, N / 4);
+    auto arm = [&](int64_t candidates) {
+      return resolveScorerPlanForTests(pool, *supplier, candidates)->shape().reportedTwoPhase;
+    };
+    // NO is the BKD arm, YES sparse verification.
+    EXPECT_EQ(Query::ReportedTwoPhase::NO, arm(cost));
+    EXPECT_EQ(ordered ? Query::ReportedTwoPhase::NO : Query::ReportedTwoPhase::YES, arm(cost - 1));
+    EXPECT_EQ(ordered ? Query::ReportedTwoPhase::NO : Query::ReportedTwoPhase::YES, arm(cost / 4));
+    EXPECT_EQ(Query::ReportedTwoPhase::YES, arm(cost / 8 - 1));
+  }
 }
 
 TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty) {
