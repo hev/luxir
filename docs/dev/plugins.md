@@ -290,13 +290,20 @@ document order included.
   later clauses' comparators to the segment again before the sweep, and
   collapse and diversify identities reset on a backward read, so a seeded
   primary clause works under both.
-- The collector seeds only a query-driven windowed sweep it can reposition
-  (match-all, terms, Booleans, ranges, filters; no score or value-expression
-  clause, no exact count or domain to produce). The column routes that seed
-  from a column's leaf bounds, and the pull-scorer path, which cannot rewind,
-  stay unseeded. There is no separate hook for a known exact domain (match-all,
-  filter-only): running the windows through the query already holds the heap
-  to real matches, and `sourceDocs` sizes the runs for the domain's density.
+- The collector seeds a query-driven sweep it can rewind, with no score or
+  value-expression clause and no exact count or domain to produce. That is
+  the windowed sweep whose product can reposition (match-all, terms, Booleans,
+  ranges, cached filters), and the pull-scorer sweep a segment takes when the
+  query has no match-window product, such as an uncached filter over a
+  column-only field: the scorer advances through the runs, is reset to the
+  segment start (its plan must support reset) and sweeps through
+  `competitiveDocs`, jumping the runs. The column routes that seed from a column's
+  leaf bounds, and plans that cannot reposition or reset, stay unseeded. There
+  is no separate hook for a known exact domain (match-all, filter-only):
+  running the windows through the query already holds the heap to real
+  matches, and `sourceDocs` sizes the runs for the domain's density.
+  `SkipStats::fieldSortSeedWindowActivations` counts seeded segments and
+  `fieldSortSeedWindowPullActivations` those seeded on the pull path.
 - `LUXIR_DISABLE_FIELD_SORT_SEEDING` (`disableFieldSortSeeding`) turns it off
   along with the column seeding, for A/B runs.
 
@@ -312,7 +319,8 @@ enough for the heap at the query's density, and counts the seeded segments and
 windows there too.
 `PluginSortTest` checks it against brute force, against the value
 expression `abs(x - center)`, which sorts the same docs without pruning, and
-seeded against unseeded, including a corpus whose nearest docs come last.
+seeded against unseeded, including a corpus whose nearest docs come last,
+on both the windowed and the pull-scorer path.
 
 ## HTTP routes
 

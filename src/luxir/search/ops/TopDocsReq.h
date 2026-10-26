@@ -2257,6 +2257,16 @@ public:
                     poolGuard.pool(), *supplier);
                 Query::ReportedTwoPhase reportedTwoPhase =
                     pullPlan->shape().reportedTwoPhase;
+                // The seed windows on the pull path (no match-window product,
+                // or bulk declined): the same scorer runs the windows, resets
+                // to the segment start and sweeps. Unscored only: reset is an
+                // unscored-use capability, and scored sorts stay unseeded.
+                bool seedWindows = maySkipNoncompetitiveDocs
+                    && builderPtr == nullptr && !captureSharedRaw
+                    && !disableFieldSortSeeding
+                    && !fieldCollector->needsScores
+                    && fieldCollector->offersSeedWindows()
+                    && pullPlan->supportsReset();
                 auto* scorer = pullPlan->build(poolGuard.pool());
                 if (scorer != nullptr) {
                   std::optional<typename ActiveFieldCollector::ExpressionBindings> expressionBindings;
@@ -2264,13 +2274,19 @@ public:
                     expressionBindings.emplace(
                         *fieldCollector, poolGuard.pool(), seg);
                   }
-                  collectTopK(segnum, scorer, collectorFilter, builderPtr,
-                              *fieldCollector,
-                              maySkipNoncompetitiveDocs, nullptr,
-                              captureSharedRaw
-                                  ? DomainBuildMode::RAW_QUERY_MATCHES
-                                  : DomainBuildMode::FILTERED_MATCHES,
-                              routedBaseDomain, reportedTwoPhase);
+                  if (seedWindows) {
+                    collectTopKSeedWindows(segnum, scorer, collectorFilter,
+                                           *fieldCollector, seg.maxDoc(),
+                                           reportedTwoPhase);
+                  } else {
+                    collectTopK(segnum, scorer, collectorFilter, builderPtr,
+                                *fieldCollector,
+                                maySkipNoncompetitiveDocs, nullptr,
+                                captureSharedRaw
+                                    ? DomainBuildMode::RAW_QUERY_MATCHES
+                                    : DomainBuildMode::FILTERED_MATCHES,
+                                routedBaseDomain, reportedTwoPhase);
+                  }
                   fieldCollector->recordSegmentSkipStats(segnum);
                 }
               }

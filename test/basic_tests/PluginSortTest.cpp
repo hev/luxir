@@ -14,6 +14,8 @@
 
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/plugin/Registries.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/FilterCache.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/server/Collection.h"
 #include "luxir/server/HttpServer.h"
@@ -105,7 +107,9 @@ protected:
   bool savedDisableSeeding = disableFieldSortSeeding;
 
   // Main holds `corpus`, `perSegment` docs to a segment. The numeric
-  // templates build no points index, which the abs_diff prune reads.
+  // templates build no points index, which the abs_diff prune reads. c_i
+  // copies small_i into a column only: a range on it has no match-window
+  // product, so a query over it runs through a pull scorer.
   void reindex(const std::vector<Row>& corpus, int perSegment) {
     helper.clear();
     std::pmr::monotonic_buffer_resource arena;
@@ -113,13 +117,13 @@ protected:
     std::string error;
     ASSERT_TRUE(api::read_json(def, R"j({"fields":{"x_i":{"type":"int","index":"range"},)j"
         R"j("n_is":{"type":"int","index":"range","multi":true},"small_i":{"type":"int","index":"range"},)j"
-        R"j("g_s":{"type":"string"}}})j", arena, &error)) << error;
+        R"j("c_i":{"type":"int"},"g_s":{"type":"string"}}})j", arena, &error)) << error;
     helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
     for (size_t start = 0; start < corpus.size(); start += (size_t)perSegment) {
       std::vector<Doc> docs;
       for (size_t i = start; i < std::min(corpus.size(), start + (size_t)perSegment); i++) {
         const Row& r = corpus[i];
-        Doc doc = flatdoc("id", docId(r.i), "small_i", r.small, "g_s", r.group);
+        Doc doc = flatdoc("id", docId(r.i), "small_i", r.small, "c_i", r.small, "g_s", r.group);
         if (r.x) doc.push_back({"x_i", *r.x});
         if (!r.n.empty()) doc.push_back({"n_is", r.n});
         docs.push_back(std::move(doc));
@@ -171,6 +175,16 @@ protected:
     EXPECT_EQ(200, result.status) << sort << "\n" << result.body.substr(0, 500);
     return result.ids;
   }
+
+  // The filter cache off, so a filter is never a cached set the match-window
+  // product can lead with.
+  struct UncachedFilters {
+    FilterCache& cache;
+    size_t savedBytes = cache.configuration().maxBytes;
+    explicit UncachedFilters(CollectionHelper& helper)
+        : cache(*helper.collection().getShard()->getReaderManager().filterCache) { cache.resize(0); }
+    ~UncachedFilters() { cache.resize(savedBytes); }
+  };
 
   std::string error(const std::string& sort) {
     auto result = search(R"j({"query":{"all":true},"sort":)j" + sort + R"j(,"limit":5})j");
@@ -502,4 +516,105 @@ TEST_F(PluginSortTest, seedWindowsUnderCollapseAndDiversify) {
     EXPECT_EQ(sorted(R"j(["abs(x_i - 17)", "g_s"])j", 12, 4, extra),
               sorted(R"j(["abs_diff(x_i, 17)", "g_s"])j", 12, 4, extra)) << extra;
   }
+}
+
+// An uncached filter with no match-window product (a column-only range)
+// sends the segment down the pull-scorer path, which seeds the same way: the
+// scorer runs the windows, resets and sweeps, jumping them. The best keys at
+// the end of the segment, so unseeded the prune never pays off.
+TEST_F(PluginSortTest, seedWindowsOnThePullPath) {
+  constexpr int N = 8000;
+  std::vector<Row> corpus;
+  for (int i = 0; i < N; i++) {
+    corpus.push_back(Row{i, CENTER + (N - 1 - i) / 3, i % 7, {}, "g" + std::to_string(i % 5)});
+  }
+  reindex(corpus, N);
+  UncachedFilters uncached(helper);
+  SkipStatsScope stats;
+  auto key = [](const Row& r) { return absDiff(r.x); };
+  std::string column = R"j({"range":{"field":"c_i","gte":2}})j";
+  std::string points = R"j({"range":{"field":"small_i","lte":5}})j";
+  struct Case {
+    std::string query;
+    std::string filters;
+    bool (*keep)(const Row&);
+  };
+  std::vector<Case> cases = {
+      {R"j({"all":true})j", column, [](const Row& r) { return r.small >= 2; }},
+      {R"j({"all":true})j", column + "," + points, [](const Row& r) { return r.small >= 2 && r.small <= 5; }},
+      {R"j({"range":{"field":"c_i","gte":2}})j", "", [](const Row& r) { return r.small >= 2; }},
+  };
+  for (const auto& c : cases) {
+    std::string extra = R"j(,"query":)j" + c.query
+        + (c.filters.empty() ? "" : R"j(,"filter":[)j" + c.filters + "]");
+    auto run = [&](int64_t limit, int64_t offset) {
+      auto result = search(R"j({"sort":"abs_diff(x_i, 17)","limit":)j" + std::to_string(limit) + R"j(,"offset":)j"
+                           + std::to_string(offset) + R"j(,"fields":["id"])j" + extra + "}");
+      EXPECT_EQ(200, result.status) << result.body.substr(0, 500);
+      return result.ids;
+    };
+    std::vector<Row> domain;
+    for (const auto& r : corpus) if (c.keep(r)) domain.push_back(r);
+    disableFieldSortSeeding = true;
+    example::AbsDiffStats::skippedDocs = 0;
+    auto unseeded = run(10, 0);
+    int64_t unseededSkips = example::AbsDiffStats::skippedDocs.load();
+    disableFieldSortSeeding = false;
+    SkipStats::reset();
+    example::AbsDiffStats::skippedDocs = 0;
+    auto seeded = run(10, 0);
+    int64_t seededSkips = example::AbsDiffStats::skippedDocs.load();
+    EXPECT_EQ(bruteForce(domain, key, false, 0, 10), seeded) << extra;
+    EXPECT_EQ(unseeded, seeded) << extra;
+    EXPECT_EQ(1, SkipStats::fieldSortSeedWindowPullActivations) << extra;
+    EXPECT_EQ(0, SkipStats::fieldSortBulkCollections) << extra;
+    EXPECT_GT(seededSkips, N * 9 / 10) << extra;
+    EXPECT_LT(unseededSkips, N / 10) << extra;
+    EXPECT_EQ(bruteForce(domain, key, false, 40, 20), run(20, 40)) << extra;
+    EXPECT_EQ(bruteForce(domain, key, false, 0, domain.size()), run((int64_t)domain.size(), 0)) << extra;
+  }
+}
+
+// Across segments, with ties falling to a later clause or doc order, under
+// collapse, and with malformed windows, the pull path seeds and sorts as the
+// unseeded path; a scored request stays unseeded.
+TEST_F(PluginSortTest, pullPathSeedingKeepsTheResults) {
+  UncachedFilters uncached(helper);
+  SkipStatsScope stats;
+  std::string filter = R"j(,"filter":[{"range":{"field":"c_i","gte":-3}}])j";
+  struct Case {
+    std::string sort;
+    int64_t limit;
+    std::string extra = "";
+    int64_t seeds = SEGMENTS;
+  };
+  std::vector<Case> cases = {
+      {R"j("abs_diff(x_i, 17)")j", 25},
+      {R"j(["abs_diff(small_i, 2)", "x_i desc"])j", 50},
+      {R"j("abs_diff(small_i, 2)")j", 700},
+      {R"j(["abs_diff(x_i, 17)", "g_s desc"])j", 40},
+      {R"j("abs_diff(x_i, 17)")j", (int64_t)rows.size()},
+      {R"j("abs_diff(x_i, 17)")j", 12, R"j(,"collapse":{"field":"g_s"})j"},
+      {R"j("abs_diff(x_i, 17)")j", 20, R"j(,"get_scores":true)j", 0},
+  };
+  for (const auto& c : cases) {
+    auto expected = sorted(c.sort, c.limit, 0, filter + c.extra);
+    disableFieldSortSeeding = true;
+    EXPECT_EQ(expected, sorted(c.sort, c.limit, 0, filter + c.extra)) << c.sort << c.extra;
+    disableFieldSortSeeding = false;
+    for (auto answer : {example::AbsDiffStats::SeedAnswer::OWN, example::AbsDiffStats::SeedAnswer::MALFORMED}) {
+      example::AbsDiffStats::seedAnswer = answer;
+      SkipStats::reset();
+      auto seeded = sorted(c.sort, c.limit, 0, filter + c.extra);
+      EXPECT_EQ(expected, seeded) << c.sort << c.extra << (int)answer;
+      EXPECT_EQ(c.seeds, SkipStats::fieldSortSeedWindowPullActivations) << c.sort << c.extra << (int)answer;
+      auto unique = seeded;
+      std::ranges::sort(unique);
+      EXPECT_EQ(unique.end(), std::ranges::adjacent_find(unique)) << c.sort;
+    }
+  }
+  auto key = [](const Row& r) { return r.small >= -3 ? absDiff(r.x) : std::nullopt; };
+  std::vector<Row> domain;
+  for (const auto& r : rows) if (r.small >= -3) domain.push_back(r);
+  EXPECT_EQ(bruteForce(domain, key, false, 0, 25), sorted(R"j("abs_diff(x_i, 17)")j", 25, 0, filter));
 }

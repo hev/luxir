@@ -480,6 +480,13 @@ public:
   }
 };
 
+// A doc run [begin, end) of one segment: a primary comparator's seed window
+// (FieldComparator::seedWindows).
+struct SeedWindow {
+  int32_t begin;
+  int32_t end;
+};
+
 enum class DomainBuildMode : uint8_t {
   FILTERED_MATCHES,
   RAW_QUERY_MATCHES,
@@ -497,6 +504,9 @@ enum class DomainBuildMode : uint8_t {
 // allowPruning=false keeps the competitive threshold at lowest. Exact totals
 // may instead come from a separate count or known membership. A bounded count
 // holds the threshold until enough hits have been counted, then permits pruning.
+// visitedRuns (sorted, disjoint, within [0, maxDoc)) are doc runs a seed-window
+// pass already collected: the field-sort prune jumps them like noncompetitive
+// blocks, so it needs sort pruning (allowPruning, no builder).
 template <typename Collector>
 void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
                  DocSetBuilder* builder, Collector& collector, bool allowPruning = true,
@@ -504,7 +514,9 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
                  DomainBuildMode buildMode = DomainBuildMode::FILTERED_MATCHES,
                  DocSet* rawDomain = nullptr,
                  Query::ReportedTwoPhase reportedTwoPhase =
-                     Query::ReportedTwoPhase::UNKNOWN) {
+                     Query::ReportedTwoPhase::UNKNOWN,
+                 std::span<const SeedWindow> visitedRuns = {},
+                 int32_t maxDoc = PostingsReader::END) {
   constexpr int32_t kAccumulatorPollPeriod = 1024;
   float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
   int32_t accumulatorPollCount = 0;
@@ -617,6 +629,25 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   if constexpr (hasSortRanges) {
     sortPrune = allowPruning && builder == nullptr;
   }
+  assert(visitedRuns.empty() || sortPrune);
+  // The collector's next competitive range from `from`, less the visited
+  // runs. Consults ascend, so the run cursor only moves forward. Generic in
+  // the collector, so collectors without ranges never instantiate it.
+  [[maybe_unused]] size_t run = 0;
+  [[maybe_unused]] auto nextRange = [&](auto& ranges, int32_t from) {
+    for (;;) {
+      auto range = ranges.nextCompetitiveRange(segnum, from);
+      if (visitedRuns.empty() || range.begin == PostingsReader::END) return range;
+      while (run < visitedRuns.size() && visitedRuns[run].end <= range.begin) run++;
+      if (run == visitedRuns.size()) return range;
+      if (visitedRuns[run].begin > range.begin) {
+        range.end = std::min(range.end, visitedRuns[run].begin);
+        return range;
+      }
+      from = visitedRuns[run].end;
+      if (from >= maxDoc) return decltype(range){PostingsReader::END, PostingsReader::END};
+    }
+  };
 
   if (buildMode == DomainBuildMode::RAW_QUERY_MATCHES) {
     assert(builder != nullptr);
@@ -701,7 +732,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       int32_t candidate = -1;
       int32_t cursor = 0;
       for (;;) {
-        auto range = collector.nextCompetitiveRange(segnum, cursor);
+        auto range = nextRange(collector, cursor);
         if (range.begin == PostingsReader::END) return;
         if (candidate < range.begin) candidate = align(range.begin);
         if (candidate == PostingsReader::END) return;
@@ -762,7 +793,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       }
       if constexpr (hasSortRanges) {
         while (sortPrune && doc >= competitiveEnd) {
-          auto range = collector.nextCompetitiveRange(segnum, doc);
+          auto range = nextRange(collector, doc);
           competitiveEnd = range.end;
           if (range.begin <= doc) break;
           doc = scorer->advance(range.begin);
@@ -789,7 +820,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       int32_t doc = *cur;
       if constexpr (hasSortRanges) {
         if (sortPrune && doc >= competitiveEnd) {
-          auto range = collector.nextCompetitiveRange(segnum, doc);
+          auto range = nextRange(collector, doc);
           competitiveEnd = range.end;
           if (range.begin > doc) {
             cur = screaming::gallopLowerBound(cur, arrEnd, range.begin);
@@ -1102,13 +1133,6 @@ inline int64_t nextVisitedLeaf(std::span<const uint64_t> visited,
   }
   return std::min(leafCount, (int64_t)(w << 6) + std::countr_zero(bits));
 }
-
-// A doc run [begin, end) of one segment: a primary comparator's seed window
-// (FieldComparator::seedWindows).
-struct SeedWindow {
-  int32_t begin;
-  int32_t end;
-};
 
 // Collect match-only windows in doc order. Scores are intentionally absent
 // from this path; collectors receive the unscored sentinel literal.
@@ -2250,6 +2274,41 @@ void collectTopKMatchWindowedSeedWindows(int32_t segnum, BulkScorer* bulk,
   }
   collectTopKMatchWindowed(segnum, bulk, filter, nullptr, collector, maxDoc,
                            true, {}, 0, windows);
+}
+
+// The pull-scorer form of collectTopKMatchWindowedSeedWindows, for plans
+// with no match-window product (such as an uncached range on a column-only
+// field): advance the scorer through the seed windows, collecting
+// the matches inside them, rebind the comparators, reset the scorer and run
+// the pruned collectTopK over the segment, jumping the windows. The same
+// guarantees hold: only the visit order changes and each match is collected
+// once. The plan must support reset, and the collector needs no scores.
+template <typename Collector>
+void collectTopKSeedWindows(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
+                            Collector& collector, int32_t maxDoc,
+                            Query::ReportedTwoPhase reportedTwoPhase) {
+  assert(scorer != nullptr);
+  assert(!collector.needsScores);
+  std::span<const SeedWindow> windows = collector.takeSeedWindows();
+  if (!windows.empty()) {
+    skipCount(SkipStats::fieldSortSeedWindowActivations);
+    skipCount(SkipStats::fieldSortSeedWindowPullActivations);
+    DocSetProbe accepted(filter);
+    for (const SeedWindow& window : windows) {
+      int32_t doc = scorer->docId();
+      if (doc < window.begin) doc = scorer->advance(window.begin);
+      for (; doc < window.end; doc = scorer->next()) {
+        if (accepted.get(doc)) collector.collect(segnum, doc, 0.0f);
+      }
+      skipCount(SkipStats::fieldSortSeedWindows);
+      if (doc == PostingsReader::END) break;
+    }
+    collector.rebindAfterSeeding();
+    scorer->reset();
+  }
+  collectTopK(segnum, scorer, filter, nullptr, collector, true, nullptr,
+              DomainBuildMode::FILTERED_MATCHES, nullptr, reportedTwoPhase,
+              windows, maxDoc);
 }
 
 // Rank score windows into a top-k collector. This is intentionally only a
