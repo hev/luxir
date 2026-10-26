@@ -75,7 +75,7 @@ public:
 #ifndef NDEBUG
   // Observe actual verification, not column decoding or metadata navigation.
   // Tests install this only after the product has been built.
-  static inline thread_local void (*verificationObserver)(int32_t) = nullptr;
+  static inline thread_local void (*verificationObserver)(const NumericPredicateQuery&, int32_t) = nullptr;
 #endif
 
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi,
@@ -230,7 +230,7 @@ public:
 
     LUXIR_INLINE void observe(int32_t doc) {
 #ifndef NDEBUG
-      if (verificationObserver != nullptr) verificationObserver(doc);
+      if (verificationObserver != nullptr) verificationObserver(query, doc);
 #else
       unused(doc);
 #endif
@@ -768,7 +768,7 @@ public:
           if (doc >= max) return;
 #ifndef NDEBUG
           if (run.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
-            verificationObserver(doc);
+            verificationObserver(query, doc);
           }
 #endif
           if (run.relation == BlockRelation::INSIDE
@@ -787,7 +787,7 @@ public:
       while (doc < max && docRank < reader.docsWithValue()) {
         auto [start, end] = reader.getStartEndValueRank(docRank);
 #ifndef NDEBUG
-        if (verificationObserver != nullptr) verificationObserver(doc);
+        if (verificationObserver != nullptr) verificationObserver(query, doc);
 #endif
         if (start < end
             && anyValueMatches(plans, crossing, query, start, end)) {
@@ -1205,7 +1205,23 @@ public:
       bool useZoneMap;
       bool hasOutside = false;
       int32_t possibleDocs;
+      int32_t insideDocs = 0;
       double zoneProductionWork = 0;
+
+      double estimatedMatches() const {
+        double matches = (double)estimatedCost;
+        const auto& sketch = reader.leafMeta().valueSketch();
+        if (points == nullptr && !sketch.empty()) {
+          matches = 0;
+          for (auto range : weight.query.intervals()) {
+            double end = range.hi == INT64_MAX ? (double)reader.numValues()
+                : sketch.countBelow(range.hi + 1);
+            matches += end - sketch.countBelow(range.lo);
+          }
+          matches = std::min(matches, (double)reader.docsWithValue());
+        }
+        return matches;
+      }
 
       struct Selection {
         ScorerArm arm;
@@ -1557,6 +1573,9 @@ public:
               });
         }
         zoneProductionWork += 8.0 * reader.numBlocks();
+        if (!reader.multiValued()) {
+          insideDocs = (int32_t)(prunableValues - reader.numValues() + possibleDocs);
+        }
         int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
         int64_t minPrunable = reader.numValues() / denominator
             + (reader.numValues() % denominator != 0);
@@ -1567,25 +1586,40 @@ public:
 
       MembershipWork membershipWork(int32_t maxDoc) override {
         unused(maxDoc);
-        double matches = (double)estimatedCost;
-        const auto& sketch = reader.leafMeta().valueSketch();
-        if (points == nullptr && !sketch.empty()) {
-          matches = 0;
-          for (auto range : weight.query.intervals()) {
-            double end = range.hi == INT64_MAX ? (double)reader.numValues()
-                : sketch.countBelow(range.hi + 1);
-            matches += end - sketch.countBelow(range.lo);
-          }
-          matches = std::min(matches, (double)reader.docsWithValue());
-        }
         // A sparse verifier can touch every value in its requested span.
         // Price that work independently of the values that pass. The sketch
-        // refines yield without changing cost()'s lead-selection upper bound.
+        // refines yield without changing cost()'s half-crossing heuristic.
         // Points may still resolve to sparse verification under a parent's
         // bounded demand. Only a resolved materialized supplier can claim the
         // cheaper retained-set price; this prior must cover either arm.
         double production = 64.0 * reader.numValues();
-        return {matches, production, 0, 64, 192};
+        return {estimatedMatches(), production, 0, 64, 192};
+      }
+
+      std::optional<MembershipQuote> quoteMembership(
+          const Query::PlanContext& context) const override {
+        using Consumption = Query::MembershipConsumption;
+        if (!isMembershipWindowUse(context.demand.horizon)
+            || context.numericPredicateDisableShapesForTests
+            || points != nullptr || reader.multiValued()
+            || !reader.denseDocsWithValue() || reader.docsWithValue() != segment.maxDoc()
+            || weight.query.isExactSet() || weight.query.intervals().size() != 1
+            || reader.leafMeta().valueSketch().empty()) return std::nullopt;
+        if (context.membershipConsumption == Consumption::WINDOWS) {
+          if (useZoneMap || selectScorer(context).arm != ScorerArm::SCAN) return std::nullopt;
+          double matches = std::clamp(estimatedMatches(), (double)insideDocs, (double)possibleDocs);
+          return MembershipQuote{matches, 24.0 * reader.numValues() + 9.0 * matches};
+        }
+        if (context.membershipConsumption != Consumption::CANDIDATES) return std::nullopt;
+        double candidates = (double)std::clamp<int64_t>(context.demand.candidates, 0, possibleDocs);
+        if (candidates == 0) return MembershipQuote{0, 0};
+        double matches = std::clamp(estimatedMatches(), (double)insideDocs, (double)possibleDocs);
+        double words = std::ceil((double)std::clamp<int64_t>(context.demand.span, 0, segment.maxDoc()) / 64);
+        // Measured branchless single-value kernels. Bound occupied words by
+        // the candidate count rather than assuming uniformly spaced probes.
+        double occupied = std::min(candidates, words);
+        return MembershipQuote{candidates * matches / possibleDocs,
+            56.0 * candidates + 8.0 * (words - occupied) + 21.0 * occupied};
       }
 
       Query::ScorerShape describeScorer(

@@ -6,6 +6,7 @@
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
+#include "test/ConjunctionPlanControl.h"
 #include "test/NumericVerification.h"
 #include "test/SchemaBuilder.h"
 #include "test/TopKAssert.h"
@@ -120,6 +121,109 @@ protected:
     return result;
   }
 };
+
+TEST_F(RangeFilterTest, ForcedConjunctionPlansPreserveMembership) {
+  TermQuery a("body_w", "threshold"), b("body_w", "b");
+  NumericPredicateQuery range("proof_i", 0, N - 1);
+  std::array<Query*, 3> required{&a, &b, &range};
+  BooleanQuery query{std::span(required).first(2), {}, {}, std::span(required).last(1)};
+  std::vector<int32_t> expected;
+  for (int32_t doc = 0; doc < N; doc += 768) {
+    if (possible(doc)) expected.push_back(doc);
+  }
+  int64_t windows[2]{};
+  [[maybe_unused]] int64_t verified[2]{};
+  for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
+    for (int32_t lead = 0; lead < 3; lead++) {
+      std::array<size_t, 3> order{0, 1, 2};
+      std::rotate(order.begin(), order.begin() + lead, order.begin() + lead + 1);
+      for (int32_t mask = 0; mask < 8; mask++) {
+        if ((mask & (1 << lead)) != 0) continue;
+        for (bool proofs : {false, true}) {
+          std::array<Consumption, 3> consumption;
+          for (size_t i = 0; i < 3; i++) {
+            consumption[i] = (mask & (1 << i)) != 0
+                ? Consumption::CANDIDATES : Consumption::WINDOWS;
+          }
+          std::array<bool, 3> observed{};
+          std::array<std::vector<size_t>, 2> stages;
+          BooleanQuery::ConjunctionControlForTests control{order, consumption, proofs,
+              [&](size_t ordinal, Consumption stage, size_t position, Query::ScorerSupplier&,
+                  const Query::PlanContext&, const Query::ScorerShape& shape) {
+                ASSERT_LT(ordinal, 3u);
+                EXPECT_FALSE(observed[ordinal]);
+                observed[ordinal] = true;
+                bool candidate = stage == Consumption::CANDIDATES;
+                bool isLead = !candidate && position == 0;
+                EXPECT_EQ(position, stages[candidate].size());
+                stages[candidate].push_back(ordinal);
+                EXPECT_EQ(ordinal == (size_t)lead, isLead);
+                EXPECT_EQ(consumption[ordinal], stage);
+                EXPECT_EQ(stage, shape.membershipConsumption);
+              }};
+          ConjunctionPlanControl force(control);
+          SkipStatsScope stats;
+          int64_t calls = 0;
+          NumericVerificationObserver observe([&](int32_t) { calls++; });
+          EXPECT_EQ(expected, membership(query, use));
+          EXPECT_TRUE(std::ranges::all_of(observed, [](bool seen) { return seen; }));
+          std::array<std::vector<size_t>, 2> expectedStages;
+          for (size_t ordinal : order) {
+            expectedStages[consumption[ordinal] == Consumption::CANDIDATES].push_back(ordinal);
+          }
+          EXPECT_EQ(expectedStages, stages);
+          if (use == Use::COUNT_WINDOWS && lead == 0 && mask == 4) {
+            windows[proofs] = SkipStats::conjDenseCountWindows;
+            verified[proofs] = calls;
+          }
+        }
+      }
+    }
+  }
+  EXPECT_LT(windows[1], windows[0]);
+#ifndef NDEBUG
+  EXPECT_LT(verified[1], verified[0]);
+#endif
+  EXPECT_EQ(nullptr, BooleanQuery::conjunctionControlForTests);
+}
+
+TEST_F(RangeFilterTest, ForcedCandidateOrderPreservesStages) {
+  TermQuery a("body_w", "threshold"), b("body_w", "b");
+  NumericPredicateQuery first("proof_i", 0, N - 1), second("proof2_i", 0, N - 1);
+  std::array<Query*, 4> required{&a, &b, &first, &second};
+  BooleanQuery query{std::span(required).first(3), {}, {}, std::span(required).last(1)};
+  std::array<size_t, 4> order{0, 2, 1, 3};
+  std::array<Consumption, 4> consumption{Consumption::WINDOWS, Consumption::WINDOWS,
+      Consumption::CANDIDATES, Consumption::CANDIDATES};
+  std::vector<int32_t> expected;
+  for (int32_t doc = 0; doc < N; doc += 768) {
+    if (possible(doc) && doc >= 8192 && doc < 20480) expected.push_back(doc);
+  }
+  for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
+    std::array<std::vector<size_t>, 2> stages;
+    BooleanQuery::ConjunctionControlForTests control{order, consumption, true,
+        [&](size_t ordinal, Consumption stage, size_t position, Query::ScorerSupplier&,
+            const Query::PlanContext&, const Query::ScorerShape& shape) {
+          EXPECT_EQ(stage, shape.membershipConsumption);
+          auto& sequence = stages[stage == Consumption::CANDIDATES];
+          EXPECT_EQ(position, sequence.size());
+          sequence.push_back(ordinal);
+        }};
+    ConjunctionPlanControl force(control);
+    EXPECT_EQ(expected, membership(query, use));
+    EXPECT_EQ((std::vector<size_t>{0, 1}), stages[0]);
+    EXPECT_EQ((std::vector<size_t>{2, 3}), stages[1]);
+  }
+  BooleanQuery::ConjunctionControlForTests invalid{order, consumption, true, {}};
+  order[3] = 2;
+  EXPECT_THROW({ ConjunctionPlanControl force(invalid); }, std::invalid_argument);
+  order[3] = 4;
+  EXPECT_THROW({ ConjunctionPlanControl force(invalid); }, std::invalid_argument);
+  order[3] = 3;
+  consumption[0] = Consumption::CANDIDATES;
+  EXPECT_THROW({ ConjunctionPlanControl force(invalid); }, std::invalid_argument);
+  EXPECT_EQ(nullptr, BooleanQuery::conjunctionControlForTests);
+}
 
 TEST_F(RangeFilterTest, CountAndMatchVerifyOnlyExactSurvivors) {
   TermQuery a("body_w", "a"), b("body_w", "b");

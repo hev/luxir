@@ -864,7 +864,7 @@ public:
     virtual int64_t cost() = 0;
 
     // Cold membership economics, separate from reset availability and from
-    // cost(), whose upper bound serves lead selection. Instructions are used
+    // cost(), whose cardinality heuristic serves lead selection. Instructions are used
     // here so the linear L1 prefix walk is priced in the same units as fills.
     struct MembershipWork {
       double matches = 0;
@@ -897,6 +897,20 @@ public:
       // Materialized membership has no verifier or postings-prefix restart.
       if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64};
       return {matches, 128.0 * maxDoc, 0, 1024, 256};
+    }
+
+    struct MembershipQuote {
+      double matches;
+      double work;
+    };
+
+    // Pure contextual instruction estimate, with no construction, allocation,
+    // or cursor movement. WINDOWS quotes segment yield and full production;
+    // CANDIDATES quotes survivors and verification after rejection proofs.
+    virtual std::optional<MembershipQuote> quoteMembership(
+        const PlanContext& context) const {
+      unused(context);
+      return std::nullopt;
     }
 
     /// Pure description of the scorer returned by resolve() for this exact build

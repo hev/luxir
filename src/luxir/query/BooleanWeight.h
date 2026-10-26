@@ -9312,6 +9312,145 @@ class BooleanQuery::Weight final : public Query::Weight {
           candidates, span, use);
     }
 
+    using MembershipQuotes = boost::container::small_vector<
+        std::optional<MembershipQuote>, 16>;
+
+    static void orderMembershipCandidates(
+        boost::container::small_vector<PlannedEntry, 16>& candidates,
+        const MembershipQuotes& quotes) {
+      for (size_t begin = 0; begin < candidates.size();) {
+        if (!quotes[candidates[begin].order]) {
+          begin++;
+          continue;
+        }
+        size_t end = begin + 1;
+        while (end < candidates.size() && quotes[candidates[end].order]) end++;
+        std::stable_sort(candidates.begin() + begin, candidates.begin() + end,
+            [&](const PlannedEntry& a, const PlannedEntry& b) {
+              const auto& qa = *quotes[a.order];
+              const auto& qb = *quotes[b.order];
+              double rejectA = 1 - qa.matches;
+              double rejectB = 1 - qb.matches;
+              if (rejectA <= 0) return false;
+              if (rejectB <= 0) return true;
+              return qa.work * rejectB < qb.work * rejectA;
+            });
+        begin = end;
+      }
+    }
+
+    LUXIR_NOINLINE void planMembershipOrder(
+        boost::container::small_vector<PlannedEntry, 16>& producers,
+        boost::container::small_vector<PlannedEntry, 16>& candidates,
+        BulkUse use, const ConjunctionControlForTests* control) {
+      using Consumption = Query::MembershipConsumption;
+      if (candidates.empty() || (producers.size() != 1 && candidates.size() < 2)) return;
+      if (control != nullptr && (!control->order.empty() || !control->proofs)) return;
+
+      int32_t maxDoc = segment.maxDoc();
+      auto unit = scorerBuildContext(Query::Demand::fromCandidatesAndSpan(1, 1, use));
+      unit.membershipConsumption = Consumption::CANDIDATES;
+      // Compare one candidate after proof projection. UNKNOWN entries divide
+      // the sequence into independent runs; no quoted filter crosses them.
+      MembershipQuotes quotes(producers.size() + candidates.size());
+      for (const auto& entry : candidates) {
+        quotes[entry.order] = entry.supplier->quoteMembership(unit);
+      }
+      orderMembershipCandidates(candidates, quotes);
+      if (producers.size() != 1
+          || (control != nullptr && !control->consumption.empty())) return;
+      for (const auto& entry : candidates) {
+        if (!quotes[entry.order]) return;
+      }
+
+      auto full = scorerBuildContext(Query::Demand::fromCandidatesAndSpan(maxDoc, maxDoc, use));
+      const auto incumbent = producers.front();
+      bool termLead = incumbent.shape.directKind == Query::DirectScorerKind::TERM;
+      auto incumbentProduction = incumbent.supplier->quoteMembership(full);
+      if (!termLead && !incumbentProduction) return;
+      if (!termLead) {
+        quotes[incumbent.order] = incumbent.supplier->quoteMembership(unit);
+        if (!quotes[incumbent.order]) return;
+      }
+      double incumbentMatches = termLead ? (double)incumbent.cost : incumbentProduction->matches;
+      size_t selected = candidates.size();
+      MembershipQuote production{incumbentMatches, 0};
+      for (size_t i = 0; i < candidates.size(); i++) {
+        auto quote = candidates[i].supplier->quoteMembership(full);
+        if (quote && quote->matches < production.matches) {
+          selected = i;
+          production = *quote;
+        }
+      }
+      if (selected == candidates.size()) return;
+
+      auto challenger = candidates[selected];
+      auto alternative = candidates;
+      alternative.erase(alternative.begin() + selected);
+      if (!termLead) alternative.insert(alternative.begin(), incumbent);
+      orderMembershipCandidates(alternative, quotes);
+
+      // Retain a term's full-traversal debit in both plans. Changing the lead
+      // earns no speculative credit for reduced posting production.
+      double commonWork = termLead ? incumbent.supplier->membershipWork(maxDoc).produce : 0;
+      auto scaledMatches = [&](size_t ordinal, double matches, double limit, bool adverse) {
+        double scale = !adverse ? 1.0 : ordinal == challenger.order ? 2.0 : 1.0 / 1.5;
+        return std::clamp(matches * scale, 0.0, limit);
+      };
+      auto price = [&](bool alternate, bool adverse) {
+        double work = commonWork;
+        double count;
+        if (alternate) {
+          work += production.work;
+          count = scaledMatches(challenger.order, production.matches, maxDoc, adverse);
+          // The adverse case gives other producers no selectivity credit.
+          if (termLead && !adverse) count *= (double)incumbent.cost / maxDoc;
+        } else if (termLead) {
+          count = (double)incumbent.cost;
+        } else {
+          work += incumbentProduction->work;
+          count = scaledMatches(incumbent.order, incumbentProduction->matches, maxDoc, adverse);
+        }
+        const auto& filters = alternate ? alternative : candidates;
+        for (const auto& entry : filters) {
+          auto context = full;
+          context.membershipConsumption = Consumption::CANDIDATES;
+          context.demand.candidates = (int64_t)std::ceil(count);
+          auto quote = entry.supplier->quoteMembership(context);
+          if (!quote) return std::numeric_limits<double>::infinity();
+          work += quote->work;
+          count = scaledMatches(entry.order, quote->matches, count, adverse);
+        }
+        return work;
+      };
+      // Stress shared yields consistently: raise the challenger's yield and
+      // lower the others in both plans. Full scans retain their full debit.
+      if (price(true, false) > 0.75 * price(false, false)
+          || price(true, true) >= price(false, true)) return;
+
+      challenger.buildContext = full;
+      challenger.shape = challenger.supplier->describeScorer(full);
+      producers.clear();
+      producers.push_back(challenger);
+      double count = production.matches;
+      if (termLead) {
+        auto term = incumbent;
+        term.buildContext = scorerBuildContext(windowFillDemand((int64_t)std::ceil(count), use));
+        term.shape = term.supplier->describeScorer(term.buildContext);
+        producers.push_back(term);
+        count *= (double)incumbent.cost / maxDoc;
+      }
+      candidates = std::move(alternative);
+      for (auto& entry : candidates) {
+        entry.buildContext = scorerBuildContext(windowFillDemand((int64_t)std::ceil(count), use));
+        entry.buildContext.membershipConsumption = Consumption::CANDIDATES;
+        entry.shape = entry.supplier->describeScorer(entry.buildContext);
+        auto quote = entry.supplier->quoteMembership(entry.buildContext);
+        assert(quote);
+        if (quote) count = quote->matches;
+      }
+    }
+
     ConjunctionPlanningResult planConjunctionEntries(
         MemPool& targetPool, ConjunctionMode mode,
         AcceptedConjunctionRoutes acceptedRoutes,
@@ -9323,6 +9462,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       plan.use = use;
       bool perEntryDemand = mode == ConjunctionMode::EXHAUSTIVE
           && isMembershipWindowUse(use);
+      const auto* control = perEntryDemand ? conjunctionControlForTests : nullptr;
       plan.enclosingFilters = enclosingFilterSuppliers.empty()
           ? EnclosingFilters::NOT_SUPPLIED
           : EnclosingFilters::CONSUMED;
@@ -9391,6 +9531,21 @@ class BooleanQuery::Weight final : public Query::Weight {
                   return a.cost != b.cost ? a.cost < b.cost
                                           : a.order < b.order;
                 });
+      if (control != nullptr) {
+        assert(!plan.hasOptionalGroup);
+        assert(control->consumption.empty() || control->consumption.size() == entries.size());
+        if (!control->order.empty()) {
+          assert(control->order.size() == entries.size());
+          auto sorted = entries;
+          for (size_t i = 0; i < entries.size(); i++) {
+            auto entry = std::find_if(sorted.begin(), sorted.end(), [&](const PlannedEntry& entry) {
+              return entry.order == control->order[i];
+            });
+            assert(entry != sorted.end());
+            entries[i] = *entry;
+          }
+        }
+      }
       plan.leadCost = entries[0].cost;
       for (size_t i = 1; i < entries.size(); i++) {
         plan.nonLeadCost += entries[i].cost;
@@ -9410,6 +9565,11 @@ class BooleanQuery::Weight final : public Query::Weight {
         entry.buildContext = scorerBuildContext(demand);
         if (perEntryDemand && i > 0 && !entry.optionalGroup) {
           entry.buildContext.membershipConsumption = Query::MembershipConsumption::EITHER;
+          if (control != nullptr) {
+            if (!control->consumption.empty()) {
+              entry.buildContext.membershipConsumption = control->consumption[entry.order];
+            }
+          }
         }
         const Query::PlanContext& buildContext = entry.buildContext;
         if (entry.optionalGroup) {
@@ -9438,14 +9598,14 @@ class BooleanQuery::Weight final : public Query::Weight {
         }
       }
 
-      boost::container::small_vector<PlannedSupplier, 16> candidateFilters;
+      boost::container::small_vector<PlannedEntry, 16> candidateFilters;
       if (perEntryDemand) {
         entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const PlannedEntry& entry) {
           if (entry.shape.membershipConsumption != Query::MembershipConsumption::CANDIDATES) {
             return false;
           }
           assert(entry.shape.windowFillClause == Query::ClauseShape::DIRECT);
-          candidateFilters.push_back({entry.supplier, entry.shape, entry.buildContext});
+          candidateFilters.push_back(entry);
           return true;
         }), entries.end());
         assert(!entries.empty());
@@ -9461,11 +9621,20 @@ class BooleanQuery::Weight final : public Query::Weight {
         } else {
           lead.shape = lead.supplier->describeScorer(lead.buildContext);
         }
+        if (!needsScores && !plan.hasOptionalGroup && prohibitedSources.empty()
+            && segment.numLive() == segment.maxDoc()
+            && !candidateFilters.empty() && (entries.size() == 1 || candidateFilters.size() > 1)) {
+          planMembershipOrder(entries, candidateFilters, use, control);
+          plan.leadCost = entries[0].cost;
+        }
       }
       plan.nonLeadCost = 0;
       for (size_t i = 1; i < entries.size(); i++) plan.nonLeadCost += entries[i].cost;
       plan.candidateFilters = targetPool.make_span<PlannedSupplier>(candidateFilters.size());
-      std::copy(candidateFilters.begin(), candidateFilters.end(), plan.candidateFilters.begin());
+      for (size_t i = 0; i < candidateFilters.size(); i++) {
+        const auto& entry = candidateFilters[i];
+        plan.candidateFilters[i] = {entry.supplier, entry.shape, entry.buildContext};
+      }
 
       boost::container::small_vector<Query::ScorerSupplier*, 16>
           prohibitedSuppliers;
@@ -9535,6 +9704,20 @@ class BooleanQuery::Weight final : public Query::Weight {
             (acceptedRoutes & routeBit(route)) != 0
             ? ConjunctionPlanStatus::READY
             : ConjunctionPlanStatus::DECLINED;
+        if (control != nullptr) {
+          if (status == ConjunctionPlanStatus::READY && control->observe) {
+            for (size_t i = 0; i < plan.entries.size(); i++) {
+              const auto& entry = plan.entries[i];
+              control->observe(entry.order, Query::MembershipConsumption::WINDOWS, i,
+                  *entry.supplier, entry.buildContext, entry.shape);
+            }
+            for (size_t i = 0; i < plan.candidateFilters.size(); i++) {
+              const auto& entry = plan.candidateFilters[i];
+              control->observe(candidateFilters[i].order, Query::MembershipConsumption::CANDIDATES, i,
+                  *entry.supplier, entry.buildContext, entry.shape);
+            }
+          }
+        }
         return ConjunctionPlanningResult{status, plan};
       };
 
@@ -10034,7 +10217,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       auto assertBuildDemand = [&](const Query::Demand& demand) {
         assert(demand.horizon == plan.use);
         if (isMembershipWindowUse(plan.use)) {
-          assert(demand.candidates >= plan.leadCost);
+          assert(demand.candidates >= 0);
           assert(demand.candidates <= segment.maxDoc());
           assert(demand.span >= demand.candidates);
           assert(demand.span <= segment.maxDoc());
@@ -10325,7 +10508,8 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
       boost::container::small_vector<Query::MembershipProof*, 8> proofs;
       int32_t candidateProofCount = 0;
-      if (plan.mode == ConjunctionMode::EXHAUSTIVE && isMembershipWindowUse(plan.use)) {
+      if (plan.mode == ConjunctionMode::EXHAUSTIVE && isMembershipWindowUse(plan.use)
+          && (conjunctionControlForTests == nullptr || conjunctionControlForTests->proofs)) {
         auto collectProof = [&](Query::ScorerPlan* child) {
           if (child != nullptr) {
             if (auto* proof = child->buildMembershipProof(targetPool)) proofs.push_back(proof);

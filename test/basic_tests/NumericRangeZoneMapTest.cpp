@@ -550,7 +550,7 @@ namespace {
 
 #ifndef NDEBUG
 thread_local int64_t verifications = 0;
-void countVerification(int32_t) { verifications++; }
+void countVerification(const NumericPredicateQuery&, int32_t) { verifications++; }
 #endif
 
 // Docs the zone-map scorer verifies value by value for [lo, hi], or -1
