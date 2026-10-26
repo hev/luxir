@@ -22,7 +22,20 @@ struct MergeCostModel {
   static constexpr int32_t STREAM_BUDGET_FLOOR = 32;
   static constexpr uint64_t TARGET_FILE_BYTES = 256ULL * 1024 * 1024;
   static constexpr int32_t STREAM_BUDGET_CAP = 128;
-  static constexpr int64_t TERM_RANGE_SOURCE_BYTES = 64 * 1024;
+  // A range holds one TermsEnum (about 1 KiB with its term buffer) per source;
+  // postings decode state lives on the stack.
+  static constexpr int64_t TERM_RANGE_SOURCE_BYTES = 4 * 1024;
+  // Range term blocks buffer in RAM until stitch and are charged as they grow,
+  // in steps of this size.  Debug builds resync often so the suite exercises
+  // in-range growth.
+#ifdef NDEBUG
+  static constexpr int64_t TERM_RANGE_RESYNC_BYTES = 1024 * 1024;
+#else
+  static constexpr int64_t TERM_RANGE_RESYNC_BYTES = 4 * 1024;
+#endif
+  // Split planning materializes one estimate (first term plus byte counts) per
+  // source term block; the term's heap bytes are charged separately.
+  static constexpr int64_t TERM_PLAN_BLOCK_BYTES = 96;
   static constexpr int64_t STORED_CHUNK_BUFFER_MULTIPLIER = 5;
   static constexpr int64_t MIN_TERM_RANGE_BYTES = 64LL * 1024 * 1024;
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
@@ -90,6 +103,10 @@ struct MergeCostModel {
   // a TermsEnum and its decode state for the duration of the range merge.
   static int64_t termRangeWorkingBytes(int64_t sources) {
     return LIGHT_BYTES + sources * TERM_RANGE_SOURCE_BYTES;
+  }
+
+  static int64_t termPlanBytes(int64_t sourceBlocks) {
+    return sourceBlocks * TERM_PLAN_BLOCK_BYTES;
   }
 
   static int64_t pointsBytes(int64_t sourceRuns, int64_t totalValues,

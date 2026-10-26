@@ -997,19 +997,29 @@ private:
     uint64_t safetyBytes = 0;
   };
 
-  int64_t partitionCoordinatorCost(std::span<MergeFieldInfo*> fields) const {
+  // The coordinator holds the merged norms until stitch. Range term blocks are
+  // charged by the ranges as they grow, then handed to the coordinator.
+  static int64_t partitionCoordinatorCost(std::span<MergeFieldInfo*> fields) {
     int64_t docsWithField = 0;
+    for (const auto* field : fields) docsWithField += field->segFieldInfo.docsWithField;
+    return docsWithField * 2;
+  }
+
+  // Planning copies each source block's first term: about one term in
+  // TERMS_BLOCK_SIZE of the source dictionaries.
+  static int64_t termPlanCost(std::span<MergeFieldInfo*> fields) {
+    int64_t blocks = 0;
     int64_t dictionaryBytes = 0;
     for (const auto* field : fields) {
       const auto& info = field->segFieldInfo;
-      docsWithField += info.docsWithField;
       if (info.nTerms == 0) continue;
+      blocks += (info.nTerms + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE;
       assert(info.termBlockIndexLoc.filenum() == info.termsLoc.filenum());
       assert(info.termBlockIndexLoc.offset() >= info.termsLoc.offset());
-      dictionaryBytes += (int64_t) (info.termBlockIndexLoc.offset()
-          - info.termsLoc.offset());
+      dictionaryBytes += (int64_t) (info.termBlockIndexLoc.offset() - info.termsLoc.offset());
     }
-    return docsWithField * 2 + dictionaryBytes;
+    return MergeCostModel::termPlanBytes(blocks)
+        + dictionaryBytes / Postings::TERMS_BLOCK_SIZE;
   }
 
   // Range count follows source posting bytes, not the indexing RAM cap, with a
@@ -1038,6 +1048,7 @@ private:
     if (minimumPartitionBlocks > (int64_t) TrieBuilder::MAX_BLOCKS) return std::nullopt;
 
     std::vector<SafetyBlock> safetyBlocks;
+    safetyBlocks.reserve((size_t) minimumPartitionBlocks + compactFields.size());
     for (auto* field : compactFields) {
       if (field->segFieldInfo.nTerms == 0) continue;
       TermsEnum terms(pool, *field->seg->postingsReader, field->segFieldInfo);
@@ -1151,11 +1162,17 @@ private:
     return plan;
   }
 
-  template<DocsEnumTier Tier, bool Array = false>
+  struct NoTermHook {
+    void operator()() const {}
+  };
+
+  // onTerm runs after each merged term is written.
+  template<DocsEnumTier Tier, bool Array = false, typename OnTerm = NoTermHook>
   void mergeTermsTier(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
                       OrdCollector* ordCollector, const std::optional<std::string>& lower,
                       const std::optional<std::string>& upper, MemPool& pool,
-                      std::vector<std::vector<uint32_t>>* ordMaps = nullptr) {
+                      std::vector<std::vector<uint32_t>>* ordMaps = nullptr,
+                      OnTerm onTerm = {}) {
     struct TermsEnumIdx {
       TermsEnum tenum;
       size_t idx;
@@ -1220,23 +1237,26 @@ private:
       } while (termPQ.size() > 0 && termPQ.top().tenum.term() == term);
 
       textWriter.endTerm(term);
+      onTerm();
     }
   }
 
+  template<typename OnTerm = NoTermHook>
   void mergeTerms(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
                   bool isOrdCol, bool hasPositions, OrdCollector* ordCollector,
                   const std::optional<std::string>& lower,
-                  const std::optional<std::string>& upper, MemPool& pool) {
+                  const std::optional<std::string>& upper, MemPool& pool,
+                  OnTerm onTerm = {}) {
     if (isOrdCol) {
-      mergeTermsTier<DocsEnumTier::DOCS>(
-          textWriter, compactFields, ordCollector, lower, upper, pool);
+      mergeTermsTier<DocsEnumTier::DOCS, false, OnTerm>(
+          textWriter, compactFields, ordCollector, lower, upper, pool, nullptr, onTerm);
     } else if (hasPositions) {
-      mergeTermsTier<DocsEnumTier::POSITIONS>(
-          textWriter, compactFields, ordCollector, lower, upper, pool);
+      mergeTermsTier<DocsEnumTier::POSITIONS, false, OnTerm>(
+          textWriter, compactFields, ordCollector, lower, upper, pool, nullptr, onTerm);
     } else {
       // This non-ord path also covers ID fields, not only positionless text.
-      mergeTermsTier<DocsEnumTier::FREQS>(
-          textWriter, compactFields, ordCollector, lower, upper, pool);
+      mergeTermsTier<DocsEnumTier::FREQS, false, OnTerm>(
+          textWriter, compactFields, ordCollector, lower, upper, pool, nullptr, onTerm);
     }
   }
 
@@ -1342,6 +1362,8 @@ private:
     struct RangeOutput {
       TermRangePlan plan;
       RAMFile termsFile;
+      // termsFile's bytes from range completion until stitch appends them.
+      IndexRamBudget::Guard termsGuard;
       TextWriter::RangeResult result;
       seg_location docsBase;
       seg_location posBase;
@@ -1416,9 +1438,9 @@ private:
         batch.streams = MergeCostModel::TERM_RANGE_STREAMS;
         batch.name = std::string((std::string_view) outputFieldInfo->fieldname)
             + "#" + std::to_string(i);
-        batch.body = [self, i](MergeAdmissionDriver&, MergeAdmissionDriver::Batch&,
-                               MergeAdmissionDriver::BatchAdmission&) {
-          self->mergeRange(i);
+        batch.body = [self, i](MergeAdmissionDriver&, MergeAdmissionDriver::Batch& current,
+                               MergeAdmissionDriver::BatchAdmission& rangeAdmission) {
+          self->mergeRange(i, current.cost, rangeAdmission);
         };
         batches.push_back(std::move(batch));
       }
@@ -1427,7 +1449,8 @@ private:
     }
 
   private:
-    void mergeRange(size_t rangeOrd) {
+    void mergeRange(size_t rangeOrd, int64_t workingBytes,
+                    MergeAdmissionDriver::BatchAdmission& admission) {
       RangeOutput& output = *outputs[rangeOrd];
       auto poolGuard = MemPool::threadLocalPoolGuard();
       MemPool& rangePool = poolGuard.pool();
@@ -1447,10 +1470,28 @@ private:
       if (FieldType::hasPositions(flags)) {
         writer.setNorms(preparedNorms.textView());
       }
+      // Term blocks stay in RAM until stitch, so charge them as they grow
+      // rather than reserving an upper bound for the whole field up front.
+      int64_t chargedTerms = 0;
+      auto chargeTerms = [&] {
+        int64_t bytes = (int64_t) termsOut.size();
+        if (bytes - chargedTerms < MergeCostModel::TERM_RANGE_RESYNC_BYTES) return;
+        chargedTerms = bytes;
+        admission.forceRepriceRam(workingBytes + chargedTerms);
+      };
       merger.mergeTerms(writer, compactFields, false, FieldType::hasPositions(flags), nullptr,
-                        output.plan.lower, output.plan.upper, rangePool);
+                        output.plan.lower, output.plan.upper, rangePool, chargeTerms);
       output.result = writer.finishTermRun();
       termsOut.flush(true);
+      // Release the working set, keeping the term blocks and their block index
+      // charged until stitch.
+      int64_t retained = (int64_t) termsOut.size()
+          + (int64_t) (output.result.termBlockOffsets.capacity() * sizeof(uint64_t));
+      for (const auto& key : output.result.separatorKeys) {
+        retained += (int64_t) (sizeof(std::string) + key.capacity());
+      }
+      output.termsGuard = admission.takeRamGuard();
+      output.termsGuard.forceResize(retained);
       // A nonempty row embeds these file numbers in the terms stream, so make
       // their per-range files durable before release. Empty ranges produce no
       // row and should leave header-only streams buffered for reuse/collapse.
@@ -1483,7 +1524,10 @@ private:
       for (auto& outputPtr : outputs) {
         RangeOutput& output = *outputPtr;
         auto& result = output.result;
-        if (result.nTerms == 0) continue;
+        if (result.nTerms == 0) {
+          output.termsGuard.release();
+          continue;
+        }
 
         seg_location termsBase = termsOut.slocation();
         if (blockOrd != 0) {
@@ -1505,6 +1549,7 @@ private:
             termsBase.filenum(), output.docsBase.filenum(), output.posBase.filenum()};
         merger.postingsWriter.protectOutputFiles(rowFiles);
         termsOut.appendFile(output.termsFile);
+        output.termsGuard.release();
         blockOffsets.insert(blockOffsets.end(), result.termBlockOffsets.begin(),
                             result.termBlockOffsets.end());
         termOrd += result.nTerms;
@@ -1619,12 +1664,13 @@ private:
       int64_t serialCost = estimateCost(mergeFieldInfos);
       int64_t coordinatorCost = partitionCoordinatorCost(compactFields);
       // Partitioning is an on-disk plan decision, so it must not depend on
-      // transient pool occupancy after this batch has started.  The temporary
-      // coordinator lease is bounded by merged norms plus source dictionaries,
-      // comparable to the state consumed by the serial path.  Forced growth
-      // notifies budget pressure immediately, allowing inverter shedding where
-      // reclaimable RAM exists without blocking or retrying in this batch.
-      admission.forceRepriceRam(std::max(serialCost, coordinatorCost));
+      // transient pool occupancy after this batch has started.  Planning holds
+      // one estimate per source term block; afterwards the coordinator keeps
+      // only the merged norms.  Forced growth notifies budget pressure
+      // immediately, allowing inverter shedding where reclaimable RAM exists
+      // without blocking or retrying in this batch.
+      admission.forceRepriceRam(
+          std::max(serialCost, coordinatorCost + termPlanCost(compactFields)));
       auto rangePlan = planTermRanges(compactFields, pool);
       if (rangePlan.has_value()) {
         if (!admission.repriceRam(coordinatorCost)) std::unreachable();

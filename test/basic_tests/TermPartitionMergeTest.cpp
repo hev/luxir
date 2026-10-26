@@ -533,27 +533,22 @@ TEST(TermPartitionMergeTest, TinyBudgetStillPartitions) {
   EXPECT_FALSE(info.rangeTableLoc.isNull());
 }
 
-TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
+// Every range and its term-block charge must be forced through a full budget.
+// Completed ranges keep their term blocks charged until stitch, and everything
+// is released by the time the merge returns.
+TEST(TermPartitionMergeTest, PartitionsUnderOccupiedBudget) {
   auto schema = textSchema();
   TestIndex sources;
   buildWideDictionarySources(sources, schema);
 
   std::vector<PostingsReader*> readers;
   std::vector<LiveDocs*> liveDocs;
-  int64_t docsWithField = 0;
-  int64_t dictionaryBytes = 0;
   for (auto& segment : sources.reader->segments()) {
     readers.push_back(&segment.postingsReader());
     liveDocs.push_back(nullptr);
     SegFieldInfo info = readBodyInfo(sources.pool, segment);
     EXPECT_NE(0, info.flags & FieldType::MAY_HAVE_FITTED);
-    docsWithField += info.docsWithField;
-    dictionaryBytes += (int64_t) (info.termBlockIndexLoc.offset()
-        - info.termsLoc.offset());
   }
-  int64_t serialCost = MergeCostModel::LIGHT_BYTES + docsWithField * 2;
-  int64_t coordinatorCost = dictionaryBytes + docsWithField * 2;
-  ASSERT_GT(coordinatorCost, serialCost);
 
   int64_t cap = 2 * MergeCostModel::LIGHT_BYTES;
   IndexRamBudget budget(cap);
@@ -563,15 +558,29 @@ TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
   PostingsWriter writer(outputDir, 901, -1);
   StoredDictionaryRegistry dictionaries;
   dictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*schema));
+  std::atomic<int64_t> maxCharged = 0;
+  Signal::listen("termRangeStreamsCheckedOut", [&](void*, void*, void*) -> void* {
+    int64_t charged = budget.reservedBytes() - cap;
+    int64_t seen = maxCharged.load();
+    while (charged > seen && !maxCharged.compare_exchange_weak(seen, charged)) {}
+    return nullptr;
+  });
+  auto signalCleanup = luxir::scope_guard([]() {
+    Signal::unlisten("termRangeStreamsCheckedOut");
+  });
   SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4, *schema, dictionaries);
   merger.merge();
   writer.finish();
+  EXPECT_EQ(cap, budget.reservedBytes());
 
   PostingsReader outputReader(outputDir, 901);
   auto* fields = outputReader.fieldInfo("body");
   ASSERT_NE(nullptr, fields);
   const auto& info = *fields;
   EXPECT_FALSE(info.rangeTableLoc.isNull());
+  // The last range to check out its streams sees every range's term blocks.
+  int64_t termBytes = (int64_t) (info.termBlockIndexLoc.offset() - info.termsLoc.offset());
+  EXPECT_GE(maxCharged.load() + (int64_t) MAX_ALIGN, termBytes);
   // Stitching keeps the marker that a range writer saw on its full-width terms.
   EXPECT_NE(0, info.flags & FieldType::MAY_HAVE_FITTED);
 }
