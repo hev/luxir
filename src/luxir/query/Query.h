@@ -365,6 +365,9 @@ protected:
 
   explicit Query(QueryKind kind) : kind(kind) {}
   Query() = delete;
+  // Queries live in pools (MemPool::make needs them trivially destructible),
+  // so the destructor is non-virtual; protecting it rejects delete via Query*.
+  ~Query() = default;
 
 private:
   // Structural hash, computed once by hash(). Only planning reaches it, and
