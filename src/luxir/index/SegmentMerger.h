@@ -155,8 +155,10 @@ class SegmentMerger {
 
   // Runs the per-field merge batches as parallel TBB tasks under IndexRamBudget
   // admission.  Strategy: work waits, threads don't.
-  //  - Batches are enumerated up front and sorted largest-cost-first, so the
+  //  - Batches are enumerated up front and sorted longest-work-first, so the
   //    longest field merge starts earliest and small column merges pack around it.
+  //    RAM cost is a poor proxy for length: a text field's merge holds only its
+  //    norms, while a short low-cardinality string column holds an ord per doc.
   //  - admitLoop() launches every pending batch whose streams fit and whose RAM
   //    reserves.  Failed RAM admissions publish merge demand, and budget capacity
   //    releases ping the driver to retry, so admission is event-driven and no
@@ -308,6 +310,8 @@ class SegmentMerger {
 
     struct Batch {
       int64_t cost = 0;
+      // Estimated merge work, for ordering only (postings and values processed).
+      int64_t work = 0;
       int32_t streams = 0;
       std::string name;
       std::vector<MergeFieldInfo> fields;
@@ -380,10 +384,7 @@ class SegmentMerger {
           for (auto& batch : batches) {
             pending.push_back(std::move(batch));
           }
-          std::sort(pending.begin(), pending.end(), [](const Batch& a, const Batch& b) {
-            if (a.cost != b.cost) return a.cost > b.cost;
-            return a.name < b.name;
-          });
+          std::sort(pending.begin(), pending.end(), longestFirst);
           int32_t releasedStreams = parent.streams - retainedStreams;
           assert(inFlightStreams >= releasedStreams);
           inFlightStreams -= releasedStreams;
@@ -395,6 +396,11 @@ class SegmentMerger {
       if (accepted) {
         admitLoop();
       }
+    }
+
+    static bool longestFirst(const Batch& a, const Batch& b) {
+      if (a.work != b.work) return a.work > b.work;
+      return a.name < b.name;
     }
 
   private:
@@ -425,7 +431,7 @@ class SegmentMerger {
 
             auto guard = budget.tryAcquireGuard(candidate.cost);
             if (!guard) {
-              // Pending is largest-cost-first.  A RAM-starved candidate consumes
+              // Pending is longest-work-first.  A RAM-starved candidate consumes
               // virtual stream slots just as if it had admitted, so a cheaper
               // later batch cannot steal the slots being reclaimed for the head
               // work.  This makes demand describe the same ordered schedule we
@@ -676,6 +682,7 @@ public:
       // we could bail early.
 
       batch.cost = estimateCost(batch.fields);
+      batch.work = estimateWork(batch.fields);
       if (isStoredField(batch.fields[0].segFieldInfo)) {
         auto format = storedFormat(batch.name);
         batch.bootstrapStoredDictionary = format.codec == StoredChunkFormat::ZSTD && format.dictionaryBytes
@@ -692,13 +699,7 @@ public:
       batches.push_back(std::move(batch));
     }
 
-    std::sort(batches.begin(), batches.end(), [](const MergeAdmissionDriver::Batch& a,
-                                                  const MergeAdmissionDriver::Batch& b) {
-      if (a.cost != b.cost) {
-        return a.cost > b.cost;
-      }
-      return a.name < b.name;
-    });
+    std::sort(batches.begin(), batches.end(), MergeAdmissionDriver::longestFirst);
 
     MergeAdmissionDriver driver(*this, ramBudget, streamBudget, std::move(batches));
     driver.run();
@@ -784,8 +785,8 @@ private:
     if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Ord columns hold the term-order -> doc-order transposition in RAM until the
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
-      // up front, plus roughly a TaggedPtr/entry of pool per value for multi-value
-      // chains.  This is the heavy class the budget exists for.
+      // up front, plus a pool delta stream per multi-valued doc.  This is the
+      // heavy class the budget exists for.
       if (allFlags & FieldType::MULTI_ARRAY) {
         int64_t mapBytes = 0;
         for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
@@ -795,7 +796,12 @@ private:
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
             + MergeCostModel::LIGHT_BYTES + pointsBytes;
       }
-      return (int64_t)postingsWriter.getMaxDoc() * 4 + numValues * 8
+      // A doc's first value takes its ords[maxDoc] slot.  A multi-valued doc
+      // spills into a pool delta stream: about 40 bytes for its header and
+      // first slice, then a few bytes per further value.
+      int64_t spilledValues = std::max<int64_t>(0, numValues - docsWithField);
+      int64_t multiValuedDocs = std::min(spilledValues, docsWithField);
+      return (int64_t)postingsWriter.getMaxDoc() * 4 + multiValuedDocs * 40 + spilledValues * 4
           + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
@@ -805,6 +811,20 @@ private:
     }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
     return MergeCostModel::LIGHT_BYTES + pointsBytes;
+  }
+
+  // In postings and values processed. A merged term is a heap step over the
+  // sources plus per-term encoding, worth many postings.
+  static int64_t estimateWork(std::span<const MergeFieldInfo> fields) {
+    constexpr int64_t TERM_WORK = 16;
+    int64_t work = 0;
+    for (const auto& field : fields) {
+      const auto& info = field.segFieldInfo;
+      work += std::max<int64_t>(0, info.nTerms) * TERM_WORK
+          + std::max({info.sumTotalTermFreq, info.sumDocFreq, info.numValues,
+                      (int64_t) info.docsWithField, (int64_t) 0});
+    }
+    return work;
   }
 
   static int32_t estimateStreams(std::span<const MergeFieldInfo> fields) {
@@ -1405,7 +1425,7 @@ private:
     }
 
     void start(const std::shared_ptr<PartitionCoordinator>& self,
-               MergeAdmissionDriver::BatchAdmission& admission) {
+               MergeAdmissionDriver::BatchAdmission& admission, int64_t fieldWork) {
       int32_t numNormDocsWithField = 0;
       merger.buildMergedNorms(compactFields, normBytes, normDocsWithField,
                               numNormDocsWithField, pool);
@@ -1435,6 +1455,8 @@ private:
       for (size_t i = 0; i < outputs.size(); i++) {
         MergeAdmissionDriver::Batch batch;
         batch.cost = rangeCost;
+        // Ranges are cut to equal source bytes.
+        batch.work = fieldWork / (int64_t) outputs.size();
         batch.streams = MergeCostModel::TERM_RANGE_STREAMS;
         batch.name = std::string((std::string_view) outputFieldInfo->fieldname)
             + "#" + std::to_string(i);
@@ -1677,7 +1699,7 @@ private:
         auto coordinator = std::make_shared<PartitionCoordinator>(
             *this, admissionDriver, std::move(mergeFieldInfos),
             std::move(*rangePlan), allFlags);
-        coordinator->start(coordinator, admission);
+        coordinator->start(coordinator, admission, batch.work);
         return;
       }
       if (!admission.repriceRam(serialCost)) std::unreachable();
