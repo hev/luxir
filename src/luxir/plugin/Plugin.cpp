@@ -47,11 +47,14 @@ const StorageRegistry& globalStorageRegistry() { return Registries::global().sto
 
 const CollationRegistry& globalCollationRegistry() { return Registries::global().collation; }
 
+const FieldTypeRegistry& globalFieldTypeRegistry() { return Registries::global().fieldTypes; }
+
 void Registries::freeze() {
   plugins.freeze();
   analysis.freeze();
   storage.freeze();  // storage backends and layers
   collation.freeze();
+  fieldTypes.freeze();
   query.freeze();
   searchOps.freeze();
   http.freeze();
