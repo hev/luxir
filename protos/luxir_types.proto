@@ -1149,7 +1149,6 @@ message CollectionCommit {
   Error error = 3;
 }
 
-// Index or delete documents, with an optional commit.
 // A family replacement is atomic and assigns a new family token.
 message FamilyUpdate {
   Map parent = 1;
@@ -1166,6 +1165,7 @@ message ChildUpdate {
   repeated string delete_ids = 5;
 }
 
+// Index or delete documents and families, with an optional commit.
 message UpdateRequest {
   // Optional opaque identifier, echoed in the response for correlation.
   string request_id = 1;
