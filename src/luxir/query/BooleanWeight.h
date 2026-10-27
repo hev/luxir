@@ -8684,8 +8684,32 @@ class BooleanQuery::Weight final : public Query::Weight {
       return optionalCost(costs, minShouldMatch, maxDoc);
     }
 
+    // Fraction of the segment matching an optional group under child
+    // independence. Adds the children's work and yield knowledge to work; a
+    // minimum-should-match cap bounds the group but does not estimate it.
+    static double optionalYield(std::span<Query::ScorerSupplier* const> optional,
+                                int minShouldMatch, int32_t maxDoc, MembershipWork& work) {
+      double universe = (double)std::max(1, maxDoc);
+      double missing = 1;
+      double sum = 0;
+      for (auto* child : optional) {
+        if (child == nullptr) continue;
+        auto childWork = child->membershipWork(maxDoc);
+        missing *= 1 - childWork.matches / universe;
+        sum += childWork.matches;
+        work.addWork(childWork);
+        work.knownMatches &= childWork.knownMatches;
+      }
+      double yield = 1 - missing;
+      if (minShouldMatch > 1) {
+        yield = std::min(yield, sum / minShouldMatch / universe);
+        work.knownMatches = false;
+      }
+      return yield;
+    }
+
     MembershipWork membershipWork(int32_t maxDoc) override {
-      MembershipWork work{(double)maxDoc, 0, 0, 42, 128};
+      MembershipWork work{(double)maxDoc, 0, 0, 42, 128, 0, true};
       double universe = (double)std::max(1, maxDoc);
       bool required = !mandatoryShapeSuppliers.empty() || !filterSuppliers.empty();
       auto intersect = [&](auto suppliers) {
@@ -8694,29 +8718,20 @@ class BooleanQuery::Weight final : public Query::Weight {
           auto childWork = child->membershipWork(maxDoc);
           work.matches *= childWork.matches / universe;
           work.addWork(childWork);
+          work.knownMatches &= childWork.knownMatches;
         }
       };
       intersect(mandatoryShapeSuppliers);
       intersect(filterSuppliers);
       if (!required || minShouldMatch > 0) {
-        double missing = 1;
-        double sum = 0;
-        for (auto* child : optionalShapeSuppliers) {
-          if (child == nullptr) continue;
-          auto childWork = child->membershipWork(maxDoc);
-          missing *= 1 - childWork.matches / universe;
-          sum += childWork.matches;
-          work.addWork(childWork);
-        }
-        double optional = universe * (1 - missing);
-        if (minShouldMatch > 1) optional = std::min(optional, sum / minShouldMatch);
-        work.matches *= optional / universe;
+        work.matches *= optionalYield(optionalShapeSuppliers, minShouldMatch, maxDoc, work);
       }
       for (auto* child : prohibitedShapeSuppliers) {
         if (child == nullptr) continue;
         auto childWork = child->membershipWork(maxDoc);
         work.matches *= 1 - childWork.matches / universe;
         work.addWork(childWork);
+        work.knownMatches &= childWork.knownMatches;
       }
       // Child independence is a yield prior, never a membership claim.
       // Round observations replace it when correlation makes it optimistic.
@@ -9581,6 +9596,25 @@ class BooleanQuery::Weight final : public Query::Weight {
           // Nested seek producers retain their own span-scaled local demand.
           entry.buildContext.demand.candidates = std::min(
               entry.buildContext.demand.candidates, bulkContext.expectedConsumption.candidates);
+          // Survivors of the entries ahead, scaled to the consumer exposure
+          // like the lead's candidates; unknown when any yield is unknown.
+          double universe = (double)std::max(1, segment.maxDoc());
+          double survivors = std::min(1.0,
+              (double)bulkContext.expectedConsumption.span / universe) * universe;
+          MembershipWork ahead{0, 0, 0, 0, 0, 0, true};
+          for (size_t j = 0; j < i; j++) {
+            if (entries[j].optionalGroup) {
+              survivors *= optionalYield(optionalSuppliers, minShouldMatch, segment.maxDoc(), ahead);
+              continue;
+            }
+            auto work = entries[j].supplier->membershipWork(segment.maxDoc());
+            survivors *= work.matches / universe;
+            ahead.knownMatches &= work.knownMatches;
+          }
+          auto& entryDemand = entry.buildContext.demand;
+          entryDemand.expectedCandidates = ahead.knownMatches
+              ? std::min(survivors, (double)entryDemand.candidates) : -1;
+          entryDemand.precedingAlignments = (double)(i - 1) * (double)entryDemand.candidates;
           if (control != nullptr) {
             if (!control->consumption.empty()) {
               entry.buildContext.membershipConsumption = control->consumption[entry.order];

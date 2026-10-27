@@ -1532,13 +1532,52 @@ public:
           return {selectProducer(context.expectedSpan).arm, Consumption::WINDOWS};
         }
         Production producer = selectProducer(demand.span);
-        const auto& costs = column();
-        int64_t candidates = reader.multiValued() ? demand.candidates
-            : std::min<int64_t>(demand.candidates, costs.possibleDocs);
-        if ((double)candidates < producer.work) {
+        if (eitherVerifies(demand, producer)) {
           return {ScorerArm::SPARSE_VERIFY, Consumption::CANDIDATES};
         }
         return {producer.arm, Consumption::WINDOWS};
+      }
+
+      // EITHER: verify the incoming candidates against the column, or produce
+      // the range and intersect it in windows. Both sides are priced in point
+      // emissions (decoding one matching point into the result), from exact
+      // counts and no codec headers. VERIFY_POINTS prices one verified
+      // survivor, ZERO_WORD_POINTS zeroing one bitset word, and
+      // TAIL_ALIGNMENT_POINTS each lead candidate a producer rejects before a
+      // sibling ahead of this entry aligns it. Fitted on forced-arm boards
+      // (5M docs, single segment, hugin, 2026-10-27); the optimum is flat for
+      // VERIFY_POINTS 16-28. Without a survivor estimate (a phrase body, whose
+      // verifier runs after positional confirmation) a raw candidate keeps the
+      // kPointsVerifyWeight price. Column producers keep their candidate-unit
+      // quote.
+      static constexpr double VERIFY_POINTS = 24;
+      static constexpr double ZERO_WORD_POINTS = 1;
+      static constexpr double TAIL_ALIGNMENT_POINTS = 4;
+
+      bool eitherVerifies(const Query::Demand& demand, const Production& producer) const {
+        const auto& costs = column();
+        int64_t candidates = reader.multiValued() ? demand.candidates
+            : std::min<int64_t>(demand.candidates, costs.possibleDocs);
+        if (producer.arm != ScorerArm::POINTS) return (double)candidates < producer.work;
+        double maxDoc = (double)std::max(1, segment.maxDoc());
+        double verify = (double)kPointsVerifyWeight * (double)candidates;
+        if (demand.expectedCandidates >= 0) {
+          double survivors = std::min(demand.expectedCandidates, (double)demand.candidates);
+          // A single-valued verifier's proof skips candidates outside the
+          // docs that can match.
+          if (!reader.multiValued() && costs.hasOutside) survivors *= costs.possibleDocs / maxDoc;
+          verify = VERIFY_POINTS * survivors + TAIL_ALIGNMENT_POINTS
+              * demand.precedingAlignments * (1 - (double)pointValueCount / maxDoc);
+        }
+        bool complement = useComplement(pointValueCount);
+        double produce = complement ? (double)(points->pointCount() - pointValueCount)
+            : (double)pointValueCount;
+        if (complement || PointsMaterialize::useBitset(pointValueCount, segment.maxDoc())) {
+          // The complement also fills the base set before clearing.
+          produce += (complement ? 2 : 1) * ZERO_WORD_POINTS
+              * (double)FixedBitSet::sizeInWords(segment.maxDoc());
+        }
+        return verify < produce;
       }
 
       static Query::ScorerShape shapeFor(
@@ -1714,7 +1753,7 @@ public:
         // bounded demand. Only a resolved materialized supplier can claim the
         // cheaper retained-set price; this prior must cover either arm.
         double production = 64.0 * reader.numValues();
-        return {estimatedMatches(), production, 0, 64, 192};
+        return {estimatedMatches(), production, 0, 64, 192, 0, true};
       }
 
       std::optional<MembershipQuote> quoteMembership(

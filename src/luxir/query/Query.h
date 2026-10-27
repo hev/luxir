@@ -548,6 +548,13 @@ public:
     int64_t candidates = std::numeric_limits<int64_t>::max();
     int64_t span = std::numeric_limits<int64_t>::max();
     ExecutionUse horizon = ExecutionUse::PULL;
+    // A conjunction entry's expected incoming survivors (the independence
+    // yield of the entries ahead of it), or -1 when not supplied. candidates
+    // stays the lead's opportunity count.
+    double expectedCandidates = -1;
+    // Lead candidates times the siblings aligned ahead of this entry: the
+    // alignment an early producer spares and a late verifier cannot.
+    double precedingAlignments = 0;
 
     // Child opportunities precede sibling rejection. Scale a child's own
     // full-domain estimate by the original consumer exposure, not final K.
@@ -891,6 +898,9 @@ public:
       // routes earn no production credit; a parent cannot sum child credits
       // because candidate-driven execution may never produce their full dfs.
       double savedProduce = 0;
+      // Whether matches estimates the supplier's yield. Otherwise it is only
+      // an opportunity bound (a phrase's cheapest term, a capped threshold).
+      bool knownMatches = false;
 
       void addWork(const MembershipWork& child) {
         produce += child.produce;
@@ -910,7 +920,7 @@ public:
       double matches = (double)std::min<int64_t>(cost(), maxDoc);
       // Unknown producers get a conservative scalar-verification price.
       // Materialized membership has no verifier or postings-prefix restart.
-      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64};
+      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64, 0, true};
       return {matches, 128.0 * maxDoc, 0, 1024, 256};
     }
 

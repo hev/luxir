@@ -3,6 +3,7 @@
 
 #include "luxir/query/BooleanWeight.h"
 #include "luxir/query/NumericPredicateQuery.h"
+#include "luxir/query/PhraseQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
@@ -344,6 +345,94 @@ TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
           IntColReader::Iterator>*>(scorer));
     }
   }
+}
+
+TEST_F(RangeFilterTest, EitherPricesPointProductionAgainstSurvivorVerification) {
+  // Half the docs: 16,384 points into a 512-word bitset, 16,896 point
+  // emissions against 24 per verified survivor and 4 per spared alignment.
+  // Unknown survivors keep 8 per raw candidate.
+  struct Case {
+    int64_t candidates;
+    double survivors;
+    double alignments;
+    bool verifies;
+  };
+  NumericPredicateQuery range("points_i", 0, N - 1);
+  for (auto [candidates, survivors, alignments, verifies] : {
+           Case{1000, 1000, 0, false}, Case{1000, 100, 0, true},
+           Case{600, 600, 0, true}, Case{600, 600, 1800, false},
+           Case{1000, -1, 0, true}, Case{3000, -1, 0, false}}) {
+    SCOPED_TRACE(::testing::Message() << candidates << " " << survivors << " " << alignments);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    ASSERT_EQ(N / 2, supplier->cost());
+    auto demand = Query::Demand::fromCandidatesAndSpan(candidates, N, Use::COUNT_WINDOWS);
+    demand.expectedCandidates = survivors;
+    demand.precedingAlignments = alignments;
+    auto build = supplier->makePlanContext(demand);
+    build.membershipConsumption = Consumption::EITHER;
+    EXPECT_EQ(verifies ? Consumption::CANDIDATES : Consumption::WINDOWS,
+              supplier->describeScorer(build).membershipConsumption);
+  }
+}
+
+TEST_F(RangeFilterTest, EitherProducesBroadUnionsAndVerifiesRareOnes) {
+  NumericPredicateQuery range("points_i", 0, N - 1);
+  auto has = [](std::string_view term, int32_t doc) {
+    if (term == "a") return doc % 64 == 0;
+    if (term == "c") return doc % 64 == 1 || doc % 128 == 0;
+    if (term == "rare") return doc % 2048 == 0;
+    return doc % 256 == 0;  // threshold
+  };
+  struct Case {
+    std::string_view x, y;
+    bool verifies;
+  };
+  for (auto [x, y, verifies] : {Case{"a", "c", false}, Case{"rare", "threshold", true}}) {
+    SCOPED_TRACE(::testing::Message() << x << " " << y);
+    TermQuery first("body_w", x), second("body_w", y);
+    std::array<Query*, 2> optional{&first, &second};
+    std::array<Query*, 1> filters{&range};
+    BooleanQuery query({}, optional, {}, filters, 1);
+    std::vector<int32_t> expected;
+    for (int32_t doc = 0; doc < N; doc++) {
+      if ((has(x, doc) || has(y, doc)) && 2 * ((doc * 1543) % N) < N) expected.push_back(doc);
+    }
+    SkipStatsScope stats;
+    EXPECT_EQ(expected, membership(query, Use::COUNT_WINDOWS));
+    EXPECT_EQ(verifies ? 1 : 0, SkipStats::numericPredicateSparseVerifyArms);
+    EXPECT_EQ(verifies ? 0 : 1, SkipStats::numericPredicatePointsArms);
+  }
+}
+
+TEST_F(RangeFilterTest, MembershipYieldIsKnownOnlyWhereEstimated) {
+  // EITHER prices survivors only from known yields; a phrase's cheapest term
+  // and a minimum-should-match cap bound their matches without estimating them.
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto& segment = reader->segments()[0];
+  auto known = [&](Query& query) {
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, segment);
+    EXPECT_NE(nullptr, supplier);
+    return supplier != nullptr && supplier->membershipWork(N).knownMatches;
+  };
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<std::string_view, 2> terms{"dense_a", "dense_b"};
+  std::array<int32_t, 2> positions{0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  NumericPredicateQuery range("points_i", 0, N - 1);
+  std::array<Query*, 2> pair{&a, &c}, withPhrase{&a, &phrase};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery conjunction(pair, {}, {}, filters), phraseConjunction(withPhrase, {}, {}, {});
+  BooleanQuery union1({}, pair, {}, filters, 1), union2({}, pair, {}, {}, 2);
+  EXPECT_TRUE(known(a));
+  EXPECT_TRUE(known(range));
+  EXPECT_FALSE(known(phrase));
+  EXPECT_TRUE(known(conjunction));
+  EXPECT_FALSE(known(phraseConjunction));
+  EXPECT_TRUE(known(union1));
+  EXPECT_FALSE(known(union2));
 }
 
 TEST_F(RangeFilterTest, ProofsSkipProductionInDenseAndSparseMembership) {
