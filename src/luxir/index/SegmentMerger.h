@@ -1170,6 +1170,9 @@ private:
     struct TermsEnumIdx {
       TermsEnum tenum;
       size_t idx;
+      // tenum.termPrefixKey(), refreshed whenever tenum moves: most queue
+      // comparisons are decided by it without touching the terms.
+      unsigned __int128 key = 0;
     };
     std::vector<TermsEnumIdx> tenums;
     tenums.reserve(compactFields.size());
@@ -1183,11 +1186,13 @@ private:
       bool positioned = lower.has_value()
           ? tenums.back().tenum.seekCeil(*lower) : tenums.back().tenum.nextTerm();
       if (positioned && (!upper.has_value() || tenums.back().tenum.term() < *upper)) {
+        tenums.back().key = tenums.back().tenum.termPrefixKey();
         tenumPtrs.push_back(&tenums.back());
       }
     }
 
     auto termCmp = [](const TermsEnumIdx& a, const TermsEnumIdx& b) {
+      if (a.key != b.key) return b.key < a.key;
       int cmp = b.tenum.term() <=> a.tenum.term();
       return cmp < 0 || (cmp == 0 && b.idx < a.idx);
     };
@@ -1198,6 +1203,7 @@ private:
       TermsEnumIdx& first = termPQ.top();
       PackedTerm term(termBuf);
       first.tenum.term().copyTo(term);
+      auto termKey = first.key;
       int64_t termOrd = textWriter.startTerm(term);
 
       do {
@@ -1224,11 +1230,13 @@ private:
 
         bool next = entry.tenum.nextTerm();
         if (next && (!upper.has_value() || entry.tenum.term() < *upper)) {
+          entry.key = entry.tenum.termPrefixKey();
           termPQ.updateTop();
         } else {
           termPQ.removeTop();
         }
-      } while (termPQ.size() > 0 && termPQ.top().tenum.term() == term);
+      } while (termPQ.size() > 0 && termPQ.top().key == termKey &&
+               termPQ.top().tenum.term() == term);
 
       textWriter.endTerm(term);
       onTerm();

@@ -334,6 +334,20 @@ public:
     return currTerm;
   }
 
+  /// The first 16 bytes of term() as a big-endian integer, zero padded: where
+  /// two keys differ they order the terms, and equal keys need a full compare.
+  /// A short term's load runs into the buffer's COPY_SLACK.
+  unsigned __int128 termPrefixKey() const {
+    const char* data = currTerm.data();
+    uint64_t hi, lo;
+    memcpy(&hi, data, 8);
+    memcpy(&lo, data + 8, 8);
+    auto key = ((unsigned __int128) std::byteswap(hi) << 64) | std::byteswap(lo);
+    uint32_t len = currTerm.size();
+    if (len < 16) key &= ~(~(unsigned __int128) 0 >> (8 * len));
+    return key;
+  }
+
   /// Byte length of term().  Same value as term().size(), but read from a
   /// member rather than from the length byte the term reconstruction just
   /// wrote, so per-term consumers do not pay a store-to-load round trip
