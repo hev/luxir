@@ -356,6 +356,9 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       bool dispatchCompletion = true;
       // Delete passes share this serial node with commits, not their metrics.
       MetricScope metric(*metrics, metricActivity(msg->applyOnly ? MetricStage::DELETE_PASS : MetricStage::COMMIT));
+      // Read before the body: a max_segments commit hands msg to the force
+      // merge, which may complete and free it concurrently.
+      bool forceIntent = !msg->applyOnly && !msg->publishOnly && msg->maxSegments > 0;
       try {
         if (msg->applyOnly) this->deletePassBody();
         else dispatchCompletion = this->finishCommitBody(*msg);
@@ -370,6 +373,11 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         std::runtime_error error("Unknown non-standard exception while committing");
         LOG_ERROR("finishCommitBody Exception Caught: exception={}", error.what());
         msg->result.setException(error);
+      }
+      if (forceIntent) {
+        const std::lock_guard<std::mutex> lock(indexMutex);
+        forceMergeIntents--;
+        _resumePolicyMergesLocked();
       }
 
       metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
@@ -612,9 +620,21 @@ void IndexWriter::completeForceMerge(MergeMessage& msg) {
     assert(activeForceMerge == origin);
     activeForceMerge = nullptr;
     _activateNextForceMergeLocked(completedOrigins);
+    _resumePolicyMergesLocked();
   }
 
   completeForceMergeOrigins(completedOrigins);
+}
+
+// Caller must hold indexMutex.  Flushes that landed while a pending force
+// merge held policy merges off submitted none, so check every level after.
+void IndexWriter::_resumePolicyMergesLocked() {
+  if (_forceMergePendingLocked()) return;
+  try {
+    mergePolicy->_maybeMergeSegments(nullptr);
+  } catch (const std::exception& e) {
+    LOG_ERROR("Policy merge resume failed: exception={}", e.what());
+  }
 }
 
 // Returns true when the merge message itself should be completed by the merge
@@ -1173,6 +1193,9 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
       }
     }
     commitNumber++;
+    // Flushes this commit started complete under indexMutex, so none can
+    // reach the merge policy before the intent is visible.
+    if (msg.maxSegments > 0) forceMergeIntents++;
   } // end mutex protected section
 }
 

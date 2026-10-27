@@ -299,7 +299,7 @@ public:
       {
         // const std::lock_guard<std::mutex> lock(iw.indexMutex);
         mergeLevel = _update(seg);
-        if (mergeLevel < 0 || outstandingMerges > 0) {
+        if (mergeLevel < 0 || outstandingMerges > 0 || iw._forceMergePendingLocked()) {
           return false;
         }
       }
@@ -367,6 +367,16 @@ public:
   // is completed.  Protected by indexMutex.
   std::deque<UpdateMessage*> pendingForceMerges;
   UpdateMessage* activeForceMerge = nullptr;
+  // max_segments commits from initiation through their commit body.  Until a
+  // force merge is in the (serial) merge queue, policy merges hold off: one
+  // queued ahead of it, e.g. started by the commit's own flushes, would rewrite
+  // segments the force merge rewrites again.  Policy merges submitted after it
+  // run after it.  Protected by indexMutex.
+  int32_t forceMergeIntents = 0;
+
+  bool _forceMergePendingLocked() const {
+    return forceMergeIntents > 0 || !pendingForceMerges.empty();
+  }
 
   // The last updateNumber generated (the first update number generated will be 1).
   // Only ever advanced from startUpdateBody, whose node has concurrency 1, so the
@@ -786,6 +796,7 @@ private:
   void completeForceMergeOrigins(const std::vector<UpdateMessage*>& origins);
   void enqueueForceMerge(UpdateMessage& origin);
   void completeForceMerge(MergeMessage& msg);
+  void _resumePolicyMergesLocked();
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
