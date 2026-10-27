@@ -13,6 +13,8 @@
 #include "test/SegmentTest.h"
 #include "test/TestIndex.h"
 
+#include <oneapi/tbb/task_arena.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -398,9 +400,16 @@ SegFieldInfo buildSparseRanges(TestIndex& index, const std::shared_ptr<Schema>& 
   return readBodyInfo(index.pool, index.reader->segments()[0]);
 }
 
+// The checkout barriers hold all four range streams at once; with fewer
+// concurrent merge workers they would spin forever.
+bool canHoldFourRanges() {
+  return oneapi::tbb::this_task_arena::max_concurrency() >= 4;
+}
+
 } // namespace
 
 TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
+  if (!canHoldFourRanges()) GTEST_SKIP() << "needs >= 4 TBB workers";
   auto schema = textSchema();
   TestIndex serial;
   TestIndex partitioned;
@@ -510,6 +519,7 @@ TEST(TermPartitionMergeTest, SampledBlockEstimatesCoverTheirBlocks) {
 }
 
 TEST(TermPartitionMergeTest, EmptyRangesAreOmitted) {
+  if (!canHoldFourRanges()) GTEST_SKIP() << "needs >= 4 TBB workers";
   auto schema = textSchema();
   TestIndex oneRange;
   std::atomic<int32_t> checkedOut = 0;
