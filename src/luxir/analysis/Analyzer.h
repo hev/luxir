@@ -284,11 +284,16 @@ public:
 // must be constructed with stateful=true.
 std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer();
 std::unique_ptr<TokenStream> makeNfkcCasefoldFilter(std::unique_ptr<TokenStream> source);
-// Fused unicode_word + nfkc_cf: UAX#29 segmentation with per-token NFKC_CF in one
-// stage. createAnalyzer swaps this in when it sees that canonical pair, so the
-// common default avoids the extra filter hop. Equivalent output (see AnalysisTest).
-// foldAccents additionally fuses a following `fold` filter (the _t chain).
-std::unique_ptr<Tokenizer> makeStandardTokenizer(bool foldAccents = false);
+// The leading case filter a unicode_word tokenizer fuses: lowercase, nfkc_cf,
+// or nfkc_cf followed by fold (the _t chain).
+enum class WordFold : uint8_t { NONE, LOWERCASE, NFKC_CF, NFKC_CF_ACCENTS };
+// unicode_word with its case filter in one stage. createAnalyzer swaps this in
+// when it sees unicode_word followed by lowercase or nfkc_cf, so those chains
+// avoid the extra filter hop. Equivalent output (see AnalysisTest).
+std::unique_ptr<Tokenizer> makeStandardTokenizer(WordFold fold = WordFold::NFKC_CF);
+// unicode_word straight over uni-algo, without the ASCII fast paths: the
+// conformance oracle for tests.
+std::unique_ptr<Tokenizer> makeReferenceWordTokenizer();
 // Accent/diacritic folding (cafe == cafe-with-accent). Lossy and language-
 // dependent, so it is a separate opt-in filter applied after nfkc_cf.
 std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> source);
@@ -424,6 +429,9 @@ public:
   // tokenizer folds only its non-ASCII tokens, skipping a filter hop and a
   // per-token scan on everything else.
   const bool fusedFold;
+  // unicode_word + lowercase fuses the same way: ASCII lowercases in one bulk
+  // pass, and only non-ASCII tokens pay for Unicode lowercase.
+  const bool fusedLowercase;
   const bool stateful;  // some stage buffers state across tokens: chains reset() per value
 
   // An absent tokenizer means "whitespace".  Throws std::invalid_argument with a
