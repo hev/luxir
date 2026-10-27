@@ -378,9 +378,9 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   index.flush();
   index.initReader();
 
-  auto makeFilter = [&](MemPool& pool) {
-    Query::Context context(pool, *index.reader);
-    NumericPredicateQuery query("window_i", 1, 1);
+  // Scorers classify blocks lazily, so the query and context must outlive them.
+  NumericPredicateQuery query("window_i", 1, 1);
+  auto makeFilter = [&](MemPool& pool, Query::Context& context) {
     auto* weight = static_cast<NumericPredicateQuery::Weight*>(
         query.createWeight(context, 0));
     auto* scorer = weight->createZoneMapScorerForTests(
@@ -394,7 +394,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   };
 
   MemPool fillPool;
-  WindowFilter fill(fillPool, makeFilter(fillPool));
+  Query::Context fillContext(fillPool, *index.reader);
+  WindowFilter fill(fillPool, makeFilter(fillPool, fillContext));
   int32_t start = IntColReader::BLOCK_SIZE - DocsEnumMeta::L1_DOCS / 2;
   int32_t end = start + DocsEnumMeta::L1_DOCS;
   fill.prepare(start, end);
@@ -403,7 +404,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
   }
 
   MemPool probePool;
-  WindowFilter probe(probePool, makeFilter(probePool), true);
+  Query::Context probeContext(probePool, *index.reader);
+  WindowFilter probe(probePool, makeFilter(probePool, probeContext), true);
   for (int32_t doc = 0; doc < nDocs; doc += 7) {
     EXPECT_EQ(probe.acceptsProbe(doc), expected(doc)) << "doc=" << doc;
   }
