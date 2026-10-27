@@ -86,6 +86,10 @@ class TermsEnum {
   uint32_t posOffRunLen = 0;
   uint32_t termImpactRunLen = 0;
   uint32_t pulsedRunLen = 0;
+  // Start of term impactCursorOrd's frontier in termImpactRun, so in-order
+  // access skips one frontier per term instead of all earlier ones.
+  const char* impactCursor = nullptr;
+  int32_t impactCursorOrd = 0;
 
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> packedBlockCounts{};
@@ -414,12 +418,18 @@ public:
       return {};
     }
     parseMetadataRuns();
-    const char* p = termImpactRun;
+    if (impactCursorOrd > ordInBlock) {
+      impactCursor = termImpactRun;
+      impactCursorOrd = 0;
+    }
+    const char* p = impactCursor;
     const char* end = termImpactRun + termImpactRunLen;
-    for (int32_t t = 0; t < ordInBlock; t++) {
+    for (int32_t t = impactCursorOrd; t < ordInBlock; t++) {
       skipEncodedImpactFrontier(p, end);
     }
     const char* start = p;
+    impactCursor = start;
+    impactCursorOrd = ordInBlock;
     skipEncodedImpactFrontier(p, end);
     assert(p <= end);
     return {start, (uint32_t) (p - start)};
@@ -540,6 +550,8 @@ protected:
     } else {
       termImpactRun = nullptr;
     }
+    impactCursor = termImpactRun;
+    impactCursorOrd = 0;
     pulsedRun = p;
     p += pulsedRunLen;
     assert(p <= blockEnd);
