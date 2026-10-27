@@ -899,7 +899,9 @@ can be named when it declares a sort proxy field.
   compressed chunks (or streamed); other sources are decoded once into
   scratch, which spills to an unnamed temporary file in the data directory
   past 32 MiB. Interleaving sources also splits their request-version runs,
-  so a sorted segment's `_version_` bookkeeping takes more space.
+  so a sorted segment's `_version_` bookkeeping takes more space: when the
+  sort scatters arrival order, about log2(indexing requests) bits per
+  document (one byte per document for 200 requests).
 - A `mode=set` request without `index_sort` keeps the current setting;
   `{"index_sort": {}}` clears it, and `mode=replace_all` without it clears it
   (the response then carries an `index_sort_cleared` warning).
