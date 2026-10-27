@@ -447,11 +447,134 @@ public:
     }
   };
 
+  // Query-local execution metadata. Neither construction nor planning touches
+  // the blocks. Producers and the compact rejection index share the same
+  // refinement on first executing use.
+  class BlockPlans {
+    MemPool& pool;
+    IntColReader& reader;
+    const NumericPredicateQuery& query;
+    std::span<BlockPlan> plans;
+    bool complete = false;
+
+  public:
+    BlockPlans(MemPool& pool, IntColReader& reader,
+               const NumericPredicateQuery& query)
+        : pool(pool), reader(reader), query(query) {}
+
+    std::span<const BlockPlan> all() {
+      if (!complete) {
+        // Construct in place: classifyBlock's narrow stores followed by a
+        // whole-plan assignment cause store/reload stalls on broad execution.
+        size_t count = (size_t)reader.numBlocks();
+        auto* storage = (BlockPlan*)pool.alloc(count * sizeof(BlockPlan), alignof(BlockPlan));
+        plans = {storage, count};
+        for (int64_t block = 0; block < reader.numBlocks(); block++) {
+          new (storage + block) BlockPlan(query.classifyBlock(reader, block));
+          skipCount(SkipStats::numericPredicateClassifiedBlocks);
+        }
+        complete = true;
+      }
+      return plans;
+    }
+  };
+
   class ColumnProof final : public Query::MembershipProof {
+    MemPool& pool;
+    IntColReader& reader;
+    const NumericPredicateQuery& query;
+    BlockPlans& plans;
+    bool fullIndex;
+    bool indexed = false;
     std::span<Range> outside;
     size_t cursor = 0;
+    screaming::BitSet::Selector* selector = nullptr;
+
+    void ensureSelector() {
+      if (selector == nullptr && !reader.denseDocsWithValue()) {
+        const auto& bits = reader.docsWithValueBitSet();
+        selector = pool.make<screaming::BitSet::Selector>(
+            bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
+      }
+    }
+
+    int32_t docForRank(int32_t rank) {
+      if (rank >= reader.docsWithValue()) return PostingsReader::END;
+      return selector == nullptr ? rank : selector->select(rank);
+    }
+
+    Range localRange(int32_t target) {
+      ensureSelector();
+      int32_t rank = target;
+      if (selector != nullptr) {
+        screaming::BitSet::Iterator iter(reader.docsWithValueBitSet());
+        target = iter.advance(target);
+        if (target == screaming::BitSet::END) return {PostingsReader::END, PostingsReader::END};
+        rank = iter.rank();
+      }
+      while (rank < reader.docsWithValue()) {
+        int64_t block = rank / IntColReader::BLOCK_SIZE;
+        NumBlockZone zone = reader.blockZone(block);
+        int64_t endRank = (block + 1) * IntColReader::BLOCK_SIZE;
+        bool possible = query.intersects(zone.min, zone.max);
+        if (possible && !query.covers(zone.min, zone.max)) {
+          // Sparse use needs only a local rejection bound. Crossing leaves
+          // remain possible; the candidate verifier handles their values.
+          int64_t leaf = rank / NumColumnFormat::LEAF_ZONE_SIZE;
+          zone = reader.leafMeta().leafZone(leaf);
+          possible = query.intersects(zone.min, zone.max);
+          endRank = (leaf + 1) * NumColumnFormat::LEAF_ZONE_SIZE;
+        }
+        int32_t end = (int32_t)std::min<int64_t>(reader.numValues(), endRank);
+        if (possible) return {target, docForRank(end)};
+        rank = end;
+        target = docForRank(rank);
+      }
+      return {PostingsReader::END, PostingsReader::END};
+    }
+
+    void buildIndex() {
+      ensureSelector();
+      boost::container::small_vector<Range, 8> ranges;
+      auto refined = plans.all();
+      for (int64_t block = 0; block < reader.numBlocks(); block++) {
+        const auto& plan = refined[(size_t)block];
+        uint32_t count = (uint32_t)reader.valuesInBlock(block);
+        plan.forEachRun(count, [&](BlockRelation relation, uint32_t begin, uint32_t end) {
+          if (relation != BlockRelation::OUTSIDE) return;
+          int32_t base = (int32_t)(block * IntColReader::BLOCK_SIZE);
+          Range range{base + (int32_t)begin, base + (int32_t)end};
+          if (!ranges.empty() && ranges.back().end == range.begin) ranges.back().end = range.end;
+          else ranges.push_back(range);
+        });
+      }
+      if (selector != nullptr) {
+        int32_t first = selector->select(0);
+        for (auto& range : ranges) {
+          if (range.begin != 0) range.begin = docForRank(range.begin);
+          range.end = docForRank(range.end);
+        }
+        if (first > 0 && (ranges.empty() || ranges.front().begin > 0)) {
+          ranges.insert(ranges.begin(), Range{0, first});
+        }
+      } else if (!ranges.empty() && ranges.back().end == reader.numValues()) {
+        ranges.back().end = PostingsReader::END;
+      }
+      int32_t afterLast = selector == nullptr ? (int32_t)reader.numValues()
+          : selector->select(reader.docsWithValue() - 1) + 1;
+      if ((ranges.empty() || ranges.back().end != PostingsReader::END)
+          && afterLast < PostingsReader::END) {
+        ranges.push_back({afterLast, PostingsReader::END});
+      }
+      outside = pool.make_span<Range>(ranges.size());
+      std::copy(ranges.begin(), ranges.end(), outside.begin());
+      indexed = true;
+      skipCount(SkipStats::numericPredicateProofIndexes);
+    }
 
     Range nextRange(int32_t target) override {
+      if (!fullIndex) return localRange(target);
+      if (!indexed) buildIndex();
       if (cursor > 0 && target < outside[cursor - 1].end) cursor = 0;
       cursor = (size_t)screaming::gallopLowerBound(
           (int64_t)cursor, (int64_t)outside.size(), target + 1,
@@ -464,46 +587,9 @@ public:
 
   public:
     ColumnProof(MemPool& pool, IntColReader& reader,
-                std::span<const BlockPlan> plans, const uint64_t* outsideBlocks) {
+                const NumericPredicateQuery& query, BlockPlans& plans, bool fullIndex)
+        : pool(pool), reader(reader), query(query), plans(plans), fullIndex(fullIndex) {
       assert(!reader.multiValued());
-      boost::container::small_vector<Range, 8> ranges;
-      for (int64_t word = 0; word < (reader.numBlocks() + 63) / 64; word++) {
-        for (uint64_t bits = outsideBlocks[word]; bits != 0; bits &= bits - 1) {
-          int64_t block = word * 64 + std::countr_zero(bits);
-          const auto& plan = plans[(size_t)block];
-          uint32_t count = (uint32_t)reader.valuesInBlock(block);
-          // Index rejection once. Possible windows then touch no leaf metadata.
-          plan.forEachRun(count, [&](BlockRelation relation, uint32_t begin, uint32_t end) {
-            if (relation != BlockRelation::OUTSIDE) return;
-            int32_t base = (int32_t)(block * IntColReader::BLOCK_SIZE);
-            Range range{base + (int32_t)begin, base + (int32_t)end};
-            if (!ranges.empty() && ranges.back().end == range.begin) ranges.back().end = range.end;
-            else ranges.push_back(range);
-          });
-        }
-      }
-      assert(!ranges.empty());
-      int32_t afterLast = (int32_t)reader.numValues();
-      if (!reader.denseDocsWithValue()) {
-        const auto& bits = reader.docsWithValueBitSet();
-        screaming::BitSet::Selector selector(
-            bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
-        int32_t first = selector.select(0);
-        afterLast = selector.select((int32_t)reader.numValues() - 1) + 1;
-        for (auto& range : ranges) {
-          if (range.begin != 0) range.begin = selector.select(range.begin);
-          range.end = range.end == reader.numValues()
-              ? PostingsReader::END : selector.select(range.end);
-        }
-        if (first > 0 && ranges.front().begin > 0) ranges.insert(ranges.begin(), Range{0, first});
-      } else if (ranges.back().end == reader.numValues()) {
-        ranges.back().end = PostingsReader::END;
-      }
-      if (ranges.back().end != PostingsReader::END && afterLast < PostingsReader::END) {
-        ranges.push_back({afterLast, PostingsReader::END});
-      }
-      outside = pool.make_span<Range>(ranges.size());
-      std::copy(ranges.begin(), ranges.end(), outside.begin());
     }
 
     void reset() override {
@@ -589,37 +675,6 @@ public:
     return plan;
   }
 
-  // Whether the plans hold an INSIDE run, which proves a match.
-  static bool hasInsideRun(const IntColReader& reader,
-                           std::span<const BlockPlan> plans) {
-    for (int64_t blockNum = 0; blockNum < (int64_t)plans.size(); blockNum++) {
-      bool inside = false;
-      plans[(size_t)blockNum].forEachRun(
-          (uint32_t)reader.valuesInBlock(blockNum),
-          [&](BlockRelation relation, uint32_t, uint32_t) {
-            inside |= relation == BlockRelation::INSIDE;
-          });
-      if (inside) return true;
-    }
-    return false;
-  }
-
-  // Each plan is built in its pool slot. Assigning into default-constructed
-  // plans would copy every result through the stack, and the copy's wide
-  // reload stalls on classifyBlock's narrow stores.
-  static std::span<BlockPlan> classifyBlocks(
-      MemPool& pool, const IntColReader& reader,
-      const NumericPredicateQuery& query) {
-    static_assert(std::is_trivially_destructible_v<BlockPlan>);
-    size_t count = (size_t)reader.numBlocks();
-    auto* plans = (BlockPlan*)pool.alloc(
-        count * sizeof(BlockPlan), alignof(BlockPlan));
-    for (size_t i = 0; i < count; i++) {
-      new (plans + i) BlockPlan(query.classifyBlock(reader, (int64_t)i));
-    }
-    return {plans, count};
-  }
-
   class CrossingValues {
     IntColReader& reader;
     int64_t residualStart = -1;
@@ -683,6 +738,7 @@ public:
     static constexpr int32_t ITER_WINDOW_WORDS = ITER_WINDOW_SIZE / 64;
 
     IntColReader& reader;
+    BlockPlans& blockPlans;
     std::span<const BlockPlan> plans;
     screaming::BitSet::Selector* selector = nullptr;
     CrossingValues crossing;
@@ -845,10 +901,10 @@ public:
     }
 
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
-                  std::span<const BlockPlan> plans,
+                  BlockPlans& blockPlans,
                   const NumericPredicateQuery& query,
                   int32_t maxDoc, float constantScore)
-      : Query::ConstantScorer(constantScore), reader(reader), plans(plans),
+      : Query::ConstantScorer(constantScore), reader(reader), blockPlans(blockPlans),
           crossing(reader),
           iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
           query(query), maxDoc(maxDoc), initialMaxDoc(maxDoc) {
@@ -868,6 +924,8 @@ public:
     void fillWindowBits(std::span<uint64_t> words, int32_t min,
                         int32_t max) override {
       assert(min >= 0 && min <= max && max <= maxDoc);
+      if (min == max) return;
+      if (plans.empty()) plans = blockPlans.all();
       if (reader.multiValued()) {
         fillMulti(words, min, max);
       } else {
@@ -1080,37 +1138,6 @@ public:
     IndexReader::FieldSegments segInfos;
     float constantScore;
 
-    static int64_t estimateCost(IntColReader& reader,
-                                std::span<const BlockPlan> plans,
-                                bool exactSet) {
-      int64_t estimate = 0;
-      for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
-        plans[(size_t)blockNum].forEachRun(
-            (uint32_t)reader.valuesInBlock(blockNum),
-            [&](BlockRelation relation, uint32_t begin, uint32_t end) {
-              int64_t count = end - begin;
-              switch (relation) {
-                case BlockRelation::INSIDE:
-                  estimate += count;
-                  break;
-                case BlockRelation::CROSSES:
-                  // A crossing run gives no exact cardinality. A range
-                  // crosses a run at one end and matches part of it, so
-                  // charge the measured half-run heuristic. A value set has
-                  // gaps throughout the run and no comparable midpoint, so
-                  // charge its full value count as a conservative upper
-                  // bound. Points-backed fields replace both with exact
-                  // point ordinal counts below.
-                  estimate += exactSet ? count : (count + 1) / 2;
-                  break;
-                case BlockRelation::OUTSIDE:
-                  break;
-              }
-            });
-      }
-      return std::min<int64_t>(estimate, reader.docsWithValue());
-    }
-
     static size_t fillPointRanges(
         PointsReader& points, const NumericPredicateQuery& query,
         std::span<PointsReader::OrdinalRange> output) {
@@ -1192,12 +1219,8 @@ public:
       IndexReader::Segment& segment;
       IntColReader& reader;
       PointsReader* points;
-      std::span<const BlockPlan> plans;
-      // Only columns need the rejection index; points use ordinal ranges.
-      union {
-        std::span<const PointsReader::OrdinalRange> pointRanges;
-        uint64_t* outsideBlocks;
-      };
+      BlockPlans blockPlans;
+      std::span<const PointsReader::OrdinalRange> pointRanges;
       uint64_t pointValueCount;
       int64_t estimatedCost;
       Query::MatchState matchState;
@@ -1327,7 +1350,7 @@ public:
         if (!useZoneMap) return nullptr;
         skipCount(SkipStats::numericPredicateZoneArms);
         auto* scorer = pool.make<ZoneMapScorer>(
-            pool, reader, plans, weight.query,
+            pool, reader, blockPlans, weight.query,
             segment.maxDoc(), weight.constantScore);
         return pool.make<PredicateBulkScorer>(
             pool, scorer, segment.maxDoc(), weight.constantScore);
@@ -1434,7 +1457,7 @@ public:
           case ScorerArm::ZONE_MAP:
             skipCount(SkipStats::numericPredicateZoneArms);
             return targetPool.make<ZoneMapScorer>(
-                targetPool, reader, plans, weight.query,
+                targetPool, reader, blockPlans, weight.query,
                 segment.maxDoc(), weight.constantScore);
           case ScorerArm::SCAN:
             skipCount(SkipStats::numericPredicateScanArms);
@@ -1459,8 +1482,13 @@ public:
         Query::MembershipProof* buildMembershipProof(MemPool& targetPool) override {
           if (supplier.points != nullptr || supplier.reader.multiValued()
               || !supplier.hasOutside) return nullptr;
+          // A full span alone can describe a handful of scattered candidates.
+          // Reserve whole-column refinement for expected broad block coverage.
+          bool fullIndex = context().demand.span >= supplier.segment.maxDoc()
+              && context().demand.candidates >= supplier.reader.numLeafZones();
           return targetPool.make<ColumnProof>(
-              targetPool, supplier.reader, supplier.plans, supplier.outsideBlocks);
+              targetPool, supplier.reader, supplier.weight.query,
+              supplier.blockPlans, fullIndex);
         }
 
         [[gnu::cold]] bool supportsReset() const noexcept override {
@@ -1494,9 +1522,7 @@ public:
         if (points != nullptr && !reader.multiValued()) {
           return (int64_t)pointValueCount;
         }
-        if (plans.empty()) {
-          plans = classifyBlocks(planPool, reader, weight.query);
-        }
+        auto plans = blockPlans.all();
         CrossingValues crossing(reader);
         if (!reader.multiValued()) {
           int64_t count = 0;
@@ -1532,54 +1558,29 @@ public:
 
     public:
       Supplier(NumericPredicateQuery::Weight& weight, MemPool& planPool,
-               IndexReader::Segment& segment,
-               IntColReader& reader, std::span<const BlockPlan> plans,
+               IndexReader::Segment& segment, IntColReader& reader,
+               NumColumnFormat::LeafMeta::RangeSummary summary,
                int64_t estimatedCost, Query::MatchState matchState,
                bool allMatch, PointsReader* points,
                std::span<const PointsReader::OrdinalRange> pointRanges,
                uint64_t pointValueCount)
-          : weight(weight), planPool(planPool), segment(segment),
-            reader(reader), points(points),
-            plans(plans), pointRanges(pointRanges),
-            pointValueCount(pointValueCount), estimatedCost(estimatedCost),
-            matchState(matchState), allMatch(allMatch), possibleDocs(reader.docsWithValue()) {
-        useZoneMap = false;
+          : weight(weight), planPool(planPool), segment(segment), reader(reader),
+            points(points), blockPlans(planPool, reader, weight.query),
+            pointRanges(pointRanges), pointValueCount(pointValueCount),
+            estimatedCost(estimatedCost), matchState(matchState), allMatch(allMatch),
+            useZoneMap(false), possibleDocs(reader.docsWithValue()) {
         if (points != nullptr) return;
-        outsideBlocks = nullptr;
-        int64_t prunableValues = 0;
-        for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
-          plans[(size_t)blockNum].forEachRun(
-              (uint32_t)reader.valuesInBlock(blockNum),
-              [&](BlockRelation relation, uint32_t begin, uint32_t end) {
-                if (relation == BlockRelation::CROSSES) {
-                  zoneProductionWork += 2.0 * (end - begin);
-                  return;
-                }
-                prunableValues += end - begin;
-                if (relation == BlockRelation::INSIDE) {
-                  zoneProductionWork += (end - begin + 63) / 64;
-                  return;
-                }
-                hasOutside = true;
-                if (!reader.multiValued()) {
-                  possibleDocs -= (int32_t)(end - begin);
-                  if (outsideBlocks == nullptr) {
-                    auto words = planPool.make_span<uint64_t>((size_t)(reader.numBlocks() + 63) / 64);
-                    std::fill(words.begin(), words.end(), 0);
-                    outsideBlocks = words.data();
-                  }
-                  outsideBlocks[blockNum >> 6] |= 1ULL << (blockNum & 63);
-                }
-              });
-        }
-        zoneProductionWork += 8.0 * reader.numBlocks();
+        hasOutside = summary.outside != 0;
+        int64_t prunable = summary.outside + summary.insideLower;
         if (!reader.multiValued()) {
-          insideDocs = (int32_t)(prunableValues - reader.numValues() + possibleDocs);
+          possibleDocs -= (int32_t)summary.outside;
+          insideDocs = (int32_t)summary.insideLower;
         }
+        zoneProductionWork = 2.0 * (reader.numValues() - prunable)
+            + (summary.insideLower + 63) / 64 + 8.0 * reader.numBlocks();
         int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
-        int64_t minPrunable = reader.numValues() / denominator
+        useZoneMap = prunable >= reader.numValues() / denominator
             + (reader.numValues() % denominator != 0);
-        useZoneMap = prunableValues >= minPrunable;
       }
 
       int64_t cost() override { return estimatedCost; }
@@ -1761,7 +1762,7 @@ public:
       int64_t colMax = reader->getMax();
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
 
-      std::span<BlockPlan> plans;
+      NumColumnFormat::LeafMeta::RangeSummary summary;
       bool allMatch = query.covers(colMin, colMax);
       int64_t cost = 0;
       PointsReader* points = nullptr;
@@ -1788,19 +1789,21 @@ public:
         matchState = pointValueCount == 0
             ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else {
-        plans = classifyBlocks(targetPool, *reader, query);
-        cost = estimateCost(*reader, plans, query.isExactSet());
-        bool hasInside = hasInsideRun(*reader, plans);
-        bool hasCrosses = false;
-        for (const BlockPlan& plan : plans) {
-          hasCrosses |= plan.relation == BlockRelation::CROSSES;
+        summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
+        // An exact set's envelope proves rejection, never inclusion in gaps.
+        if (query.isExactSet() && !allMatch) {
+          summary.insideLower = summary.insideUpper = 0;
         }
-        matchState = hasInside ? Query::MatchState::NONEMPTY
-            : hasCrosses ? Query::MatchState::UNKNOWN
-                         : Query::MatchState::EMPTY;
+        int64_t possible = reader->numValues() - summary.outside;
+        int64_t estimate = query.isExactSet() ? possible
+            : summary.insideLower + (possible - summary.insideLower + 1) / 2;
+        cost = std::min<int64_t>(estimate, reader->docsWithValue());
+        matchState = possible == 0 ? Query::MatchState::EMPTY
+            : summary.insideLower > 0 ? Query::MatchState::NONEMPTY
+                                     : Query::MatchState::UNKNOWN;
       }
       return targetPool.make<Supplier>(*this, targetPool, segment, *reader,
-                                       plans, cost, matchState,
+                                       summary, cost, matchState,
                                        allMatch, points, pointRanges,
                                        pointValueCount);
     }
@@ -1857,9 +1860,9 @@ public:
           || query.getHi() < reader->getMin()) {
         return nullptr;
       }
-      auto plans = classifyBlocks(targetPool, *reader, query);
+      auto* plans = targetPool.make<BlockPlans>(targetPool, *reader, query);
       return targetPool.make<ZoneMapScorer>(
-          targetPool, *reader, plans, query,
+          targetPool, *reader, *plans, query,
           segment.maxDoc(), constantScore);
     }
 

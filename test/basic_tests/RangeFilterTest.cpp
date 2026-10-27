@@ -302,6 +302,8 @@ TEST_F(RangeFilterTest, LeadOnlyAndMixedThresholdPlansResetWithFilters) {
 TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   // Scanning a random column costs about as much as verifying most docs.
   // Proofs keep settled-zone skips when sparse candidates are cheaper.
+  // The cheap quote charges crossing leaves even if later rank refinement
+  // can settle them, so the multivalued range also verifies sparse candidates.
   struct Case {
     const char* field;
     int64_t candidates;
@@ -310,7 +312,8 @@ TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   for (auto [field, candidates, verifies] : {Case{"column_i", 64, true},
            Case{"column_i", N * 3 / 10, true}, Case{"column_i", N * 9 / 10, false},
            Case{"cluster_i", 64, true}, Case{"cluster_i", N * 3 / 10, false},
-           Case{"cluster_i", N * 9 / 10, false}, Case{"cluster_is", 64, false}}) {
+           Case{"cluster_i", N * 9 / 10, false}, Case{"cluster_is", 64, true},
+           Case{"cluster_is", N * 3 / 10, false}}) {
     SCOPED_TRACE(::testing::Message() << field << " " << candidates);
     NumericPredicateQuery range(field, 4096, 28671);
     MemPool pool;
@@ -435,6 +438,42 @@ TEST_F(RangeFilterTest, PartlySettledScanSharesProofsWithCandidateConsumption) {
   }
 }
 
+TEST_F(RangeFilterTest, NumericPlansRefineOnlyWhenConsumed) {
+  NumericPredicateQuery range("striped_i", 0, 0);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  SkipStatsScope stats;
+  auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  int64_t cost = supplier->cost();
+  auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(1, N, Use::COUNT_WINDOWS));
+  build.membershipConsumption = Consumption::CANDIDATES;
+  auto* plan = supplier->resolve(pool, build);
+  auto* scorer = plan->build(pool);
+  auto* proof = plan->buildMembershipProof(pool);
+  ASSERT_NE(nullptr, scorer);
+  ASSERT_NE(nullptr, proof);
+  EXPECT_EQ(0, SkipStats::numericPredicateClassifiedBlocks);
+  EXPECT_EQ(0, SkipStats::numericPredicateProofIndexes);
+  EXPECT_EQ(0, proof->nextPossible(0));
+  EXPECT_EQ(1024, proof->nextPossible(512));
+  EXPECT_EQ(0, SkipStats::numericPredicateClassifiedBlocks);
+  EXPECT_EQ(0, SkipStats::numericPredicateProofIndexes);
+  proof->reset();
+  EXPECT_EQ(0, proof->nextPossible(0));
+
+  build.demand = Query::Demand::fromCandidatesAndSpan(N, N, Use::COUNT_WINDOWS);
+  auto* full = supplier->resolve(pool, build)->buildMembershipProof(pool);
+  ASSERT_NE(nullptr, full);
+  EXPECT_EQ(0, SkipStats::numericPredicateProofIndexes);
+  EXPECT_EQ(1024, full->nextPossible(512));
+  EXPECT_EQ(1, SkipStats::numericPredicateProofIndexes);
+  EXPECT_EQ(N / IntColReader::BLOCK_SIZE, SkipStats::numericPredicateClassifiedBlocks);
+  EXPECT_EQ(cost, supplier->cost());
+  full->reset();
+  EXPECT_EQ(0, full->nextPossible(0));
+  EXPECT_EQ(1, SkipStats::numericPredicateProofIndexes);
+}
+
 TEST_F(RangeFilterTest, SparseColumnProofsRespectBoundsAndReset) {
   TermQuery a("body_w", "threshold"), b("body_w", "b");
   NumericPredicateQuery range("holes_i", 0, N - 1);
@@ -520,44 +559,46 @@ TEST_F(LuxirTest, RangeProofIndexSpansBitmapWords) {
 
 TEST_F(RangeFilterTest, ProofResourcesAreIndependentOfScorerCursors) {
   for (auto field : {"proof_i", "holes_i"}) {
-    for (auto consumption : {Consumption::WINDOWS, Consumption::CANDIDATES}) {
-      NumericPredicateQuery range(field, 0, N - 1);
-      MemPool pool;
-      Query::Context context(pool, *reader);
-      auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
-      auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(N, N, Use::COUNT_WINDOWS));
-      build.membershipConsumption = consumption;
-      auto* plan = supplier->resolve(pool, build);
-      auto* scorer = plan->build(pool);
-      auto* proof = plan->buildMembershipProof(pool);
-      ASSERT_NE(nullptr, proof);
-      {
-        NumericVerificationObserver observe([](int32_t) { FAIL() << "proof decoded a value"; });
-        for (int32_t target : {0, 4095, 4096, 4609, 5001, 12287, 12288, 16383, 24576, N, 0}) {
-          int32_t bound = proof->nextPossible(target);
-          EXPECT_GE(bound, target);
-          for (int32_t doc = target; doc < std::min(bound, N); doc++) {
-            EXPECT_FALSE(possible(doc) && (std::string_view(field) != "holes_i" || doc % 5 != 0));
-          }
-        }
-        for (int32_t base : {4001, 4050, 4095, 12287, 24576, 4096, 5001}) {
-          std::array<uint64_t, 64> bits;
-          bits.fill(~0ULL);
-          proof->intersect(bits, base);
-          for (int32_t bit = 0; bit < 4096; bit++) {
-            bool kept = (bits[(size_t)(bit >> 6)] & (1ULL << (bit & 63))) != 0;
-            if (std::string_view(field) == "proof_i") {
-              EXPECT_EQ(possible(base + bit), kept);
-            } else if (possible(base + bit) && (base + bit) % 5 != 0) {
-              EXPECT_TRUE(kept);
+    for (int64_t candidates : {1, N}) {
+      for (auto consumption : {Consumption::WINDOWS, Consumption::CANDIDATES}) {
+        NumericPredicateQuery range(field, 0, N - 1);
+        MemPool pool;
+        Query::Context context(pool, *reader);
+        auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+        auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(candidates, N, Use::COUNT_WINDOWS));
+        build.membershipConsumption = consumption;
+        auto* plan = supplier->resolve(pool, build);
+        auto* scorer = plan->build(pool);
+        auto* proof = plan->buildMembershipProof(pool);
+        ASSERT_NE(nullptr, proof);
+        {
+          NumericVerificationObserver observe([](int32_t) { FAIL() << "proof decoded a value"; });
+          for (int32_t target : {0, 4095, 4096, 4609, 5001, 12287, 12288, 16383, 24576, N, 0}) {
+            int32_t bound = proof->nextPossible(target);
+            EXPECT_GE(bound, target);
+            for (int32_t doc = target; doc < std::min(bound, N); doc++) {
+              EXPECT_FALSE(possible(doc) && (std::string_view(field) != "holes_i" || doc % 5 != 0));
             }
           }
+          for (int32_t base : {4001, 4050, 4095, 12287, 24576, 4096, 5001}) {
+            std::array<uint64_t, 64> bits;
+            bits.fill(~0ULL);
+            proof->intersect(bits, base);
+            for (int32_t bit = 0; bit < 4096; bit++) {
+              bool kept = (bits[(size_t)(bit >> 6)] & (1ULL << (bit & 63))) != 0;
+              if (std::string_view(field) == "proof_i") {
+                EXPECT_EQ(possible(base + bit), kept);
+              } else if (possible(base + bit) && (base + bit) % 5 != 0) {
+                EXPECT_TRUE(kept);
+              }
+            }
+          }
+          EXPECT_EQ(-1, scorer->docId());
+          proof->reset();
+          EXPECT_GT(proof->nextPossible(0), 0);
         }
-        EXPECT_EQ(-1, scorer->docId());
-        proof->reset();
-        EXPECT_GT(proof->nextPossible(0), 0);
+        EXPECT_EQ(4096, scorer->advanceWindow(0, N));
       }
-      EXPECT_EQ(4096, scorer->advanceWindow(0, N));
     }
   }
   for (auto field : {"column_i", "points_i", "cluster_is"}) {
