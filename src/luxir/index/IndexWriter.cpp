@@ -335,12 +335,23 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   // Budget callbacks never take indexMutex or flush inline.  They coalesce on
   // this elevated-priority graph node, whose body rechecks global pressure and
   // claims victims against the budget before changing writer state.
-  pressureCheckNode = std::make_unique<PressureCheckMultiFunc>(*updateGraph, 1,
+  pressureCheckNode = std::make_unique<ContinueMultiFunc>(*updateGraph, 1,
     [this](tbb::flow::continue_msg,
-           PressureCheckMultiFunc::output_ports_type& op) {
+           ContinueMultiFunc::output_ports_type& op) {
       unused(op);
       this->pressureCheckBody();
     }, FLUSH_PRIORITY);
+
+  segmentReleaseNode = std::make_unique<ContinueMultiFunc>(*updateGraph, 1,
+    [this](tbb::flow::continue_msg,
+           ContinueMultiFunc::output_ports_type& op) {
+      unused(op);
+      std::vector<std::unique_ptr<SegInfo>> released;
+      {
+        const std::lock_guard lock(retiredMutex);
+        released.swap(retiredSegments);
+      }
+    });
 
   commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(*updateGraph,
     [](UpdateMessage* msg) -> size_t {
@@ -1896,8 +1907,24 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
     if (!seg) continue;
     INDEX_DEBUG("Deleting files {}", *seg);
     snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
-    seg.reset();
   }
+  releaseSegments(segments);
+}
+
+// Hands segments to segmentReleaseNode, which drops their readers off the
+// caller's path.  Once closed, the graph is draining or drained, so they are
+// dropped here.
+void IndexWriter::releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments) {
+  if (!closed.load(std::memory_order_acquire)) {
+    {
+      const std::lock_guard lock(retiredMutex);
+      for (auto& seg : segments) {
+        if (seg) retiredSegments.push_back(std::move(seg));
+      }
+    }
+    segmentReleaseNode->try_put(tbb::flow::continue_msg{});
+  }
+  segments.clear();
 }
 
 // Move a segment from segInfos to segmentsToDelete for deferred deletion

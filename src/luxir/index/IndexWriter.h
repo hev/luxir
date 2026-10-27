@@ -350,6 +350,11 @@ public:
   // protected by indexMutex
   std::vector<std::unique_ptr<SegInfo>> segmentsToDelete;
 
+  // Retired segments whose files are deleted, waiting for segmentReleaseNode
+  // to drop their readers.  protected by retiredMutex
+  std::mutex retiredMutex;
+  std::vector<std::unique_ptr<SegInfo>> retiredSegments;
+
 
   // protected by indexMutex
   // If we don't need to look up by segment id, we could just use a vector for idleInverters.
@@ -543,11 +548,16 @@ public:
   using InverterMultiFunc = tbb::flow::multifunction_node<Inverter*, std::tuple<UpdateMessage*>>;
   std::unique_ptr<InverterMultiFunc> segmentFlushNode;
 
-  using PressureCheckMultiFunc =
+  using ContinueMultiFunc =
       tbb::flow::multifunction_node<tbb::flow::continue_msg, std::tuple<void*>>;
-  std::unique_ptr<PressureCheckMultiFunc> pressureCheckNode;
+  std::unique_ptr<ContinueMultiFunc> pressureCheckNode;
   std::atomic<bool> pressureCheckQueued = false;
   IndexRamBudget::PressureRegistration pressureRegistration;
+
+  // Drops retired segments' readers.  That unmaps their files, which for a
+  // large merge's sources can take most of a second (on tmpfs the unmap frees
+  // the unlinked files' pages), so it stays off the commit that retired them.
+  std::unique_ptr<ContinueMultiFunc> segmentReleaseNode;
 
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
@@ -849,6 +859,7 @@ private:
   void tryDeleteSegments();
   std::vector<std::unique_ptr<SegInfo>> takeDeletableSegmentsLocked();
   void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
+  void releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
@@ -868,6 +879,9 @@ public:
 
   // Cheap test-only snapshot of committed and buffered index state.
   bool testIsEmpty();
+
+  // Waits for queued graph work, including releasing retired segments.
+  void testDrain() { updateGraph->wait_for_all(); }
 
   // Test hook for the rebuild-without-reindex path: remove an overlay entry
   // from one live segment, leaving the segment data untouched.
