@@ -1208,10 +1208,10 @@ public:
       for (;;) {
         for (int j = 1; j < conjunctionEnums.size(); j++) {
           if (conjunctionEnums[j]->docId() < target) {
-            int32_t id = conjunctionEnums[j]->advance(target);
+            int32_t id = conjunctionEnums[j]->advanceInline(target);
             assert(id >= target);
             if (id > target) {
-              target = firstEnum->advance(id);
+              target = firstEnum->advanceInline(id);
               goto outer;
             }
           }
