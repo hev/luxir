@@ -405,7 +405,14 @@ public:
   // estimates the docs the query produces in the segment, so about
   // matches * maxDoc / sourceDocs docs hold the matches the heap needs.
   // `bottomSlot` is the heap bottom when earlier segments filled it, else -1.
-  // Leave `out` empty to sweep unseeded. offersSeedWindows is asked after
+  // Leave `out` empty to sweep unseeded. sourceDocs is an estimate, and the
+  // query may be much sparser near the best keys than overall, so when a
+  // round's windows leave the heap short the collector asks again, with
+  // `round` counting up from 0 and `collected` the docs the heap holds; a
+  // later round should offer the next ring beyond what it offered before
+  // (say twice as far, or scaled by matches / collected). Runs already
+  // visited are dropped from a later answer, and an empty answer (or one
+  // with nothing new) ends the seeding. offersSeedWindows is asked after
   // setSegment, so it may answer per segment. The collector seeds only a
   // query-driven windowed sweep it can reposition: the exact-domain and
   // column-seeded routes need a column's KeyBatch, and a pull scorer cannot
@@ -414,6 +421,8 @@ public:
     int64_t matches = 0;
     int64_t sourceDocs = 0;
     int32_t bottomSlot = -1;
+    int32_t round = 0;
+    int64_t collected = 0;
   };
   virtual bool offersSeedWindows() const { return false; }
   virtual void seedWindows(const SeedRequest& request, std::vector<SeedWindow>& out) {

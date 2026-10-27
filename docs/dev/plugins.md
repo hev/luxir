@@ -282,9 +282,23 @@ document order included.
   `matches * maxDoc / sourceDocs` docs hold the matches the heap needs.
   `request.bottomSlot` is the heap bottom when earlier segments filled it,
   else -1. Leave `out` empty to sweep unseeded.
+- Seeding runs in rounds. `sourceDocs` is an estimate (a range over a tenth of
+  the values may be estimated at half the docs), and a filter can be much
+  sparser near the best keys than overall, so a round's runs may leave the
+  heap short; then the sweep could not prune until it filled, and on a
+  segment ordered by the key it scans most of the segment. So while the heap
+  is not full, the collector asks again, up to four more rounds:
+  `request.round` counts from 0 and `request.collected` is the docs the heap
+  holds. A later round should offer the next ring beyond what the comparator
+  offered before, growing geometrically (at least doubling, or scaled by
+  `matches / collected`), rather than re-offering or over-seeding up front.
+  Runs an earlier round visited are dropped from the answer, and an empty
+  answer, or one with nothing new, ends the seeding. Between rounds the
+  collector rewinds the query and binds the later clauses again, and the
+  sweep jumps the runs of every round.
 - Any answer is safe: the collector clamps the runs to the segment, drops
-  empty ones, and sorts and merges overlapping ones, so a doc is collected
-  once.
+  empty ones, sorts and merges overlapping ones, and drops what earlier
+  rounds visited, so a doc is collected once.
 - The comparator reads docs out of order (the runs, then the sweep from doc 0);
   `ValueSortComparator::read` must already allow that. The collector binds the
   later clauses' comparators to the segment again before the sweep, and
@@ -302,8 +316,9 @@ document order included.
   is no separate hook for a known exact domain (match-all, filter-only):
   running the windows through the query already holds the heap to real
   matches, and `sourceDocs` sizes the runs for the domain's density.
-  `SkipStats::fieldSortSeedWindowActivations` counts seeded segments and
-  `fieldSortSeedWindowPullActivations` those seeded on the pull path.
+  `SkipStats::fieldSortSeedWindowActivations` counts seeded segments,
+  `fieldSortSeedWindowPullActivations` those seeded on the pull path and
+  `fieldSortSeedWindowRounds` the rounds after the first.
 - `LUXIR_DISABLE_FIELD_SORT_SEEDING` (`disableFieldSortSeeding`) turns it off
   along with the column seeding, for A/B runs.
 
@@ -315,12 +330,15 @@ index (`"index": "range"`), reads them once they are under an eighth of
 `sourceDocs` and again each time the bottom distance halves, and counts the
 docs it ruled out in `example::AbsDiffStats` (`test/plugins/example/ExampleSort.h`).
 It seeds from the points index leaves holding the points nearest the center,
-enough for the heap at the query's density, and counts the seeded segments and
-windows there too.
+enough for the heap at the query's density; each later round widens the
+leaves offered so far by `matches / collected`, at least doubling them, and
+offers the new ring. It counts the seeded segments, later rounds and windows
+there too.
 `PluginSortTest` checks it against brute force, against the value
 expression `abs(x - center)`, which sorts the same docs without pruning, and
 seeded against unseeded, including a corpus whose nearest docs come last,
-on both the windowed and the pull-scorer path.
+on both the windowed and the pull-scorer path, and one whose filter is
+sparse near the center, where round 0 leaves the heap short.
 
 ## HTTP routes
 
