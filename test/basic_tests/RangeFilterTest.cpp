@@ -33,9 +33,11 @@ protected:
 
   void SetUp() override {
     SchemaBuilder schema;
-    auto& field = schema.field("points_i");
-    field.type = api::FieldDef::FieldClass::INT;
-    field.index = api::FieldDef::IndexMode::RANGE;
+    for (auto name : {"points_i", "proof_points_i"}) {
+      auto& field = schema.field(name);
+      field.type = api::FieldDef::FieldClass::INT;
+      field.index = api::FieldDef::IndexMode::RANGE;
+    }
     schema.set(helper.collection());
     std::vector<Doc> docs;
     for (int32_t doc = 0; doc < N; doc++) {
@@ -52,6 +54,7 @@ protected:
       docs.push_back(flatdoc("id", std::to_string(doc), "body_w", body,
           "column_i", value, "points_i", value, "cluster_i", doc,
           "proof_i", possible(doc) ? doc : N + doc,
+          "proof_points_i", possible(doc) ? doc : N + doc,
           "proof2_i", doc >= 8192 && doc < 20480 ? doc : N + doc,
           "partial_i", doc < N / 4 ? N + doc : value,
           "striped_i", (doc / 512) % 2 == 0 ? 0 : N));
@@ -472,6 +475,56 @@ TEST_F(RangeFilterTest, NumericPlansRefineOnlyWhenConsumed) {
   full->reset();
   EXPECT_EQ(0, full->nextPossible(0));
   EXPECT_EQ(1, SkipStats::numericPredicateProofIndexes);
+}
+
+TEST_F(RangeFilterTest, PointsFactsAndColumnProofsFollowResolvedConsumption) {
+  NumericPredicateQuery range("proof_points_i", 0, N - 1);
+  for (auto [candidates, consumption] : {
+           std::pair{1, Consumption::EITHER}, {N, Consumption::EITHER},
+           {N, Consumption::CANDIDATES}}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    SkipStatsScope stats;
+    auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    EXPECT_EQ(N / 2, supplier->cost());
+    auto build = supplier->makePlanContext(
+        Query::Demand::fromCandidatesAndSpan(candidates, N, Use::COUNT_WINDOWS));
+    build.membershipConsumption = consumption;
+    auto shape = supplier->describeScorer(build);
+    EXPECT_EQ(Query::MatchState::NONEMPTY, shape.matchState);
+    auto* plan = supplier->resolve(pool, build);
+    auto* scorer = plan->build(pool);
+    auto* proof = plan->buildMembershipProof(pool);
+    EXPECT_EQ(0, SkipStats::numericPredicateClassifiedBlocks);
+    if (consumption == Consumption::CANDIDATES) {
+      EXPECT_EQ(nullptr, proof);
+      EXPECT_EQ(1, SkipStats::numericPredicatePointsArms);
+    } else {
+      ASSERT_NE(nullptr, proof);
+      EXPECT_EQ(4096, proof->nextPossible(0));
+      EXPECT_EQ(candidates == 1 ? 0 : 1, SkipStats::numericPredicateProofIndexes);
+      EXPECT_EQ(candidates == 1 ? 1 : 0, SkipStats::numericPredicateSparseVerifyArms);
+      EXPECT_EQ(candidates == N ? 1 : 0, SkipStats::numericPredicateZoneArms);
+    }
+    std::array<uint64_t, 64> bits;
+    bits.fill(~0ULL);
+    scorer->intersectCandidateBits(bits, 2048);
+    for (int32_t i = 0; i < 4096; i++) {
+      EXPECT_EQ(possible(2048 + i), (bits[(size_t)(i >> 6)] & (1ULL << (i & 63))) != 0);
+    }
+  }
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  SkipStatsScope stats;
+  auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  Query::ScorerSupplier::BulkScorerContext bulk;
+  bulk.requireConstantCount = true;
+  auto plan = supplier->planBulk(Use::COUNT_WINDOWS, bulk);
+  EXPECT_TRUE(plan.hasConstantCount());
+  EXPECT_EQ(N / 2, plan.constantCount);
+  EXPECT_EQ(0, SkipStats::numericPredicateClassifiedBlocks);
+  EXPECT_EQ(0, SkipStats::numericPredicatePointsArms);
+  EXPECT_EQ(0, SkipStats::numericPredicateZoneArms);
 }
 
 TEST_F(RangeFilterTest, SparseColumnProofsRespectBoundsAndReset) {

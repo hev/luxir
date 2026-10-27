@@ -489,6 +489,7 @@ public:
     std::span<Range> outside;
     size_t cursor = 0;
     screaming::BitSet::Selector* selector = nullptr;
+    screaming::BitSet::Iterator* docs = nullptr;
 
     void ensureSelector() {
       if (selector == nullptr && !reader.denseDocsWithValue()) {
@@ -507,10 +508,14 @@ public:
       ensureSelector();
       int32_t rank = target;
       if (selector != nullptr) {
-        screaming::BitSet::Iterator iter(reader.docsWithValueBitSet());
-        target = iter.advance(target);
+        if (docs == nullptr) {
+          docs = pool.make<screaming::BitSet::Iterator>(reader.docsWithValueBitSet());
+        } else if (target < docs->val()) {
+          docs->reset();
+        }
+        target = target > docs->val() ? docs->advance(target) : docs->val();
         if (target == screaming::BitSet::END) return {PostingsReader::END, PostingsReader::END};
-        rank = iter.rank();
+        rank = docs->rank();
       }
       while (rank < reader.docsWithValue()) {
         int64_t block = rank / IntColReader::BLOCK_SIZE;
@@ -595,6 +600,7 @@ public:
     void reset() override {
       MembershipProof::reset();
       cursor = 0;
+      if (docs != nullptr) docs->reset();
     }
   };
 
@@ -1201,9 +1207,6 @@ public:
       // Measured with gcc-release on 2026-07-10 on a hybrid-core laptop, the
       // least representative hardware described by the tuning caveat.
       static constexpr int64_t ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR = 2;
-      // The direct points arm beat the best scan arm at every measured
-      // selectivity and field shape. Measured with gcc-release on 2026-07-10
-      // on a hybrid-core laptop per the tuning caveat.
 
       using Materialized = PointsMaterialize::Materialized;
 
@@ -1225,11 +1228,82 @@ public:
       int64_t estimatedCost;
       Query::MatchState matchState;
       bool allMatch;
-      bool useZoneMap;
-      bool hasOutside = false;
-      int32_t possibleDocs;
-      int32_t insideDocs = 0;
-      double zoneProductionWork = 0;
+      struct ColumnCosts {
+        bool useZones;
+        bool hasOutside;
+        int32_t possibleDocs;
+        int32_t insideDocs;
+        double setupWork;
+        double valueWork;
+      };
+      mutable std::optional<ColumnCosts> columnCosts;
+
+      ColumnCosts priceColumn(NumColumnFormat::LeafMeta::RangeSummary summary) const {
+        int64_t prunable = summary.outside + summary.insideLower;
+        int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
+        bool single = !reader.multiValued();
+        // Only dense single-valued INSIDE runs can emit whole mask words.
+        // Sparse columns map each rank to a doc; multivalued producers also
+        // visit documents whose values are entirely outside the predicate.
+        double insideWork = single && reader.denseDocsWithValue()
+            ? (double)((summary.insideLower + 63) / 64)
+            : (double)summary.insideLower;
+        return {
+          prunable >= reader.numValues() / denominator
+              + (reader.numValues() % denominator != 0),
+          summary.outside != 0,
+          reader.docsWithValue() - (single ? (int32_t)summary.outside : 0),
+          single ? (int32_t)summary.insideLower : 0,
+          8.0 * reader.numBlocks(),
+          2.0 * (reader.numValues() - prunable) + insideWork
+              + (single ? 0.0 : (double)reader.docsWithValue()),
+        };
+      }
+
+      const ColumnCosts& column() const {
+        // Points already supply exact cost/nonemptiness. Scalar COUNT needs
+        // neither a column summary nor executing block plans.
+        if (!columnCosts) {
+          auto summary = reader.leafMeta().summarizeRange(
+              weight.query.getLo(), weight.query.getHi());
+          if (weight.query.isExactSet() && !allMatch) {
+            summary.insideLower = summary.insideUpper = 0;
+          }
+          columnCosts = priceColumn(summary);
+        }
+        return *columnCosts;
+      }
+
+      double columnCandidateWork() const {
+        const auto& costs = column();
+        double weight = costs.useZones && reader.multiValued() && costs.hasOutside
+            ? unprovenZoneCandidateValueWeight : candidateValueWeight;
+        return weight * std::max(1.0,
+            (double)reader.numValues() / std::max(1, reader.docsWithValue()));
+      }
+
+      struct Production {
+        ScorerArm arm;
+        double work;
+      };
+
+      Production selectProducer(int64_t span) const {
+        const auto& costs = column();
+        double fraction = std::min(1.0, (double)span / std::max(1, segment.maxDoc()));
+        // Normalize the existing pairwise crossovers to candidate-verification
+        // units; point emission and column scanning do not cost the same.
+        Production result = points != nullptr
+            ? Production{ScorerArm::POINTS, (double)estimatedCost / kPointsVerifyWeight}
+            : Production{ScorerArm::SCAN,
+                fraction * reader.numValues() / columnCandidateWork()};
+        if (costs.useZones) {
+          // First use still refines the whole column, even for a short span.
+          double work = (costs.setupWork + fraction * costs.valueWork)
+              / columnCandidateWork();
+          if (points == nullptr || work < result.work) result = {ScorerArm::ZONE_MAP, work};
+        }
+        return result;
+      }
 
       double estimatedMatches() const {
         double matches = (double)estimatedCost;
@@ -1346,8 +1420,8 @@ public:
             pool, result, segment.maxDoc(), weight.constantScore);
       }
 
-      BulkScorer* phaseOneBulkScorer(MemPool& pool) {
-        if (!useZoneMap) return nullptr;
+      BulkScorer* zoneBulkScorer(MemPool& pool) {
+        assert(column().useZones);
         skipCount(SkipStats::numericPredicateZoneArms);
         auto* scorer = pool.make<ZoneMapScorer>(
             pool, reader, blockPlans, weight.query,
@@ -1371,48 +1445,34 @@ public:
       Selection selectScorer(const Query::PlanContext& context) const {
         using Consumption = Query::MembershipConsumption;
         const auto& demand = context.demand;
-        auto windowArm = [&] {
-          int64_t verifyLimit = points == nullptr ? estimatedCost
-              : pointsVerifyLimit(estimatedCost);
-          if (demand.span < verifyLimit) return ScorerArm::SPARSE_VERIFY;
-          if (points != nullptr) return ScorerArm::POINTS;
-          return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
-        };
-        if (context.membershipConsumption == Consumption::WINDOWS) {
-          return {windowArm(), Consumption::WINDOWS};
-        }
         if (context.membershipConsumption == Consumption::CANDIDATES) {
+          // ZoneMap's window quote does not price its per-candidate protocol.
           ScorerArm arm = points != nullptr
                   && demand.candidates >= pointsVerifyLimit(estimatedCost)
               ? ScorerArm::POINTS : ScorerArm::SPARSE_VERIFY;
           return {arm, Consumption::CANDIDATES};
         }
-        // Compare the existing sparse decoder against production, not result
-        // cardinality. Single-valued candidate filters reject OUTSIDE runs
-        // before decoding; multivalued filters retain their prior policy.
-        double valuesPerDoc = std::max(1.0,
-            (double)reader.numValues() / std::max(1, reader.docsWithValue()));
-        bool unsupportedProofs = reader.multiValued() && hasOutside;
-        int64_t candidates = points == nullptr && !reader.multiValued()
-            ? std::min<int64_t>(demand.candidates, possibleDocs)
-            : demand.candidates;
-        double candidateWork = (useZoneMap && unsupportedProofs
-            ? unprovenZoneCandidateValueWeight : candidateValueWeight)
-            * (double)candidates * valuesPerDoc;
-        double spanFraction = std::min(1.0,
-            (double)demand.span / std::max(1, segment.maxDoc()));
-        double productionWork = points != nullptr ? (double)estimatedCost
-            : spanFraction * (useZoneMap ? zoneProductionWork
-                                         : (double)reader.numValues());
-        if (points != nullptr) {
-          candidateWork = (double)kPointsVerifyWeight * (double)demand.candidates;
+        if (context.membershipConsumption == Consumption::WINDOWS) {
+          if (points == nullptr) {
+            if (demand.span < estimatedCost) return {ScorerArm::SPARSE_VERIFY, Consumption::WINDOWS};
+            return {column().useZones ? ScorerArm::ZONE_MAP : ScorerArm::SCAN,
+                    Consumption::WINDOWS};
+          }
+          // Retain the bounded verifier fence. Producer alternatives currently
+          // price full exposure here; parent exposure hints are separate work.
+          if (demand.span < pointsVerifyLimit(estimatedCost)) {
+            return {ScorerArm::SPARSE_VERIFY, Consumption::WINDOWS};
+          }
+          return {selectProducer(segment.maxDoc()).arm, Consumption::WINDOWS};
         }
-        if (candidateWork < productionWork) {
+        Production producer = selectProducer(demand.span);
+        const auto& costs = column();
+        int64_t candidates = reader.multiValued() ? demand.candidates
+            : std::min<int64_t>(demand.candidates, costs.possibleDocs);
+        if ((double)candidates < producer.work) {
           return {ScorerArm::SPARSE_VERIFY, Consumption::CANDIDATES};
         }
-        return {points != nullptr ? ScorerArm::POINTS
-            : useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN,
-            Consumption::WINDOWS};
+        return {producer.arm, Consumption::WINDOWS};
       }
 
       static Query::ScorerShape shapeFor(
@@ -1480,8 +1540,10 @@ public:
 
       public:
         Query::MembershipProof* buildMembershipProof(MemPool& targetPool) override {
-          if (supplier.points != nullptr || supplier.reader.multiValued()
-              || !supplier.hasOutside) return nullptr;
+          // Materialized points already provide exact membership; do not
+          // attach a second, column-wide classification/index to that arm.
+          if (arm == ScorerArm::POINTS || supplier.reader.multiValued()
+              || !supplier.column().hasOutside) return nullptr;
           // A full span alone can describe a handful of scattered candidates.
           // Reserve whole-column refinement for expected broad block coverage.
           bool fullIndex = context().demand.span >= supplier.segment.maxDoc()
@@ -1559,7 +1621,7 @@ public:
     public:
       Supplier(NumericPredicateQuery::Weight& weight, MemPool& planPool,
                IndexReader::Segment& segment, IntColReader& reader,
-               NumColumnFormat::LeafMeta::RangeSummary summary,
+               std::optional<NumColumnFormat::LeafMeta::RangeSummary> summary,
                int64_t estimatedCost, Query::MatchState matchState,
                bool allMatch, PointsReader* points,
                std::span<const PointsReader::OrdinalRange> pointRanges,
@@ -1567,20 +1629,8 @@ public:
           : weight(weight), planPool(planPool), segment(segment), reader(reader),
             points(points), blockPlans(planPool, reader, weight.query),
             pointRanges(pointRanges), pointValueCount(pointValueCount),
-            estimatedCost(estimatedCost), matchState(matchState), allMatch(allMatch),
-            useZoneMap(false), possibleDocs(reader.docsWithValue()) {
-        if (points != nullptr) return;
-        hasOutside = summary.outside != 0;
-        int64_t prunable = summary.outside + summary.insideLower;
-        if (!reader.multiValued()) {
-          possibleDocs -= (int32_t)summary.outside;
-          insideDocs = (int32_t)summary.insideLower;
-        }
-        zoneProductionWork = 2.0 * (reader.numValues() - prunable)
-            + (summary.insideLower + 63) / 64 + 8.0 * reader.numBlocks();
-        int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
-        useZoneMap = prunable >= reader.numValues() / denominator
-            + (reader.numValues() % denominator != 0);
+            estimatedCost(estimatedCost), matchState(matchState), allMatch(allMatch) {
+        if (summary) columnCosts = priceColumn(*summary);
       }
 
       int64_t cost() override { return estimatedCost; }
@@ -1606,8 +1656,11 @@ public:
             || !reader.denseDocsWithValue() || reader.docsWithValue() != segment.maxDoc()
             || weight.query.isExactSet() || weight.query.intervals().size() != 1
             || reader.leafMeta().valueSketch().empty()) return std::nullopt;
+        const auto& costs = column();
+        int32_t possibleDocs = costs.possibleDocs;
+        int32_t insideDocs = costs.insideDocs;
         if (context.membershipConsumption == Consumption::WINDOWS) {
-          if (useZoneMap || selectScorer(context).arm != ScorerArm::SCAN) return std::nullopt;
+          if (costs.useZones || selectScorer(context).arm != ScorerArm::SCAN) return std::nullopt;
           double matches = std::clamp(estimatedMatches(), (double)insideDocs, (double)possibleDocs);
           return MembershipQuote{matches, 24.0 * reader.numValues() + 9.0 * matches};
         }
@@ -1698,18 +1751,12 @@ public:
             BulkAnswer::NO,
           };
         }
-        if (points != nullptr) {
-          auto* state = planPool.make<BulkState>(
-              this, BulkState::Arm::POINTS, use);
-          state->complement = useComplement(pointValueCount);
-          return {
-            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-            BulkAnswer::NO, state, -1, WindowFilterConsumption::NO,
-          };
-        }
-        if (useZoneMap) {
-          auto* state = planPool.make<BulkState>(
-              this, BulkState::Arm::ZONE_MAP, use);
+        Production producer = selectProducer(segment.maxDoc());
+        if (producer.arm == ScorerArm::POINTS || producer.arm == ScorerArm::ZONE_MAP) {
+          auto* state = planPool.make<BulkState>(this,
+              producer.arm == ScorerArm::POINTS ? BulkState::Arm::POINTS : BulkState::Arm::ZONE_MAP,
+              use);
+          state->complement = producer.arm == ScorerArm::POINTS && useComplement(pointValueCount);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
             BulkAnswer::NO, state, -1, WindowFilterConsumption::NO,
@@ -1736,7 +1783,7 @@ public:
         const auto& state =
             *static_cast<const BulkState*>(plan.buildState);
         if (state.arm == BulkState::Arm::ZONE_MAP) {
-          return phaseOneBulkScorer(targetPool);
+          return zoneBulkScorer(targetPool);
         }
         assert(points != nullptr);
         if (state.complement) {
@@ -1762,7 +1809,7 @@ public:
       int64_t colMax = reader->getMax();
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
 
-      NumColumnFormat::LeafMeta::RangeSummary summary;
+      std::optional<NumColumnFormat::LeafMeta::RangeSummary> summary;
       bool allMatch = query.covers(colMin, colMax);
       int64_t cost = 0;
       PointsReader* points = nullptr;
@@ -1792,14 +1839,14 @@ public:
         summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
         // An exact set's envelope proves rejection, never inclusion in gaps.
         if (query.isExactSet() && !allMatch) {
-          summary.insideLower = summary.insideUpper = 0;
+          summary->insideLower = summary->insideUpper = 0;
         }
-        int64_t possible = reader->numValues() - summary.outside;
+        int64_t possible = reader->numValues() - summary->outside;
         int64_t estimate = query.isExactSet() ? possible
-            : summary.insideLower + (possible - summary.insideLower + 1) / 2;
+            : summary->insideLower + (possible - summary->insideLower + 1) / 2;
         cost = std::min<int64_t>(estimate, reader->docsWithValue());
         matchState = possible == 0 ? Query::MatchState::EMPTY
-            : summary.insideLower > 0 ? Query::MatchState::NONEMPTY
+            : summary->insideLower > 0 ? Query::MatchState::NONEMPTY
                                      : Query::MatchState::UNKNOWN;
       }
       return targetPool.make<Supplier>(*this, targetPool, segment, *reader,
