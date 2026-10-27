@@ -653,3 +653,66 @@ TEST_F(IndexSortTest, changedIndexSortReordersTheNextMerge) {
   EXPECT_EQ(2, reorders);
   expectKeyOrder(indexOrder("isort_change", R"j(["id","ts_i","r_i"])j"), "r_i", true);
 }
+
+// The same documents ingested at random and reordered by the merge, or
+// ingested in key order and concatenated, merge to the same order and the
+// same bytes, except for request-version runs: under the reorder each doc's
+// request is no longer implied by its position, so they hold about log2
+// (requests) bits per doc, written one run per doc without start columns.
+TEST_F(IndexSortTest, reorderedSegmentSizeMatchesPresortedIngest) {
+  constexpr int DOCS = 40000, BATCH = 200, PER_SEGMENT = 10000;
+  auto shuffled = collection("isort_zrand", "");
+  auto presorted = collection("isort_zpre", "");
+  for (auto* helper : {shuffled.get(), presorted.get()}) {
+    setSchema(*helper, R"j({"index_sort":{"field":"k_i"}})j");
+  }
+  std::map<std::string, Doc> docs;
+  std::vector<std::string> order;
+  for (int i = 0; i < DOCS; i++) {
+    std::string id = std::format("{:016x}", (uint64_t)rng.rint(INT64_MAX));
+    docs[id] = flatdoc("id", id, "k_i", (int64_t)rng.rint(INT32_MAX), "price_i", (int64_t)rng.rint(100000),
+                       "body_t", words(rng, 5, 40, 2000));
+    order.push_back(id);
+  }
+  auto ingest = [&](CollectionHelper& helper) {
+    for (int b = 0; b < DOCS; b += BATCH) {
+      std::vector<Doc> batch;
+      for (int i = b; i < b + BATCH; i++) batch.push_back(docs[order[i]]);
+      bool last = (b + BATCH) % PER_SEGMENT == 0;
+      ASSERT_TRUE(helper.indexAll(batch, last ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT, true).success);
+    }
+    forceMerge(helper);
+  };
+  ingest(*shuffled);
+  order.clear();
+  for (const Json& doc : indexOrder("isort_zrand", R"j(["id"])j")) order.push_back(doc["id"].get<std::string>());
+  ingest(*presorted);
+  EXPECT_EQ(1, reorders);
+  EXPECT_EQ(1, concatenations);
+  std::vector<std::string> presortedOrder;
+  for (const Json& doc : indexOrder("isort_zpre", R"j(["id"])j")) presortedOrder.push_back(doc["id"].get<std::string>());
+  ASSERT_EQ(order, presortedOrder);
+
+  struct Sizes {
+    int64_t total, versions, runs, denseBlocks, blocks;
+  };
+  auto sizes = [](CollectionHelper& helper) {
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    EXPECT_EQ(1u, reader->segments().size());
+    auto& postings = reader->segments()[0].postingsReader();
+    const auto& runs = postings.versionRuns();
+    Sizes out{(int64_t)postings.sizeInBytes(), (int64_t)runs.byteSize(), (int64_t)runs.size(), 0, runs.numBlocks()};
+    for (uint32_t i = 0; i < runs.numBlocks(); i++) out.denseBlocks += runs.block(i).header().step == 1;
+    return out;
+  };
+  Sizes reordered = sizes(*shuffled), concatenated = sizes(*presorted);
+  // Everything but the version runs: within 0.2%.
+  int64_t rest = reordered.total - reordered.versions, presortedRest = concatenated.total - concatenated.versions;
+  EXPECT_LE(std::abs(rest - presortedRest), presortedRest / 500) << rest << " vs " << presortedRest;
+  // One run per request in key order; one per doc, 8 bits for 200 requests
+  // plus the block descriptors, after the reorder.
+  EXPECT_EQ(DOCS / BATCH, concatenated.runs);
+  EXPECT_EQ(DOCS, reordered.runs);
+  EXPECT_EQ(reordered.blocks, reordered.denseBlocks);
+  EXPECT_LE(reordered.versions, DOCS + reordered.blocks * 80);
+}

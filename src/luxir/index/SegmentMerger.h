@@ -1023,7 +1023,13 @@ private:
   // in the worst case every merged doc starts a run, and versions that
   // stepped by one per doc in arrival order no longer form the affine prefix
   // VersionRuns answers birth() from arithmetically, so a reordered
-  // segment's runs take more bytes and birth() decodes blocks instead.
+  // segment's runs take more bytes and birth() decodes blocks instead. That
+  // cost is the information itself: which request each doc came from, about
+  // log2(requests) bits per doc once the order no longer follows arrival.
+  // A window of docs that is mostly run starts is written as one run per
+  // doc: blocks of consecutive starts store no start column, which the few
+  // runs merged by an equal neighbor would otherwise cost every block.
+  static constexpr size_t DENSE_VERSION_WINDOW = 256;
   void buildReorderedMapping(PostingsWriter::VersionRunsWriter& versions) {
     std::vector<std::unique_ptr<VersionRuns::Cursor>> cursors;
     cursors.reserve(segs.size());
@@ -1032,14 +1038,25 @@ private:
       seg.remap.assign((size_t)seg.postingsReader->maxDoc(), -1);
       cursors.push_back(std::make_unique<VersionRuns::Cursor>(seg.postingsReader->versionRuns()));
     }
+    std::array<uint64_t, DENSE_VERSION_WINDOW> window;
     uint64_t last = 0;
-    for (size_t n = 0; n < newToOld.size(); n++) {
-      uint32_t source = sourceOf(newToOld[n]);
-      int32_t local = localOf(newToOld[n]);
-      segs[source].remap[(size_t)local] = (int32_t)n;
-      uint64_t version = cursors[source]->birth(local);
-      if (n == 0 || version != last) versions.add((uint32_t)n, version);
-      last = version;
+    for (size_t first = 0; first < newToOld.size(); first += DENSE_VERSION_WINDOW) {
+      size_t count = std::min(DENSE_VERSION_WINDOW, newToOld.size() - first);
+      size_t starts = 0;
+      for (size_t i = 0; i < count; i++) {
+        size_t n = first + i;
+        uint32_t source = sourceOf(newToOld[n]);
+        int32_t local = localOf(newToOld[n]);
+        segs[source].remap[(size_t)local] = (int32_t)n;
+        window[i] = cursors[source]->birth(local);
+        starts += n == 0 || window[i] != (i ? window[i - 1] : last);
+      }
+      bool dense = starts * 2 > count;
+      for (size_t i = 0; i < count; i++) {
+        size_t n = first + i;
+        if (n == 0 || dense || window[i] != last) versions.add((uint32_t)n, window[i], dense);
+        last = window[i];
+      }
     }
   }
 
