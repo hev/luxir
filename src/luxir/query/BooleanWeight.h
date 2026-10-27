@@ -2460,9 +2460,11 @@ private:
     }
   }
 
-  void applyProhibitedWindowBits(int32_t windowBase, int32_t windowEnd) {
+  // Returns whether any window bit survives the exclusions; the subtraction
+  // loop accumulates it.
+  bool applyProhibitedWindowBits(int32_t windowBase, int32_t windowEnd) {
     if (!negatedCountPath) {
-      return;
+      return true;
     }
     skipCount(SkipStats::negatedCountWindows);
     for (size_t clause = 0; clause < prohibitedDenseClauses.size(); clause++) {
@@ -2489,14 +2491,17 @@ private:
       fillDenseClauseWindowBits(
           denseClause, clauseBits, windowBase, windowEnd);
       skipCount(SkipStats::negatedCountExclFills);
+      uint64_t remaining = 0;
       for (int32_t word = 0; word < kWindowWords; word++) {
         windowBits[(size_t) word] &= ~clauseBits[(size_t) word];
+        remaining |= windowBits[(size_t) word];
       }
       if (denseClauseDocId(denseClause) == PostingsReader::END) {
         prohibitedExhausted[clause] = 1;
       }
-      if (popCountWindowBits() == 0) break;
+      if (remaining == 0) return false;
     }
+    return true;
   }
 
   int32_t termClauseAdvanceShallow(size_t clause, int32_t target) {
@@ -3303,6 +3308,14 @@ private:
     std::fill(bits.begin(), bits.end(), 0);
   }
 
+  // Stops at the first nonzero word, so a dense window reads one word.
+  bool anyWindowBits() const {
+    for (uint64_t bits : windowBits) {
+      if (bits != 0) return true;
+    }
+    return false;
+  }
+
   int64_t popCountWindowBits() const {
     int64_t total = 0;
     for (uint64_t bits : windowBits) {
@@ -3378,9 +3391,11 @@ private:
     return min;
   }
 
-  void leapfrogRemainingDenseClauses(size_t firstClause,
+  // Returns whether any window bit survives the remaining clauses.
+  bool leapfrogRemainingDenseClauses(size_t firstClause,
                                      int32_t windowBase, int32_t windowEnd) {
     int32_t innerSize = windowEnd - windowBase;
+    uint64_t remaining = 0;
     for (int32_t word = 0; word < kWindowWords; word++) {
       uint64_t bits = windowBits[(size_t) word];
       while (bits != 0) {
@@ -3411,7 +3426,9 @@ private:
         }
         bits &= bits - 1;
       }
+      remaining |= windowBits[(size_t) word];
     }
+    return remaining != 0;
   }
 
   bool fillDenseWindowBits(DocSet* filter, int32_t min, int32_t max,
@@ -3445,32 +3462,37 @@ private:
     int32_t threshold = countLeadIsDocSet
         ? docSetLeadLeapfrogThresholdForTests
         : termLeadLeapfrogThresholdForTests;
+    // The loops below that rewrite the window report whether it kept a bit.
+    // A lone lead fill is a scorer's own kernel: test its first nonzero word.
+    bool nonEmpty = denseClauses.size() > 1 || anyWindowBits();
     if (threshold > 0 && denseClauses.size() >= 2
         && belowLeapfrogThreshold(threshold)) {
       if (!countLeadIsDocSet) {
         skipCount(SkipStats::conjTermLeadFirstFillLeapfrogs);
       }
-      leapfrogRemainingDenseClauses(1, windowBase, windowEnd);
+      nonEmpty = leapfrogRemainingDenseClauses(1, windowBase, windowEnd);
     } else {
       for (size_t c = 1; c < denseClauses.size(); c++) {
         clearWindowBits(clauseBits);
         fillDenseClauseWindowBits(
             denseClauses[c], clauseBits, windowBase, windowEnd);
+        uint64_t remaining = 0;
         for (int32_t w = 0; w < kWindowWords; w++) {
           windowBits[(size_t) w] &= clauseBits[(size_t) w];
+          remaining |= windowBits[(size_t) w];
         }
+        nonEmpty = remaining != 0;
         if (c + 1 < denseClauses.size()
             && belowLeapfrogThreshold(
                 denseLeapfrogThresholdForTests)) {
-          leapfrogRemainingDenseClauses(c + 1, windowBase, windowEnd);
+          nonEmpty = leapfrogRemainingDenseClauses(c + 1, windowBase, windowEnd);
           break;
         }
       }
     }
 
-    if (popCountWindowBits() == 0) return false;
-    applyProhibitedWindowBits(windowBase, windowEnd);
-    if (popCountWindowBits() == 0) return false;
+    // An empty window skips the exclusion, domain and filter work.
+    if (!nonEmpty || !applyProhibitedWindowBits(windowBase, windowEnd)) return false;
     if (filter != nullptr && filter->type == DocSet::BITSET) {
       applyDomainBitsToWindow(windowBits, windowBase, windowEnd,
                               &((BitDocSet*) filter)->bits());
