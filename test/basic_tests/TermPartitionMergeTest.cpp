@@ -478,6 +478,37 @@ TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
   EXPECT_EQ(cascadeOracle, cascade);
 }
 
+// Planning may sample every stride-th block: a sample keeps that block's
+// leading term and the bytes up to the next sample, so cuts land on the same
+// terms with the weights of the blocks they cover.
+TEST(TermPartitionMergeTest, SampledBlockEstimatesCoverTheirBlocks) {
+  auto schema = textSchema();
+  TestIndex index;
+  buildWideDictionarySources(index, schema);
+  MemPool pool;
+  Segment& segment = index.reader->segments()[0];
+  SegFieldInfo info = readBodyInfo(pool, segment);
+  TermsEnum terms(pool, segment.postingsReader(), info);
+  auto every = terms.estimateTermBlocks();
+  ASSERT_GT(every.size(), 8u);
+  for (size_t stride : {(size_t) 2, (size_t) 3, (size_t) 7, every.size()}) {
+    auto sampled = terms.estimateTermBlocks((int32_t) stride);
+    ASSERT_EQ((every.size() + stride - 1) / stride, sampled.size()) << stride;
+    for (size_t i = 0; i < sampled.size(); i++) {
+      EXPECT_EQ(every[i * stride].firstTerm, sampled[i].firstTerm) << stride;
+      if (i + 1 == sampled.size()) {
+        EXPECT_GT(sampled[i].bytes, 0u);  // the row's last sample is estimated
+        continue;
+      }
+      uint64_t covered = 0;
+      for (size_t block = i * stride; block < (i + 1) * stride; block++) {
+        covered += every[block].bytes;
+      }
+      EXPECT_EQ(covered, sampled[i].bytes) << stride << " sample " << i;
+    }
+  }
+}
+
 TEST(TermPartitionMergeTest, EmptyRangesAreOmitted) {
   auto schema = textSchema();
   TestIndex oneRange;

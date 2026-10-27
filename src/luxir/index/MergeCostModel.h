@@ -34,8 +34,11 @@ struct MergeCostModel {
   static constexpr int64_t TERM_RANGE_RESYNC_BYTES = 4 * 1024;
 #endif
   // Split planning materializes one estimate (first term plus byte counts) per
-  // source term block; the term's heap bytes are charged separately.
+  // sampled source term block; the term's heap bytes are charged separately.
   static constexpr int64_t TERM_PLAN_BLOCK_BYTES = 96;
+  // Cuts only balance range work, so planning samples every k-th block of each
+  // source, keeping a field's plan to about this many estimates.
+  static constexpr int64_t MAX_TERM_PLAN_SAMPLES = 256 * 1024;
   static constexpr int64_t STORED_CHUNK_BUFFER_MULTIPLIER = 5;
   static constexpr int64_t MIN_TERM_RANGE_BYTES = 64LL * 1024 * 1024;
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;

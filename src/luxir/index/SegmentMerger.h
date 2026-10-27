@@ -1024,21 +1024,40 @@ private:
     return docsWithField * 2;
   }
 
-  // Planning copies each source block's first term: about one term in
-  // TERMS_BLOCK_SIZE of the source dictionaries.
-  static int64_t termPlanCost(std::span<MergeFieldInfo*> fields) {
+  static int64_t sourceTermBlocks(std::span<MergeFieldInfo*> fields) {
     int64_t blocks = 0;
+    for (const auto* field : fields) {
+      blocks += (field->segFieldInfo.nTerms + Postings::TERMS_BLOCK_SIZE - 1)
+          / Postings::TERMS_BLOCK_SIZE;
+    }
+    return blocks;
+  }
+
+  // Planning reads every stride-th source term block.
+  static int32_t termPlanStride(std::span<MergeFieldInfo*> fields) {
+    int64_t blocks = sourceTermBlocks(fields);
+    return (int32_t) std::max<int64_t>(
+        1, (blocks + MergeCostModel::MAX_TERM_PLAN_SAMPLES - 1)
+               / MergeCostModel::MAX_TERM_PLAN_SAMPLES);
+  }
+
+  // Planning copies each sampled block's first term: about one term in
+  // TERMS_BLOCK_SIZE * stride of the source dictionaries.
+  static int64_t termPlanCost(std::span<MergeFieldInfo*> fields) {
+    int64_t stride = termPlanStride(fields);
+    int64_t samples = 0;
     int64_t dictionaryBytes = 0;
     for (const auto* field : fields) {
       const auto& info = field->segFieldInfo;
       if (info.nTerms == 0) continue;
-      blocks += (info.nTerms + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE;
+      int64_t blocks = (info.nTerms + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE;
+      samples += (blocks + stride - 1) / stride;
       assert(info.termBlockIndexLoc.filenum() == info.termsLoc.filenum());
       assert(info.termBlockIndexLoc.offset() >= info.termsLoc.offset());
       dictionaryBytes += (int64_t) (info.termBlockIndexLoc.offset() - info.termsLoc.offset());
     }
-    return MergeCostModel::termPlanBytes(blocks)
-        + dictionaryBytes / Postings::TERMS_BLOCK_SIZE;
+    return MergeCostModel::termPlanBytes(samples)
+        + dictionaryBytes / Postings::TERMS_BLOCK_SIZE / stride;
   }
 
   // Range count follows source posting bytes, not the indexing RAM cap, with a
@@ -1062,12 +1081,13 @@ private:
         (sourceTerms + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE + 1;
     if (minimumPartitionBlocks > (int64_t) TrieBuilder::MAX_BLOCKS) return std::nullopt;
 
+    int32_t stride = termPlanStride(compactFields);
     std::vector<TermsEnum::BlockEstimate> sourceBlocks;
-    sourceBlocks.reserve((size_t) minimumPartitionBlocks + compactFields.size());
+    sourceBlocks.reserve((size_t) (minimumPartitionBlocks / stride) + compactFields.size());
     for (auto* field : compactFields) {
       if (field->segFieldInfo.nTerms == 0) continue;
       TermsEnum terms(pool, *field->seg->postingsReader, field->segFieldInfo);
-      for (auto& block : terms.estimateTermBlocks()) sourceBlocks.push_back(std::move(block));
+      for (auto& block : terms.estimateTermBlocks(stride)) sourceBlocks.push_back(std::move(block));
     }
     if (sourceBlocks.empty()) return std::nullopt;
 
