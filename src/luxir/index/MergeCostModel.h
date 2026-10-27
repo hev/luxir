@@ -60,9 +60,15 @@ struct MergeCostModel {
         (uint64_t) STREAM_BUDGET_CAP);
   }
 
+  // A finished range returns its streams for the next range to append to, so
+  // ranges beyond the concurrently runnable ones add no files; they queue
+  // largest first and even out the uneven ranges a cut on block-leading terms
+  // leaves.
+  static constexpr int32_t RANGE_QUEUE_FACTOR = 2;
+
   static constexpr int32_t maxTermRangesForStreams(int32_t streamBudget) {
     return std::min(MAX_TERM_RANGES_CAP,
-                    streamBudget / TERM_RANGE_STREAMS);
+                    RANGE_QUEUE_FACTOR * streamBudget / TERM_RANGE_STREAMS);
   }
 
   // Doc ids must stay below PostingsReader::MAX_SEGMENT_DOCS (see the

@@ -123,7 +123,6 @@ public:
   struct BlockEstimate {
     std::string firstTerm;
     uint64_t bytes;
-    uint64_t safetyBytes;
   };
 
   struct EncodedImpactFrontier {
@@ -266,7 +265,7 @@ public:
         int32_t blockOrd = firstBlock + i;
         input.seek(blockLocation(&sourceRow, blockOrd));
         PackedTerm first = input.readPackedTerm();
-        blocks.push_back({std::string(first.data(), first.size()), 0, 0});
+        blocks.push_back({std::string(first.data(), first.size()), 0});
         docsOffsets[(size_t) i] = input.readVlong();
         posOffsets[(size_t) i] = input.readVlong();
       }
@@ -278,7 +277,6 @@ public:
         uint64_t bytes = docsOffsets[(size_t) i + 1] - docsOffsets[(size_t) i]
             + posOffsets[(size_t) i + 1] - posOffsets[(size_t) i];
         blocks[outputBase + (size_t) i].bytes = bytes;
-        blocks[outputBase + (size_t) i].safetyBytes = bytes;
         precedingBytes += bytes;
       }
       uint64_t lastDocsOffset = docsOffsets.back();
@@ -319,7 +317,6 @@ public:
       }
       blocks.back().bytes = count > 1
           ? precedingBytes / (uint64_t) (count - 1) : finalEstimate;
-      blocks.back().safetyBytes = finalBytes;
     }
     assert((int32_t) blocks.size() == numTermBlocks);
     return blocks;

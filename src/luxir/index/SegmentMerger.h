@@ -1013,8 +1013,7 @@ private:
   struct TermRangePlan {
     std::optional<std::string> lower;
     std::optional<std::string> upper;
-    uint64_t bytes = 0;
-    uint64_t safetyBytes = 0;
+    uint64_t bytes = 0;  // source postings bytes of the range's terms
   };
 
   // The coordinator holds the merged norms until stitch. Range term blocks are
@@ -1050,10 +1049,6 @@ private:
   // block-index stream's file.
   std::optional<std::vector<TermRangePlan>> planTermRanges(
       std::span<MergeFieldInfo*> compactFields, MemPool& pool) {
-    struct SafetyBlock {
-      TermsEnum::BlockEstimate block;
-      size_t next = SIZE_MAX;
-    };
     struct WeightedTerm {
       size_t block;
       uint64_t bytes;
@@ -1067,29 +1062,22 @@ private:
         (sourceTerms + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE + 1;
     if (minimumPartitionBlocks > (int64_t) TrieBuilder::MAX_BLOCKS) return std::nullopt;
 
-    std::vector<SafetyBlock> safetyBlocks;
-    safetyBlocks.reserve((size_t) minimumPartitionBlocks + compactFields.size());
+    std::vector<TermsEnum::BlockEstimate> sourceBlocks;
+    sourceBlocks.reserve((size_t) minimumPartitionBlocks + compactFields.size());
     for (auto* field : compactFields) {
       if (field->segFieldInfo.nTerms == 0) continue;
       TermsEnum terms(pool, *field->seg->postingsReader, field->segFieldInfo);
-      auto blocks = terms.estimateTermBlocks();
-      size_t sourceStart = safetyBlocks.size();
-      for (auto& block : blocks) {
-        safetyBlocks.push_back({std::move(block), SIZE_MAX});
-      }
-      for (size_t i = sourceStart; i + 1 < safetyBlocks.size(); i++) {
-        safetyBlocks[i].next = i + 1;
-      }
+      for (auto& block : terms.estimateTermBlocks()) sourceBlocks.push_back(std::move(block));
     }
-    if (safetyBlocks.empty()) return std::nullopt;
+    if (sourceBlocks.empty()) return std::nullopt;
 
     std::vector<WeightedTerm> weighted;
-    weighted.reserve(safetyBlocks.size());
-    for (size_t i = 0; i < safetyBlocks.size(); i++) {
-      weighted.push_back({i, safetyBlocks[i].block.bytes});
+    weighted.reserve(sourceBlocks.size());
+    for (size_t i = 0; i < sourceBlocks.size(); i++) {
+      weighted.push_back({i, sourceBlocks[i].bytes});
     }
     auto termFor = [&](const WeightedTerm& entry) -> const std::string& {
-      return safetyBlocks[entry.block].block.firstTerm;
+      return sourceBlocks[entry.block].firstTerm;
     };
 
     std::sort(weighted.begin(), weighted.end(), [&](const WeightedTerm& a, const WeightedTerm& b) {
@@ -1156,20 +1144,6 @@ private:
         uint64_t& bytes = plan[range].bytes;
         bytes = UINT64_MAX - bytes < entry.bytes ? UINT64_MAX : bytes + entry.bytes;
       }
-      for (const auto& source : safetyBlocks) {
-        const auto& block = source.block;
-        for (auto& range : plan) {
-          bool startsBeforeRangeEnd = !range.upper.has_value()
-              || block.firstTerm < *range.upper;
-          bool endsAfterRangeStart = !range.lower.has_value()
-              || source.next == SIZE_MAX
-              || *range.lower < safetyBlocks[source.next].block.firstTerm;
-          if (!startsBeforeRangeEnd || !endsAfterRangeStart) continue;
-          range.safetyBytes = UINT64_MAX - range.safetyBytes < block.safetyBytes
-              ? UINT64_MAX : range.safetyBytes + block.safetyBytes;
-        }
-      }
-      for (auto& range : plan) range.bytes = std::max(range.bytes, range.safetyBytes);
       return plan;
     };
 
@@ -1450,13 +1424,18 @@ private:
 
       std::vector<MergeAdmissionDriver::Batch> batches;
       batches.reserve(outputs.size());
+      uint64_t planBytes = 0;
+      for (const auto& output : outputs) planBytes += output->plan.bytes;
       int64_t rangeCost =
           MergeCostModel::termRangeWorkingBytes((int64_t) compactFields.size());
       for (size_t i = 0; i < outputs.size(); i++) {
         MergeAdmissionDriver::Batch batch;
         batch.cost = rangeCost;
-        // Ranges are cut to equal source bytes.
-        batch.work = fieldWork / (int64_t) outputs.size();
+        // Cuts land on block-leading terms, so a range holding a heavy term
+        // runs long: queue ranges by their share of the source bytes.
+        batch.work = planBytes == 0 ? fieldWork / (int64_t) outputs.size()
+            : (int64_t) ((long double) fieldWork * (long double) outputs[i]->plan.bytes
+                         / (long double) planBytes);
         batch.streams = MergeCostModel::TERM_RANGE_STREAMS;
         batch.name = std::string((std::string_view) outputFieldInfo->fieldname)
             + "#" + std::to_string(i);
