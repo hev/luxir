@@ -465,6 +465,13 @@ TEST_F(RangeFilterTest, NumericPlansRefineOnlyWhenConsumed) {
   EXPECT_EQ(0, proof->nextPossible(0));
 
   build.demand = Query::Demand::fromCandidatesAndSpan(N, N, Use::COUNT_WINDOWS);
+  auto limited = build;
+  limited.expectedSpan = 64;
+  auto* local = supplier->resolve(pool, limited)->buildMembershipProof(pool);
+  ASSERT_NE(nullptr, local);
+  EXPECT_EQ(1024, local->nextPossible(512));
+  EXPECT_EQ(0, SkipStats::numericPredicateClassifiedBlocks);
+  EXPECT_EQ(0, SkipStats::numericPredicateProofIndexes);
   auto* full = supplier->resolve(pool, build)->buildMembershipProof(pool);
   ASSERT_NE(nullptr, full);
   EXPECT_EQ(0, SkipStats::numericPredicateProofIndexes);
@@ -818,3 +825,172 @@ TEST_F(RangeFilterTest, ProbePreparationDoesNotFillAndObserversRestore) {
 }
 
 } // namespace
+
+TEST_F(RangeFilterTest, PartialExposureClassifiesTouchedBlocksAndCanStillExhaust) {
+  for (auto field : {"proof_points_i", "holes_i", "cluster_is"}) {
+    NumericPredicateQuery range(field, 0, N - 1);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    SkipStatsScope stats;
+    auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    Query::ScorerSupplier::BulkScorerContext bulkContext;
+    bulkContext.expectedConsumption = Query::Demand::fromCandidatesAndSpan(64, 64, Use::MATCH_WINDOWS);
+    auto plan = supplier->planBulk(Use::MATCH_WINDOWS, bulkContext);
+    ASSERT_EQ(Answer::YES, plan.available);
+    ASSERT_EQ(Answer::YES, plan.supportsReposition());
+    auto* bulk = supplier->buildBulk(pool, plan);
+    EXPECT_EQ(0, SkipStats::numericPredicateClassifiedBlocks);
+    ScoreWindow out;
+    bulk->matchNextWindow(out, nullptr, 4096, 4160);
+    EXPECT_EQ(std::string_view(field) == "holes_i" ? 52 : 64, out.size);
+    EXPECT_EQ(1, SkipStats::numericPredicateClassifiedBlocks);
+    bulk->prepareMembership();
+    bulk->reposition(4096);
+    bulk->matchNextWindow(out, nullptr, 4096, 4160);
+    EXPECT_EQ(1, SkipStats::numericPredicateClassifiedBlocks);
+
+    // The end sentinel maps to the final sparse/multivalued value rank.
+    bulk->reposition(N - 64);
+    bulk->matchNextWindow(out, nullptr, N - 64, N);
+    EXPECT_EQ(std::string_view(field) == "cluster_is" ? 64 : 0, out.size);
+    EXPECT_EQ(2, SkipStats::numericPredicateClassifiedBlocks);
+
+    // A broad consumer fills missing plans, sharing those built on touch.
+    auto eager = supplier->planBulk(Use::MATCH_WINDOWS, {});
+    supplier->buildBulk(pool, eager)->matchNextWindow(out, nullptr, 4096, 4160);
+    int64_t values = std::string_view(field) == "cluster_is" ? 2 * N
+        : std::string_view(field) == "holes_i" ? N - (N + 4) / 5 : N;
+    int64_t blocks = (values + IntColReader::BLOCK_SIZE - 1) / IntColReader::BLOCK_SIZE;
+    EXPECT_EQ(blocks, SkipStats::numericPredicateClassifiedBlocks);
+
+    // A deliberately wrong short estimate must not bound execution, even
+    // after repositioning. Includes sparse ranks and a multivalued column.
+    bulk->reposition(0);
+    std::vector<int32_t> actual, expected;
+    for (int32_t cursor = 0; cursor < N;) {
+      int32_t next = bulk->matchNextWindow(out, nullptr, cursor, N);
+      actual.insert(actual.end(), out.docs.begin(), out.docs.begin() + out.size);
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    for (int32_t doc = 0; doc < N; doc++) {
+      if (std::string_view(field) == "cluster_is"
+          || (possible(doc) && (std::string_view(field) != "holes_i" || doc % 5 != 0))) {
+        expected.push_back(doc);
+      }
+    }
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(blocks, SkipStats::numericPredicateClassifiedBlocks);
+  }
+}
+
+TEST_F(RangeFilterTest, PartialExposureSurvivesNestedBooleanResolution) {
+  NumericPredicateQuery first("proof_points_i", 0, N - 1), second("cluster_i", 4096, 8191);
+  TermQuery term("body_w", "pad");
+  std::array<Query*, 2> alternatives{&first, &second};
+  BooleanQuery inner({}, alternatives, {}, {}, 1);
+  std::array<Query*, 2> required{&term, &inner};
+  BooleanQuery outer(required, {}, {}, {});
+  for (Query* query : std::array<Query*, 2>{&inner, &outer}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    SkipStatsScope stats;
+    auto* supplier = query->createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(64, 64));
+    build.expectedSpan = 64;
+    auto* scorer = supplier->resolve(pool, build)->build(pool);
+    std::array<uint64_t, 1> bits{};
+    scorer->fillWindowBits(bits, 4096, 4160);
+    EXPECT_EQ(~0ULL, bits[0]);
+    EXPECT_LE(SkipStats::numericPredicateClassifiedBlocks, 2);
+    EXPECT_EQ(0, SkipStats::numericPredicateProofIndexes);
+  }
+}
+
+TEST_F(RangeFilterTest, CandidateExposurePricesOnlyTheIncomingFilterStream) {
+  TermQuery term("body_w", "dense_a");
+  NumericPredicateQuery range("proof_points_i", 0, N - 1);
+  std::array<Query*, 1> required{&term}, filters{&range};
+  BooleanQuery query(required, {}, {}, filters);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 0; doc < N; doc += 16) if (possible(doc)) expected.push_back(doc);
+  for (int64_t candidates : {1, N}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    SkipStatsScope stats;
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    Query::ScorerSupplier::BulkScorerContext bulkContext;
+    bulkContext.expectedConsumption = Query::Demand::fromCandidatesAndSpan(candidates, 4096, Use::MATCH_WINDOWS);
+    auto plan = supplier->planBulk(Use::MATCH_WINDOWS, bulkContext);
+    ASSERT_EQ(Answer::YES, plan.available);
+    auto* bulk = supplier->buildBulk(pool, plan);
+    EXPECT_EQ(candidates == 1 ? 1 : 0, SkipStats::numericPredicateSparseVerifyArms);
+    EXPECT_EQ(candidates == 1 ? 0 : 1, SkipStats::numericPredicateZoneArms);
+    std::vector<int32_t> actual;
+    for (int32_t cursor = 0; cursor < N;) {
+      ScoreWindow out;
+      int32_t next = bulk->matchNextWindow(out, nullptr, cursor, N);
+      actual.insert(actual.end(), out.docs.begin(), out.docs.begin() + out.size);
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    EXPECT_EQ(expected, actual);
+  }
+}
+
+TEST_F(RangeFilterTest, ExplicitWindowExposureComparesZonesBelowLegacyVerifierFence) {
+  NumericPredicateQuery range("proof_points_i", 0, N - 1);
+  for (auto [use, explicitSpan] : {
+           std::pair{Use::MATCH_WINDOWS, true}, {Use::MATCH_WINDOWS, false}, {Use::PULL, true}}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    SkipStatsScope stats;
+    auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(1024, 1024, use));
+    if (explicitSpan) build.expectedSpan = 1024;
+    auto* scorer = supplier->resolve(pool, build)->build(pool);
+    bool zones = explicitSpan && use == Use::MATCH_WINDOWS;
+    EXPECT_EQ(zones ? 1 : 0, SkipStats::numericPredicateZoneArms);
+    EXPECT_EQ(zones ? 0 : 1, SkipStats::numericPredicateSparseVerifyArms);
+    std::array<uint64_t, 1> bits{};
+    scorer->fillWindowBits(bits, 4096, 4160);
+    EXPECT_EQ(~0ULL, bits[0]);
+    EXPECT_EQ(zones ? 1 : 0, SkipStats::numericPredicateClassifiedBlocks);
+  }
+}
+
+TEST_F(RangeFilterTest, CandidateDemandAloneDoesNotMakeZoneSetupIncremental) {
+  NumericPredicateQuery range("striped_i", 0, 0);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  SkipStatsScope stats;
+  auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(N / 2, N / 2));
+  build.membershipConsumption = Consumption::EITHER;
+  auto* scorer = supplier->resolve(pool, build)->build(pool);
+  ASSERT_EQ(1, SkipStats::numericPredicateZoneArms);
+  std::array<uint64_t, 1> bits{};
+  scorer->fillWindowBits(bits, 0, 64);
+  EXPECT_EQ(~0ULL, bits[0]);
+  EXPECT_EQ(N / IntColReader::BLOCK_SIZE, SkipStats::numericPredicateClassifiedBlocks);
+}
+
+TEST_F(RangeFilterTest, PullExposurePreservesTheLocalRangeApproximation) {
+  TermQuery term("body_w", "dense_a");
+  NumericPredicateQuery range("proof_points_i", 0, N - 1);
+  std::array<Query*, 1> required{&term}, filters{&range};
+  BooleanQuery query(required, {}, {}, filters);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  SkipStatsScope stats;
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  auto build = supplier->makePlanContext(Query::Demand{});
+  build.expectedSpan = 64;
+  auto* scorer = supplier->resolve(pool, build)->build(pool);
+  EXPECT_EQ(1, SkipStats::numericPredicateZoneArms);
+  EXPECT_EQ(0, SkipStats::numericPredicateSparseVerifyArms);
+  std::array<uint64_t, 1> bits{};
+  scorer->fillWindowBits(bits, 4096, 4160);
+  EXPECT_EQ(0x0001000100010001ULL, bits[0]);
+  EXPECT_EQ(1, SkipStats::numericPredicateClassifiedBlocks);
+}

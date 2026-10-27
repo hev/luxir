@@ -394,6 +394,9 @@ public:
     // (outside).
     uint8_t leafInside = 0;
     uint8_t leafCrossing = 0;
+    // Classification already establishes the domain of the residual bounds.
+    // Do not re-read codec metadata and query kind for every crossing value.
+    bool residualComparable = false;
     // In-block ranks outside [checkBegin, checkEnd) cannot match; ranks in
     // [insideBegin, insideEnd) all match.
     uint16_t checkBegin = 0;
@@ -455,26 +458,65 @@ public:
     IntColReader& reader;
     const NumericPredicateQuery& query;
     std::span<BlockPlan> plans;
+    std::span<uint64_t> initialized;
     bool complete = false;
+
+    void allocate() {
+      if (!plans.empty()) return;
+      size_t count = (size_t)reader.numBlocks();
+      auto* storage = (BlockPlan*)pool.alloc(count * sizeof(BlockPlan), alignof(BlockPlan));
+      plans = {storage, count};
+    }
+
+    void classify(size_t block) {
+      // Construct in place: narrow stores followed by a whole-plan assignment
+      // cause store/reload stalls on broad execution.
+      new (plans.data() + block) BlockPlan(query.classifyBlock(reader, (int64_t)block));
+      skipCount(SkipStats::numericPredicateClassifiedBlocks);
+    }
 
   public:
     BlockPlans(MemPool& pool, IntColReader& reader,
                const NumericPredicateQuery& query)
         : pool(pool), reader(reader), query(query) {}
 
+    const BlockPlan& operator[](size_t block) {
+      if (!complete) {
+        allocate();
+        if (initialized.empty()) {
+          initialized = pool.make_span<uint64_t>((plans.size() + 63) / 64);
+          std::fill(initialized.begin(), initialized.end(), 0);
+        }
+        uint64_t bit = 1ULL << (block & 63);
+        if ((initialized[block >> 6] & bit) == 0) {
+          classify(block);
+          initialized[block >> 6] |= bit;
+        }
+      }
+      return plans[block];
+    }
+
     std::span<const BlockPlan> all() {
       if (!complete) {
-        // Construct in place: classifyBlock's narrow stores followed by a
-        // whole-plan assignment cause store/reload stalls on broad execution.
-        size_t count = (size_t)reader.numBlocks();
-        auto* storage = (BlockPlan*)pool.alloc(count * sizeof(BlockPlan), alignof(BlockPlan));
-        plans = {storage, count};
-        for (int64_t block = 0; block < reader.numBlocks(); block++) {
-          new (storage + block) BlockPlan(query.classifyBlock(reader, block));
-          skipCount(SkipStats::numericPredicateClassifiedBlocks);
+        allocate();
+        for (size_t block = 0; block < plans.size(); block++) {
+          if (initialized.empty() || (initialized[block >> 6] & (1ULL << (block & 63))) == 0) {
+            classify(block);
+          }
         }
         complete = true;
       }
+      return plans;
+    }
+
+    // Prepare just the value blocks a window can read. The returned span is
+    // indexed by absolute block number; only this range is initialized. Keep
+    // the readiness checks out of the run/value loops used by both producers.
+    std::span<const BlockPlan> forValues(int64_t begin, int64_t end) {
+      assert(begin < end);
+      size_t first = (size_t)(begin / IntColReader::BLOCK_SIZE);
+      size_t last = (size_t)((end - 1) / IntColReader::BLOCK_SIZE);
+      for (size_t block = first; block <= last; block++) (*this)[block];
       return plans;
     }
   };
@@ -677,6 +719,7 @@ public:
       }
       plan.residualLower = bounds.lower;
       plan.residualWidth = bounds.upper - bounds.lower;
+      plan.residualComparable = true;
     }
     return plan;
   }
@@ -695,10 +738,7 @@ public:
 
     bool matches(int64_t valueRank, const BlockPlan& plan,
                  const NumericPredicateQuery& query) {
-      int64_t blockNum = valueRank / IntColReader::BLOCK_SIZE;
-      auto block = reader.blockInfo(blockNum);
-      if (!query.isExactSet()
-          && block.residualComparable()) {
+      if (plan.residualComparable) {
         if (valueRank < residualStart
             || valueRank >= residualStart + (int64_t)residualCount) {
           residualStart = reader.decodeResidualSubBlock(valueRank, residuals,
@@ -755,6 +795,7 @@ public:
     int32_t iterWindowStart = 0;
     int32_t iterWindowEnd = 0;
     const int32_t initialMaxDoc;
+    bool eager;
 
     static void setBit(std::span<uint64_t> words, int32_t windowStart,
                        int32_t doc) {
@@ -909,11 +950,11 @@ public:
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
                   BlockPlans& blockPlans,
                   const NumericPredicateQuery& query,
-                  int32_t maxDoc, float constantScore)
+                  int32_t maxDoc, float constantScore, bool eager)
       : Query::ConstantScorer(constantScore), reader(reader), blockPlans(blockPlans),
           crossing(reader),
           iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
-          query(query), maxDoc(maxDoc), initialMaxDoc(maxDoc) {
+          query(query), maxDoc(maxDoc), initialMaxDoc(maxDoc), eager(eager) {
       if (!reader.denseDocsWithValue()) {
         const auto& bits = reader.docsWithValueBitSet();
         selector = pool.make<screaming::BitSet::Selector>(
@@ -931,12 +972,24 @@ public:
                         int32_t max) override {
       assert(min >= 0 && min <= max && max <= maxDoc);
       if (min == max) return;
-      if (plans.empty()) plans = blockPlans.all();
-      if (reader.multiValued()) {
-        fillMulti(words, min, max);
+      if (eager) {
+        if (plans.empty()) plans = blockPlans.all();
       } else {
-        fillSingle(words, min, max);
+        auto [firstDoc, firstRank] = firstDocRank(min);
+        if (firstDoc >= max) return;
+        auto [lastDoc, lastRank] = firstDocRank(max);
+        if (lastDoc == PostingsReader::END) lastRank = reader.docsWithValue();
+        int64_t begin = firstRank;
+        int64_t end = lastRank;
+        if (reader.multiValued()) {
+          begin = reader.getStartValueRank(firstRank);
+          end = reader.getStartValueRank(lastRank);
+        }
+        if (begin == end) return;
+        plans = blockPlans.forValues(begin, end);
       }
+      if (reader.multiValued()) fillMulti(words, min, max);
+      else fillSingle(words, min, max);
     }
 
     int32_t next() override {
@@ -1234,6 +1287,7 @@ public:
         int32_t possibleDocs;
         int32_t insideDocs;
         double setupWork;
+        double blockWork;
         double valueWork;
       };
       mutable std::optional<ColumnCosts> columnCosts;
@@ -1254,6 +1308,7 @@ public:
           summary.outside != 0,
           reader.docsWithValue() - (single ? (int32_t)summary.outside : 0),
           single ? (int32_t)summary.insideLower : 0,
+          8.0,
           8.0 * reader.numBlocks(),
           2.0 * (reader.numValues() - prunable) + insideWork
               + (single ? 0.0 : (double)reader.docsWithValue()),
@@ -1297,8 +1352,10 @@ public:
             : Production{ScorerArm::SCAN,
                 fraction * reader.numValues() / columnCandidateWork()};
         if (costs.useZones) {
-          // First use still refines the whole column, even for a short span.
-          double work = (costs.setupWork + fraction * costs.valueWork)
+          // Allocation/bookkeeping is fixed; refinement follows the blocks
+          // reached by execution. A short span still touches at least a block.
+          double blocks = std::max(8.0, fraction * costs.blockWork);
+          double work = (costs.setupWork + blocks + fraction * costs.valueWork)
               / columnCandidateWork();
           if (points == nullptr || work < result.work) result = {ScorerArm::ZONE_MAP, work};
         }
@@ -1420,12 +1477,12 @@ public:
             pool, result, segment.maxDoc(), weight.constantScore);
       }
 
-      BulkScorer* zoneBulkScorer(MemPool& pool) {
+      BulkScorer* zoneBulkScorer(MemPool& pool, bool eager) {
         assert(column().useZones);
         skipCount(SkipStats::numericPredicateZoneArms);
         auto* scorer = pool.make<ZoneMapScorer>(
             pool, reader, blockPlans, weight.query,
-            segment.maxDoc(), weight.constantScore);
+            segment.maxDoc(), weight.constantScore, eager);
         return pool.make<PredicateBulkScorer>(
             pool, scorer, segment.maxDoc(), weight.constantScore);
       }
@@ -1453,17 +1510,26 @@ public:
           return {arm, Consumption::CANDIDATES};
         }
         if (context.membershipConsumption == Consumption::WINDOWS) {
+          if (isMembershipWindowUse(demand.horizon)
+              && context.expectedSpan != std::numeric_limits<int64_t>::max()) {
+            // An explicit consumer exposure prices physical production. The
+            // legacy lead-cost fence below can otherwise turn a short zone
+            // producer into per-doc verification across every filled window.
+            Production producer = selectProducer(context.expectedSpan);
+            return {(double)demand.span < producer.work ? ScorerArm::SPARSE_VERIFY : producer.arm,
+                    Consumption::WINDOWS};
+          }
           if (points == nullptr) {
             if (demand.span < estimatedCost) return {ScorerArm::SPARSE_VERIFY, Consumption::WINDOWS};
             return {column().useZones ? ScorerArm::ZONE_MAP : ScorerArm::SCAN,
                     Consumption::WINDOWS};
           }
-          // Retain the bounded verifier fence. Producer alternatives currently
-          // price full exposure here; parent exposure hints are separate work.
+          // Retain the bounded verifier fence. It also serves pull callers,
+          // whose span is a lead-cost estimate rather than a window schedule.
           if (demand.span < pointsVerifyLimit(estimatedCost)) {
             return {ScorerArm::SPARSE_VERIFY, Consumption::WINDOWS};
           }
-          return {selectProducer(segment.maxDoc()).arm, Consumption::WINDOWS};
+          return {selectProducer(context.expectedSpan).arm, Consumption::WINDOWS};
         }
         Production producer = selectProducer(demand.span);
         const auto& costs = column();
@@ -1497,7 +1563,7 @@ public:
       }
 
       Query::Scorer* buildScorer(
-          MemPool& targetPool, ScorerArm arm, bool complement) {
+          MemPool& targetPool, ScorerArm arm, bool complement, int64_t expectedSpan) {
         switch (arm) {
           case ScorerArm::SPARSE_VERIFY:
             skipCount(SkipStats::numericPredicateSparseVerifyArms);
@@ -1518,7 +1584,7 @@ public:
             skipCount(SkipStats::numericPredicateZoneArms);
             return targetPool.make<ZoneMapScorer>(
                 targetPool, reader, blockPlans, weight.query,
-                segment.maxDoc(), weight.constantScore);
+                segment.maxDoc(), weight.constantScore, expectedSpan >= segment.maxDoc());
           case ScorerArm::SCAN:
             skipCount(SkipStats::numericPredicateScanArms);
             return targetPool.make<PredicateScorer<IntColReader::Iterator>>(
@@ -1535,7 +1601,9 @@ public:
 
       protected:
         Query::Scorer* buildScorer(MemPool& targetPool) override {
-          return supplier.buildScorer(targetPool, arm, complement);
+          // A lead's demand describes candidate economics, not a stopping
+          // consumer. Only explicit exposure justifies incremental setup.
+          return supplier.buildScorer(targetPool, arm, complement, context().expectedSpan);
         }
 
       public:
@@ -1546,7 +1614,8 @@ public:
               || !supplier.column().hasOutside) return nullptr;
           // A full span alone can describe a handful of scattered candidates.
           // Reserve whole-column refinement for expected broad block coverage.
-          bool fullIndex = context().demand.span >= supplier.segment.maxDoc()
+          bool fullIndex = context().expectedSpan >= supplier.segment.maxDoc()
+              && context().demand.span >= supplier.segment.maxDoc()
               && context().demand.candidates >= supplier.reader.numLeafZones();
           return targetPool.make<ColumnProof>(
               targetPool, supplier.reader, supplier.weight.query,
@@ -1572,6 +1641,7 @@ public:
 
         Arm arm;
         bool complement = false;
+        bool eager = true;
         BulkUse use;
 
         BulkState(const Supplier* owner, Arm arm, BulkUse use)
@@ -1751,11 +1821,12 @@ public:
             BulkAnswer::NO,
           };
         }
-        Production producer = selectProducer(segment.maxDoc());
+        Production producer = selectProducer(bulkContext.expectedConsumption.span);
         if (producer.arm == ScorerArm::POINTS || producer.arm == ScorerArm::ZONE_MAP) {
           auto* state = planPool.make<BulkState>(this,
               producer.arm == ScorerArm::POINTS ? BulkState::Arm::POINTS : BulkState::Arm::ZONE_MAP,
               use);
+          state->eager = bulkContext.expectedConsumption.span >= segment.maxDoc();
           state->complement = producer.arm == ScorerArm::POINTS && useComplement(pointValueCount);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
@@ -1783,7 +1854,7 @@ public:
         const auto& state =
             *static_cast<const BulkState*>(plan.buildState);
         if (state.arm == BulkState::Arm::ZONE_MAP) {
-          return zoneBulkScorer(targetPool);
+          return zoneBulkScorer(targetPool, state.eager);
         }
         assert(points != nullptr);
         if (state.complement) {
@@ -1910,7 +1981,7 @@ public:
       auto* plans = targetPool.make<BlockPlans>(targetPool, *reader, query);
       return targetPool.make<ZoneMapScorer>(
           targetPool, *reader, *plans, query,
-          segment.maxDoc(), constantScore);
+          segment.maxDoc(), constantScore, true);
     }
 
   };

@@ -549,6 +549,16 @@ public:
     int64_t span = std::numeric_limits<int64_t>::max();
     ExecutionUse horizon = ExecutionUse::PULL;
 
+    // Child opportunities precede sibling rejection. Scale a child's own
+    // full-domain estimate by the original consumer exposure, not final K.
+    Demand exposedTo(int64_t expectedSpan, int32_t maxDoc) const {
+      if (expectedSpan >= maxDoc) return *this;
+      double fraction = (double)std::max<int64_t>(0, expectedSpan)
+          / std::max(1, maxDoc);
+      return {(int64_t)std::ceil(std::min(candidates, (int64_t)maxDoc) * fraction),
+              std::min(span, expectedSpan), horizon};
+    }
+
     static Demand fromCandidatesAndSpan(
         int64_t candidates, int64_t span,
         ExecutionUse horizon = ExecutionUse::PULL) noexcept {
@@ -581,6 +591,8 @@ public:
     };
 
     Demand demand;
+    // Retained across nested resolution; local demand has already been priced.
+    int64_t expectedSpan = std::numeric_limits<int64_t>::max();
     MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
     MultiTermScorerMode multiTermScorerModeForTests =
         MultiTermScorerMode::AUTO;
@@ -805,6 +817,9 @@ public:
       // Ask this same planner only for an exact scalar count arm. This never
       // authorizes a bulk build whose output would then be discarded.
       bool requireConstantCount = false;
+      // Economics only: total expected consumption, including disjoint windows
+      // and revisits. Never limits the scorer's membership or exhaustion.
+      Demand expectedConsumption{};
 
       bool hasFilter() const noexcept { return filterCost >= 0; }
     };

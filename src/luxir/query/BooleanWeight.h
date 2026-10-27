@@ -8543,18 +8543,21 @@ class BooleanQuery::Weight final : public Query::Weight {
       return Query::ReportedTwoPhase::UNKNOWN;
     }
 
-    static Query::PlanContext childPlanContext(
+    Query::PlanContext childPlanContext(
         const Query::PlanContext& parentContext,
-        const Query::Demand& demand) {
+        const Query::Demand& demand) const {
       Query::PlanContext childContext = parentContext;
-      childContext.demand = demand;
+      // Pull's local demand prices the approximation between seeks. Short
+      // total exposure must not replace that approximation with verification.
+      childContext.demand = demand.horizon == Query::ExecutionUse::PULL
+          ? demand : demand.exposedTo(parentContext.expectedSpan, segment.maxDoc());
       childContext.membershipConsumption = Query::MembershipConsumption::WINDOWS;
       return childContext;
     }
 
-    static Query::PlanContext childPlanContext(
+    Query::PlanContext childPlanContext(
         const Query::PlanContext& parentContext,
-        int64_t leadCost) {
+        int64_t leadCost) const {
       return childPlanContext(
           parentContext, Query::Demand::fromLeadCost(
               leadCost, parentContext.demand.horizon));
@@ -9300,6 +9303,14 @@ class BooleanQuery::Weight final : public Query::Weight {
       return shape;
     }
 
+    Query::PlanContext bulkScorerBuildContext(
+        Query::Demand fullDemand, const BulkScorerContext& bulkContext) const {
+      auto context = scorerBuildContext(
+          fullDemand.exposedTo(bulkContext.expectedConsumption.span, segment.maxDoc()));
+      context.expectedSpan = bulkContext.expectedConsumption.span;
+      return context;
+    }
+
     Query::Demand windowFillDemand(
         int64_t candidates, BulkUse use) const {
       assert(candidates >= 0);
@@ -9456,7 +9467,8 @@ class BooleanQuery::Weight final : public Query::Weight {
         AcceptedConjunctionRoutes acceptedRoutes,
         BulkUse use,
         std::span<Query::ScorerSupplier* const>
-            enclosingFilterSuppliers) {
+            enclosingFilterSuppliers,
+        const BulkScorerContext& bulkContext) {
       ConjunctionPlan plan;
       plan.mode = mode;
       plan.use = use;
@@ -9562,9 +9574,13 @@ class BooleanQuery::Weight final : public Query::Weight {
                   segment.maxDoc(), segment.maxDoc(), use)
               : windowFillDemand(entries[i == 0 ? 1 : 0].cost, use);
         }
-        entry.buildContext = scorerBuildContext(demand);
+        entry.buildContext = bulkScorerBuildContext(demand, bulkContext);
         if (perEntryDemand && i > 0 && !entry.optionalGroup) {
           entry.buildContext.membershipConsumption = Query::MembershipConsumption::EITHER;
+          // Only the candidate option consumes the incoming lead's opportunities.
+          // Nested seek producers retain their own span-scaled local demand.
+          entry.buildContext.demand.candidates = std::min(
+              entry.buildContext.demand.candidates, bulkContext.expectedConsumption.candidates);
           if (control != nullptr) {
             if (!control->consumption.empty()) {
               entry.buildContext.membershipConsumption = control->consumption[entry.order];
@@ -9612,16 +9628,19 @@ class BooleanQuery::Weight final : public Query::Weight {
         // Only producers can ratchet the lead's exposure. A sole producer
         // must be able to produce the complete membership span.
         auto& lead = entries[0];
-        lead.buildContext = scorerBuildContext(entries.size() == 1
+        lead.buildContext = bulkScorerBuildContext(entries.size() == 1
             ? Query::Demand::fromCandidatesAndSpan(segment.maxDoc(), segment.maxDoc(), use)
-            : windowFillDemand(entries[1].cost, use));
+            : windowFillDemand(entries[1].cost, use), bulkContext);
         if (lead.optionalGroup) {
           optionalGroupBuildDemand = lead.buildContext.demand;
           lead.shape = plannedOptionalGroupShape(optionalSuppliers, lead.buildContext);
         } else {
           lead.shape = lead.supplier->describeScorer(lead.buildContext);
         }
-        if (!needsScores && !plan.hasOptionalGroup && prohibitedSources.empty()
+        // Membership-order quotes debit full traversal. Keep the incumbent
+        // for partial consumers until that comparison prices partial traversal.
+        if (bulkContext.expectedConsumption.span >= segment.maxDoc()
+            && !needsScores && !plan.hasOptionalGroup && prohibitedSources.empty()
             && segment.numLive() == segment.maxDoc()
             && !candidateFilters.empty() && (entries.size() == 1 || candidateFilters.size() > 1)) {
           planMembershipOrder(entries, candidateFilters, use, control);
@@ -9647,7 +9666,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           ? windowFillDemand(entries[0].cost, use)
           : Query::Demand::fromLeadCost(plan.leadCost, use);
       Query::PlanContext prohibitedBuildContext =
-          scorerBuildContext(prohibitedBuildDemand);
+          bulkScorerBuildContext(prohibitedBuildDemand, bulkContext);
       if (hasUnknownElision(
               prohibitedSuppliers, prohibitedBuildContext)) {
         plan.unresolvedCause = firstUnresolvedCause(
@@ -9662,6 +9681,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       for (size_t i = 0; i < optionalSuppliers.size(); i++) {
         Query::PlanContext buildContext =
             scorerBuildContext(optionalGroupBuildDemand);
+        buildContext.expectedSpan = bulkContext.expectedConsumption.span;
         plan.optionalGroup[i] = {
             optionalSuppliers[i],
             optionalSuppliers[i]->describeScorer(buildContext),
@@ -10017,7 +10037,8 @@ class BooleanQuery::Weight final : public Query::Weight {
         AcceptedConjunctionRoutes acceptedRoutes,
         BulkUse use,
         std::span<Query::ScorerSupplier* const>
-            enclosingFilterSuppliers = {}) {
+            enclosingFilterSuppliers = {},
+        const BulkScorerContext& bulkContext = {}) {
       // Expansion capture does not depend on leadCost. Resolve it before
       // planConjunctionEntries reads supplier costs and sorts the entries, so
       // memo-backed costs determine both entry order and the build context.
@@ -10031,7 +10052,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       // A membership producer consumes physical spans, not just candidate
       // docids. Choose child arms and the route from that demand together.
       return planConjunctionEntries(targetPool, mode, acceptedRoutes, use,
-                                  enclosingFilterSuppliers);
+                                  enclosingFilterSuppliers, bulkContext);
     }
 
     void resolveConjunctionChildren(
@@ -10145,10 +10166,11 @@ class BooleanQuery::Weight final : public Query::Weight {
         BulkUse use, ConjunctionMode mode,
         AcceptedConjunctionRoutes acceptedRoutes,
         std::span<Query::ScorerSupplier* const>
-            enclosingFilterSuppliers = {}) {
+            enclosingFilterSuppliers = {},
+        const BulkScorerContext& bulkContext = {}) {
       ConjunctionPlanningResult planning = planConjunction(
           pool, mode, acceptedRoutes, use,
-          enclosingFilterSuppliers);
+          enclosingFilterSuppliers, bulkContext);
       switch (planning.status) {
         case ConjunctionPlanStatus::READY: {
           bool acceptsWindowFilter = planning.plan.candidateFilters.empty();
@@ -10608,7 +10630,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
       int64_t mandCost = mandSupplier->cost();
       Query::Demand demand = Query::Demand::fromLeadCost(mandCost, use);
-      Query::PlanContext buildContext = scorerBuildContext(demand);
+      Query::PlanContext buildContext = bulkScorerBuildContext(demand, bulkContext);
       Query::ScorerShape mandShape =
           describeResolved(mandSupplier, buildContext);
       if (mandShape.matchState != Query::MatchState::NONEMPTY
@@ -10674,11 +10696,12 @@ class BooleanQuery::Weight final : public Query::Weight {
     }
 
     BulkPlan planMaxScoreBulk(BulkUse use,
-                              bool withBulkExclusion = false) {
+                              bool withBulkExclusion = false,
+                              const BulkScorerContext& bulkContext = {}) {
       Query::Demand optionalDemand = Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max(), use);
       Query::PlanContext optionalContext =
-          scorerBuildContext(optionalDemand);
+          bulkScorerBuildContext(optionalDemand, bulkContext);
       boost::container::small_vector<PlannedSupplier, 16> optional;
       boost::container::small_vector<int64_t, 16> optionalCosts;
       // Count-only identity routing needs every per-segment term df even for
@@ -10720,7 +10743,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       Query::Demand exclusionDemand = Query::Demand::fromLeadCost(
           aggregateClauseCost, use);
       Query::PlanContext exclusionContext =
-          scorerBuildContext(exclusionDemand);
+          bulkScorerBuildContext(exclusionDemand, bulkContext);
       boost::container::small_vector<PlannedSupplier, 16> prohibited;
       if (withBulkExclusion) {
         for (auto* supplier : prohibitedShapeSuppliers) {
@@ -10901,7 +10924,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     }
 
     FilteredDisjunctionPlanningResult planFilteredDisjunctionBulk(
-        BulkUse use) {
+        BulkUse use, const BulkScorerContext& bulkContext = {}) {
       auto declined = [&]() {
         return FilteredDisjunctionPlanningResult{
           noBulkPlan(), FilteredDisjunctionDisposition::DECLINED};
@@ -10926,7 +10949,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       Query::Demand filterDemand = Query::Demand::fromLeadCost(
           filterCost, use);
       Query::PlanContext filterContext =
-          scorerBuildContext(filterDemand);
+          bulkScorerBuildContext(filterDemand, bulkContext);
       PlannedSupplier filter{};
       DocSet* filterDocs = nullptr;
       bool arrayFilterFeed = false;
@@ -10963,7 +10986,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       Query::Demand optionalDemand = Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max(), use);
       Query::PlanContext optionalContext =
-          scorerBuildContext(optionalDemand);
+          bulkScorerBuildContext(optionalDemand, bulkContext);
       boost::container::small_vector<PlannedSupplier, 16> entries;
       for (auto* supplier : optionalShapeSuppliers) {
         if (supplier == nullptr) {
@@ -11299,7 +11322,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       return attached ? bulk : nullptr;
     }
 
-    BulkPlan planFilterOnlyBulk(BulkUse use) {
+    BulkPlan planFilterOnlyBulk(BulkUse use, const BulkScorerContext& bulkContext) {
       boost::container::small_vector<PlannedBulkSupplier, 16> entries;
       entries.reserve(filterSuppliers.size());
       for (auto* supplier : filterSuppliers) {
@@ -11314,6 +11337,11 @@ class BooleanQuery::Weight final : public Query::Weight {
                    const PlannedBulkSupplier& b) {
                   return a.cost < b.cost;
                 });
+      if (!entries.empty() && bulkContext.expectedConsumption.span < segment.maxDoc()) {
+        auto& lead = entries[0];
+        lead.plan = lead.supplier->planBulk(use, bulkContext);
+        if (lead.plan.available != BulkAnswer::YES || lead.plan.hasConstantCount()) return noBulkPlan();
+      }
       auto* state = pool.make<FilterOnlyPlan>();
       state->owner = this;
       state->filters = pool.make_span<PlannedBulkSupplier>(entries.size());
@@ -11429,7 +11457,7 @@ class BooleanQuery::Weight final : public Query::Weight {
                    && !bulkContext.filterSuppliers.empty()) {
           BulkPlan plan = planConjunctionBulk(
               use, ConjunctionMode::EXHAUSTIVE, allRouteMask(),
-              bulkContext.filterSuppliers);
+              bulkContext.filterSuppliers, bulkContext);
           if (plan.available == BulkAnswer::YES) return plan;
         }
       }
@@ -11439,7 +11467,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
       if (mandatorySources.empty() && optionalSources.empty()
           && prohibitedSources.empty() && !filterSuppliers.empty()) {
-        return planFilterOnlyBulk(use);
+        return planFilterOnlyBulk(use, bulkContext);
       }
 
       if (needsScores && !prohibitedSources.empty()) {
@@ -11454,13 +11482,13 @@ class BooleanQuery::Weight final : public Query::Weight {
         if (!maxScoreShape || disableBulkExclusionForTests) {
           return noBulkPlan();
         }
-        return planMaxScoreBulk(use, true);
+        return planMaxScoreBulk(use, true, bulkContext);
       }
 
       if (!filterSuppliers.empty() && mandatorySources.empty()
           && prohibitedSources.empty() && optionalSources.size() >= 2
           && minShouldMatch == 1 && !allowsPruning) {
-        auto disjunction = planFilteredDisjunctionBulk(use);
+        auto disjunction = planFilteredDisjunctionBulk(use, bulkContext);
         if (disjunction.disposition
             == FilteredDisjunctionDisposition::BULK) {
           return disjunction.plan;
@@ -11503,6 +11531,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           if (child != nullptr && filterCost >= 0) {
             BulkScorerContext context{
                 filterCost, filterSuppliers, true};
+            context.expectedConsumption = bulkContext.expectedConsumption;
             BulkPlan childPlan = child->planBulk(use, context);
             if (childPlan.available == BulkAnswer::YES
                 && childPlan.consumesFilters == BulkAnswer::YES) {
@@ -11518,7 +11547,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         }
         BulkPlan conjunction = planConjunctionBulk(
             use, ConjunctionMode::EXHAUSTIVE,
-            countRouteMask(!disableFilterClauseCountForTests));
+            countRouteMask(!disableFilterClauseCountForTests), {}, bulkContext);
         if (conjunction.available == BulkAnswer::YES) {
           return conjunction;
         }
@@ -11526,7 +11555,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             && prohibitedSources.empty() && optionalSources.size() >= 2
             && minShouldMatch == 1;
         if (!pureFilteredDisjunction) return noBulkPlan();
-        return planFilteredDisjunctionBulk(use).plan;
+        return planFilteredDisjunctionBulk(use, bulkContext).plan;
       }
 
       if (needsScores && !filterSuppliers.empty()) {
@@ -11537,7 +11566,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           && filterSuppliers.empty() && mandatorySources.size() >= 2) {
         return planConjunctionBulk(
             use, ConjunctionMode::SCORED_BODY,
-            routeBit(ConjunctionRoute::GENERIC));
+            routeBit(ConjunctionRoute::GENERIC), {}, bulkContext);
       }
       if (!disableMandOptBulkForTests && mandatorySources.size() == 1
           && !optionalSources.empty() && prohibitedSources.empty()
@@ -11549,7 +11578,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           || optionalSources.size() < 2) {
         return noBulkPlan();
       }
-      return planMaxScoreBulk(use, false);
+      return planMaxScoreBulk(use, false, bulkContext);
     }
 
     void recordBulkPlanCommitment(
