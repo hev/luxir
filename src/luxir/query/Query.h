@@ -549,7 +549,8 @@ public:
 
   // Producers and consumers price membership work in one unit, the point
   // emission: decoding one point into a bitset, about 0.8 ns on hugin. A
-  // producer quotes its arms in it (NumericPredicateQuery's prices) and a
+  // producer quotes its arms in it (NumericPredicateQuery's and GeoQuery's
+  // prices; PointsMaterialize prices materialization and verification) and a
   // consumer the work that producing would spare it (Demand::sparedWork).
   struct Demand {
     int64_t candidates = std::numeric_limits<int64_t>::max();
@@ -816,6 +817,13 @@ public:
 
     static bool isMembershipWindowUse(BulkUse use) noexcept {
       return use == BulkUse::MATCH_WINDOWS || use == BulkUse::COUNT_WINDOWS;
+    }
+
+    // Whether a WINDOWS consumer fills windows over an explicit exposure; any
+    // other one pulls the candidates of its lead.
+    static bool fillsExposedWindows(const PlanContext& context) noexcept {
+      return isMembershipWindowUse(context.demand.horizon)
+          && context.expectedSpan != std::numeric_limits<int64_t>::max();
     }
 
     enum class BulkAnswer : uint8_t {

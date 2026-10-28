@@ -1313,24 +1313,19 @@ public:
         return *columnCosts;
       }
 
-      // Prices in point emissions (see Query::Demand). Bitset words, the
-      // sorted array and block
-      // classification were measured by forcing each arm under a
-      // 35-candidate pull lead (5M docs, one segment, 2026-10-28). The rest
-      // are fitted on that board's forced-arm oracle: one verification costs
-      // about a cache miss at the sparse candidate densities where verifying
-      // can win; a scan tests a value in about 5 ns; zone checks and inside
-      // words are priced per unit of the column summary, which a dense lead's
-      // refills can reach about twice.
-      static constexpr double WORD_POINTS = 0.15;         // zero one bitset word
-      static constexpr double ARRAY_POINTS = 10;          // one point through the sorted array
+      // Prices in point emissions (see Query::Demand); points production and
+      // verification are PointsMaterialize's. Block classification was
+      // measured by forcing each arm under a 35-candidate pull lead (5M docs,
+      // one segment, 2026-10-28). The rest are fitted on that board's
+      // forced-arm oracle: a scan tests a value in about 5 ns; zone checks and
+      // inside words are priced per unit of the column summary, which a dense
+      // lead's refills can reach about twice.
       static constexpr double CLASSIFY_POINTS = 25;       // classify one column block
       static constexpr double CHECK_POINTS = 4;           // test one value of an unprunable block
       static constexpr double INSIDE_WORD_POINTS = 3;     // emit one dense inside mask word
       static constexpr double INSIDE_VALUE_POINTS = 1;    // emit one inside value's document
       static constexpr double DOC_VISIT_POINTS = CHECK_POINTS;  // combine one document's values
       static constexpr double SCAN_POINTS = 6;            // test one value of a scanned column
-      static constexpr double VERIFY_POINTS = 20;         // verify one candidate
 
       struct Production {
         ScorerArm arm;
@@ -1339,14 +1334,9 @@ public:
 
       double pointsPrice() const {
         bool complement = useComplement(pointValueCount);
-        double count = complement ? (double)(points->pointCount() - pointValueCount)
-            : (double)pointValueCount;
-        if (!complement && !PointsMaterialize::useBitset(pointValueCount, segment.maxDoc())) {
-          return ARRAY_POINTS * count;
-        }
-        // The complement also fills the base set before clearing.
-        return count + (complement ? 2 : 1) * WORD_POINTS
-            * (double)FixedBitSet::sizeInWords(segment.maxDoc());
+        return PointsMaterialize::price(
+            complement ? points->pointCount() - pointValueCount : pointValueCount,
+            segment.maxDoc(), complement);
       }
 
       // Fractions of the column a consumer makes a producer refine (zones),
@@ -1567,7 +1557,7 @@ public:
             verified *= costs.possibleDocs / (double)std::max(1, segment.maxDoc());
           }
         }
-        return VERIFY_POINTS * verified + demand.sparedWork;
+        return PointsMaterialize::verifyPrice(verified, demand);
       }
 
       // Verify each candidate or produce the range: one comparison in point
@@ -1581,7 +1571,7 @@ public:
               ? std::min(demand.candidates, (int64_t)std::ceil(demand.expectedCandidates))
               : demand.candidates;
           bool produce = points != nullptr && pointsPrice()
-              < VERIFY_POINTS * verifiableCandidates(candidates) + demand.sparedWork;
+              < PointsMaterialize::verifyPrice(verifiableCandidates(candidates), demand);
           return {produce ? ScorerArm::POINTS : ScorerArm::SPARSE_VERIFY,
                   Consumption::CANDIDATES};
         }
@@ -1589,8 +1579,7 @@ public:
           // An explicit exposure fills windows; any other window consumer
           // pulls the candidates of its lead, or those the consumer expects
           // to reach this clause.
-          bool windows = isMembershipWindowUse(demand.horizon)
-              && context.expectedSpan != std::numeric_limits<int64_t>::max();
+          bool windows = fillsExposedWindows(context);
           Production producer = cheapestProducer(
               windows ? windowReach(context.expectedSpan) : pullReach(demand.span),
               context.expectedSpan);
@@ -1600,7 +1589,7 @@ public:
               : demand.expectedCandidates >= 0
                   ? std::min(demand.expectedCandidates, (double)reader.docsWithValue())
                   : (double)demand.span;
-          double verify = VERIFY_POINTS * candidates + demand.sparedWork;
+          double verify = PointsMaterialize::verifyPrice(candidates, demand);
           return {verify <= producer.points ? ScorerArm::SPARSE_VERIFY : producer.arm,
                   Consumption::WINDOWS};
         }
