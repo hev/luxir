@@ -35,12 +35,6 @@ api::AnalyzerComponent component(std::string_view name) {
   return c;
 }
 
-// A registry holding only the built-ins, so name listings are exact.
-struct BuiltinRegistry {
-  AnalysisRegistry registry;
-  BuiltinRegistry() { registerBuiltinAnalysis(registry); }
-};
-
 std::string compileError(const AnalysisRegistry& registry, std::string_view json) {
   std::pmr::monotonic_buffer_resource arena;
   api::AnalyzerDef def;
@@ -89,66 +83,72 @@ protected:
 };
 
 TEST_F(AnalysisRegistryTest, builtinNamesAreListedSorted) {
-  BuiltinRegistry b;
-  EXPECT_EQ((std::vector<std::string>{"keyword", "unicode_word", "whitespace"}), b.registry.tokenizerNames());
+  AnalysisRegistry registry;
+  EXPECT_EQ((std::vector<std::string>{"keyword", "unicode_word", "whitespace"}), registry.tokenizerNames());
   EXPECT_EQ((std::vector<std::string>{"english_possessive", "fold", "kstem", "lowercase", "nfkc_cf", "stop"}),
-            b.registry.filterNames());
-  EXPECT_EQ((std::vector<std::string>{"html_strip", "mapping", "nfkc_cf"}), b.registry.charFilterNames());
-  EXPECT_EQ((std::vector<std::string>{"english", "standard"}), b.registry.analyzerNames());
+            registry.filterNames());
+  EXPECT_EQ((std::vector<std::string>{"html_strip", "mapping", "nfkc_cf"}), registry.charFilterNames());
+  EXPECT_EQ((std::vector<std::string>{"english", "standard"}), registry.analyzerNames());
 }
 
 TEST_F(AnalysisRegistryTest, duplicatesAndBadNamesThrow) {
-  BuiltinRegistry b;
+  AnalysisRegistry registry;
   auto tokenizer = [](const api::AnalyzerComponent&) -> std::unique_ptr<const TokenizerFactory> { return nullptr; };
   auto filter = [](const api::AnalyzerComponent&) -> std::unique_ptr<TokenFilterFactory> { return nullptr; };
   auto charFilter = [](const api::AnalyzerComponent&) -> std::unique_ptr<const CharFilterFactory> { return nullptr; };
-  EXPECT_THROW(b.registry.addTokenizer("keyword", tokenizer), std::invalid_argument);
-  EXPECT_THROW(b.registry.addFilter("stop", filter), std::invalid_argument);
-  EXPECT_THROW(b.registry.addAnalyzer("english", api::AnalyzerDef{}), std::invalid_argument);
-  b.registry.addCharFilter("mine", charFilter);
-  EXPECT_THROW(b.registry.addCharFilter("mine", charFilter), std::invalid_argument);
-  // the same name in different kinds is fine
-  EXPECT_NO_THROW(b.registry.addFilter("mine", filter));
-  for (const char* bad : {"", "Mixed", "has-dash", "sp ace"}) {
-    EXPECT_THROW(b.registry.addFilter(bad, filter), std::invalid_argument) << bad;
+  EXPECT_THROW(registry.addTokenizer("keyword", tokenizer), std::invalid_argument);
+  try {
+    registry.addFilter("stop", filter);
+    FAIL();
+  } catch (const std::invalid_argument& e) {
+    EXPECT_STREQ("duplicate filter 'stop'", e.what());
   }
-  EXPECT_THROW(b.registry.addFilter("empty_maker", nullptr), std::invalid_argument);
+  EXPECT_THROW(registry.addCharFilter("html_strip", charFilter), std::invalid_argument);
+  EXPECT_THROW(registry.addAnalyzer("english", api::AnalyzerDef{}), std::invalid_argument);
+  registry.addCharFilter("mine", charFilter);
+  EXPECT_THROW(registry.addCharFilter("mine", charFilter), std::invalid_argument);
+  // the same name in different kinds is fine
+  EXPECT_NO_THROW(registry.addFilter("mine", filter));
+  for (const char* bad : {"", "Mixed", "has-dash", "sp ace"}) {
+    EXPECT_THROW(registry.addFilter(bad, filter), std::invalid_argument) << bad;
+  }
+  EXPECT_THROW(registry.addFilter("empty_maker", nullptr), std::invalid_argument);
 }
 
 TEST_F(AnalysisRegistryTest, frozenRegistryRejectsEveryAdd) {
-  BuiltinRegistry b;
-  b.registry.freeze();
-  EXPECT_TRUE(b.registry.frozen());
+  AnalysisRegistry registry;
+  registry.freeze();
+  EXPECT_TRUE(registry.frozen());
   auto filter = [](const api::AnalyzerComponent&) -> std::unique_ptr<TokenFilterFactory> { return nullptr; };
-  EXPECT_THROW(b.registry.addFilter("late", filter), std::logic_error);
-  EXPECT_THROW(b.registry.addTokenizer("late", nullptr), std::logic_error);
-  EXPECT_THROW(b.registry.addCharFilter("late", nullptr), std::logic_error);
-  EXPECT_THROW(b.registry.addAnalyzer("late", api::AnalyzerDef{}), std::logic_error);
+  EXPECT_THROW(registry.addFilter("late", filter), std::logic_error);
+  EXPECT_THROW(registry.addTokenizer("late", nullptr), std::logic_error);
+  EXPECT_THROW(registry.addCharFilter("late", nullptr), std::logic_error);
+  EXPECT_THROW(registry.addAnalyzer("late", api::AnalyzerDef{}), std::logic_error);
   // lookups keep working
-  EXPECT_NE(nullptr, b.registry.findAnalyzer("english"));
-  EXPECT_NO_THROW(b.registry.makeFilter(component("lowercase")));
+  EXPECT_NE(nullptr, registry.findAnalyzer("english"));
+  EXPECT_NO_THROW(registry.makeFilter(component("lowercase")));
   EXPECT_TRUE(globalAnalysisRegistry().frozen());
   EXPECT_THROW(Registries::global().analysis.addFilter("late", filter), std::logic_error);
 }
 
 TEST_F(AnalysisRegistryTest, unknownNamesListValidOnesSorted) {
-  BuiltinRegistry b;
+  AnalysisRegistry registry;
   EXPECT_EQ("unknown filter 'stemmer'; valid filters: english_possessive, fold, kstem, lowercase, nfkc_cf, stop",
-            compileError(b.registry, R"({"filters":["stemmer"]})"));
+            compileError(registry, R"({"filters":["stemmer"]})"));
   EXPECT_EQ("unknown tokenizer 'standard'; valid tokenizers: keyword, unicode_word, whitespace",
-            compileError(b.registry, R"({"tokenizer":"standard"})"));
+            compileError(registry, R"({"tokenizer":"standard"})"));
   EXPECT_EQ("unknown char filter 'html'; valid char filters: html_strip, mapping, nfkc_cf",
-            compileError(b.registry, R"({"char_filters":["html"]})"));
+            compileError(registry, R"({"char_filters":["html"]})"));
   EXPECT_EQ("unknown analyzer 'french'; valid analyzers: english, standard",
-            compileError(b.registry, R"("french")"));
-  EXPECT_NE(std::string::npos, compileError(b.registry, R"({"filters":[{"params":{}}]})").find("has no name"));
+            compileError(registry, R"("french")"));
+  EXPECT_NE(std::string::npos, compileError(registry, R"({"filters":[{"params":{}}]})").find("has no name"));
 }
 
 TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
-  BuiltinRegistry b;
-  auto named = compileWith(b.registry, R"({"name":"english"})");
-  auto bare = compileWith(b.registry, R"("english")");
-  auto authored = compileWith(b.registry,
+  AnalysisRegistry registry;
+  auto named = compileWith(registry, R"({"name":"english"})");
+  auto bare = compileWith(registry, R"("english")");
+  auto authored = compileWith(registry,
       R"({"tokenizer":"unicode_word","filters":["nfkc_cf","fold","english_possessive",{"name":"kstem","params":{"possessive":false}}]})");
   EXPECT_EQ("english", named->presetName);
   EXPECT_EQ("english", bare->presetName);
@@ -159,8 +159,8 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
             named->canonical);
   EXPECT_TRUE(named->fusedHead);
   EXPECT_TRUE(named->fusedFold);
-  EXPECT_EQ(compileWith(b.registry, R"({"tokenizer":"unicode_word","filters":["nfkc_cf"]})")->canonical,
-            compileWith(b.registry, R"("standard")")->canonical);
+  EXPECT_EQ(compileWith(registry, R"({"tokenizer":"unicode_word","filters":["nfkc_cf"]})")->canonical,
+            compileWith(registry, R"("standard")")->canonical);
   // the example plugin's preset carries a char filter in the canonical form
   auto example = compileWith(globalAnalysisRegistry(), R"("example")");
   EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
@@ -170,12 +170,12 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
 }
 
 TEST_F(AnalysisRegistryTest, namedAnalyzerTakesOnlyCharFilters) {
-  BuiltinRegistry b;
+  AnalysisRegistry registry;
   const std::string expected = "analyzer 'english' is a named analyzer; it takes no tokenizer or filters";
-  EXPECT_EQ(expected, compileError(b.registry, R"({"name":"english","tokenizer":"keyword"})"));
-  EXPECT_EQ(expected, compileError(b.registry, R"({"name":"english","filters":["lowercase"]})"));
+  EXPECT_EQ(expected, compileError(registry, R"({"name":"english","tokenizer":"keyword"})"));
+  EXPECT_EQ(expected, compileError(registry, R"({"name":"english","filters":["lowercase"]})"));
   // char filters next to a name replace the preset's
-  auto withCharFilters = compileWith(b.registry, R"({"name":"english","char_filters":["html_strip"]})");
+  auto withCharFilters = compileWith(registry, R"({"name":"english","char_filters":["html_strip"]})");
   EXPECT_EQ("english", withCharFilters->presetName);
   EXPECT_EQ(R"({"char_filters":["html_strip"],"filters":["nfkc_cf","fold","english_possessive",{"name":"kstem","params":{"possessive":false}}],"tokenizer":"unicode_word"})",
             withCharFilters->canonical);
@@ -184,44 +184,44 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerTakesOnlyCharFilters) {
 }
 
 TEST_F(AnalysisRegistryTest, nestedNamedAnalyzerRejectedAtRegistration) {
-  BuiltinRegistry b;
+  AnalysisRegistry registry;
   api::AnalyzerDef alias;
   alias.name = "english";
-  EXPECT_THROW(b.registry.addAnalyzer("alias", alias), std::invalid_argument);
-  EXPECT_EQ(nullptr, b.registry.findAnalyzer("alias"));
+  EXPECT_THROW(registry.addAnalyzer("alias", alias), std::invalid_argument);
+  EXPECT_EQ(nullptr, registry.findAnalyzer("alias"));
 }
 
 TEST_F(AnalysisRegistryTest, freezeRejectsPresetWithMissingComponent) {
-  BuiltinRegistry b;
+  AnalysisRegistry registry;
   api::AnalyzerDef def;
   const api::AnalyzerComponent filters[] = {component("lowercase"), component("not_registered")};
   def.filters = filters;
-  b.registry.addAnalyzer("broken", def);  // components may be registered later, so this is accepted
+  registry.addAnalyzer("broken", def);  // components may be registered later, so this is accepted
   try {
-    b.registry.freeze();
+    registry.freeze();
     FAIL() << "freeze accepted an unresolvable preset";
   } catch (const std::invalid_argument& e) {
     EXPECT_NE(std::string::npos, std::string(e.what()).find("analyzer 'broken': unknown filter 'not_registered'"))
         << e.what();
   }
-  EXPECT_FALSE(b.registry.frozen());
+  EXPECT_FALSE(registry.frozen());
 }
 
 TEST_F(AnalysisRegistryTest, addAnalyzerCopiesTheDefinition) {
-  BuiltinRegistry b;
+  AnalysisRegistry registry;
   {
     std::pmr::monotonic_buffer_resource arena;
     api::AnalyzerDef def;
     ASSERT_TRUE(api::read_json(def, R"({"tokenizer":"keyword","filters":[{"name":"stop","params":{"words":["a"]}}]})", arena));
-    b.registry.addAnalyzer("copied", def);
+    registry.addAnalyzer("copied", def);
   }  // the authored views are gone
-  const api::AnalyzerDef* found = b.registry.findAnalyzer("copied");
+  const api::AnalyzerDef* found = registry.findAnalyzer("copied");
   ASSERT_NE(nullptr, found);
   EXPECT_EQ("keyword", found->tokenizer->name);
   ASSERT_EQ(1u, found->filters.size());
   EXPECT_EQ("stop", found->filters[0].name);
   EXPECT_EQ(R"({"char_filters":[],"filters":[{"name":"stop","params":{"words":["a"]}}],"tokenizer":"keyword"})",
-            compileWith(b.registry, R"("copied")")->canonical);
+            compileWith(registry, R"("copied")")->canonical);
 }
 
 TEST_F(AnalysisRegistryTest, examplePluginComponentsAreRegistered) {

@@ -56,7 +56,6 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   static detail::PluginInit state;
   state.run(addPlugins, [](auto addPlugins) {
     Registries r = Registries::global();
-    registerBuiltinAnalysis(r.analysis);
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {

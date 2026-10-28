@@ -803,18 +803,18 @@ std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def
 
 }  // namespace
 
-void registerBuiltinAnalysis(AnalysisRegistry& r) {
+void AnalysisRegistry::registerBuiltins() {
   // unicode_word is stateful: it carries a segmentation cursor and rebuilds it in reset().
-  r.addTokenizer("whitespace", plainTokenizer<makeWhitespaceTokenizer>);
-  r.addTokenizer("keyword", plainTokenizer<makeKeywordTokenizer>);
-  r.addTokenizer("unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>);
-  r.addFilter("lowercase", plainFilter<makeLowercaseFilter>);
-  r.addFilter("nfkc_cf", plainFilter<makeNfkcCasefoldFilter>);
-  r.addFilter("fold", plainFilter<makeAccentFoldFilter>);
-  r.addFilter("english_possessive", plainFilter<makeEnglishPossessiveFilter, false>);
-  r.addFilter("kstem", kstemFilter);
-  r.addFilter("stop", stopFilter);
-  registerBuiltinCharFilters(r);
+  addTokenizer("whitespace", plainTokenizer<makeWhitespaceTokenizer>);
+  addTokenizer("keyword", plainTokenizer<makeKeywordTokenizer>);
+  addTokenizer("unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>);
+  addFilter("lowercase", plainFilter<makeLowercaseFilter>);
+  addFilter("nfkc_cf", plainFilter<makeNfkcCasefoldFilter>);
+  addFilter("fold", plainFilter<makeAccentFoldFilter>);
+  addFilter("english_possessive", plainFilter<makeEnglishPossessiveFilter, false>);
+  addFilter("kstem", kstemFilter);
+  addFilter("stop", stopFilter);
+  registerBuiltinCharFilters();
 
   api::AnalyzerComponent unicodeWord;
   unicodeWord.name = "unicode_word";
@@ -827,7 +827,7 @@ void registerBuiltinAnalysis(AnalysisRegistry& r) {
   standard.tokenizer = unicodeWord;
   std::array<api::AnalyzerComponent, 1> standardFilters{nfkc};
   standard.filters = standardFilters;
-  r.addAnalyzer("standard", standard);
+  addAnalyzer("standard", standard);
   // possessive removal happens in english_possessive; kstem must not strip it a second time
   api::Val noPossessive;
   noPossessive.kind = false;
@@ -838,7 +838,7 @@ void registerBuiltinAnalysis(AnalysisRegistry& r) {
   english.tokenizer = unicodeWord;
   std::array<api::AnalyzerComponent, 4> englishFilters{nfkc, fold, possessive, kstem};
   english.filters = englishFilters;
-  r.addAnalyzer("english", english);
+  addAnalyzer("english", english);
 }
 
 std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def) {

@@ -142,7 +142,7 @@ locations, browse `src/luxir/<area>/`.
      the resolved view; `SchemaInfo` persists authored definitions and introductions
    - Analysis (`src/luxir/analysis/`): `AnalysisRegistry` (name -> maker for tokenizers,
      token filters, char filters, plus named analyzers) is the only path from an authored
-     `AnalyzerDef` to stages; built-ins register in `registerBuiltinAnalysis`, plugins add
+     `AnalyzerDef` to stages; its constructor seeds built-ins, plugins add
      more before the registry freezes. `Analyzer::compile` expands a named analyzer into
      its definition (the canonical JSON, and so segment metadata, never names the preset)
      and builds an immutable plan; `createChain` instantiates a per-thread `TokenChain`

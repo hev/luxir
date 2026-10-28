@@ -13,8 +13,9 @@ and it registers its components through a generated translation unit.
   `luxir_test` links `luxir_test_plugins`, which adds the test-only plugins.
 - Each area owns its function-local static registry.
   `luxir::Registries::global()` binds references to them for registration.
-  `luxir::initPlugins()` fills and freezes them: later registration throws,
-  and lookups read immutable tables without locking.
+  Each constructor seeds its built-ins. `luxir::initPlugins()` adds plugins and
+  freezes the registries: later registration throws, and lookups read immutable
+  tables without locking. Reads before the freeze are safe while nothing registers.
 - One `Plugin` instance per process supplies metadata and registers types once.
   Mutable node-level work belongs in a separate `PluginNodeState` per node;
   registered makers get the current node from their context.
@@ -31,8 +32,9 @@ initialization is terminal: every later call rethrows the original exception,
 even with a different adder. The registries may be partially populated or frozen;
 nothing about their state may be relied on afterwards, and the process must exit.
 
-1. Built-in components are registered (`registerBuiltinAnalysis`, so built-in names are
-   taken before any plugin can claim them).
+1. Each area constructs its registry on first access and seeds its built-ins,
+   so built-in names are taken before any plugin can claim them. Construction
+   does not initialize or freeze plugins.
 2. The `addPlugins` callback (executables pass `addConfiguredPlugins`, so the reference
    comes from the executable and the generated object is linked in) adds every
    configured plugin, in link-list order.
