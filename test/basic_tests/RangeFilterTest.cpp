@@ -347,29 +347,150 @@ TEST_F(RangeFilterTest, NumericSelectionPricesDenseAndSettledProduction) {
   }
 }
 
+TEST_F(RangeFilterTest, MultivaluedZonesPriceTheirDocumentVisits) {
+  // Two values per document: zones combine every document's values, far
+  // below verifying them all and far above verifying a few.
+  NumericPredicateQuery range("cluster_is", 4096, 28671);
+  for (auto [candidates, verifies] : {std::pair{int64_t{64}, true}, {int64_t{N}, false}}) {
+    SCOPED_TRACE(candidates);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+    auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(
+        candidates, N, Use::COUNT_WINDOWS));
+    build.membershipConsumption = Consumption::EITHER;
+    auto* scorer = supplier->resolve(pool, build)->build(pool);
+    if (verifies) {
+      EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::PredicateScorer<
+          IntColReader::SparseIterator>*>(scorer));
+    } else {
+      EXPECT_NE(nullptr, dynamic_cast<NumericPredicateQuery::ZoneMapScorer*>(scorer));
+    }
+  }
+}
+
+struct PullRun {
+  std::vector<int32_t> docs;
+  int64_t zoneArms;
+  int64_t verifyArms;
+  // Verified candidates per range, keyed by its upper bound.
+  std::map<int64_t, int64_t> verified;
+};
+
+static PullRun pullRun(IndexReader& reader, Query& query) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader.segments()[0]);
+  EXPECT_NE(nullptr, supplier);
+  if (supplier == nullptr) return {};
+  PullRun run;
+  NumericVerificationObserver observe([&](const NumericPredicateQuery& leaf, int32_t) {
+    run.verified[leaf.getHi()]++;
+  });
+  SkipStatsScope stats;
+  auto* scorer = buildScorerForTests(pool, *supplier, reader.maxDoc());
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    run.docs.push_back(doc);
+  }
+  run.zoneArms = SkipStats::numericPredicateZoneArms;
+  run.verifyArms = SkipStats::numericPredicateSparseVerifyArms;
+  return run;
+}
+
+TEST_F(RangeFilterTest, PullConjunctionKeepsAProducingRange) {
+  // Two point-less multivalued ranges, each cheap to verify against the
+  // other's matches and dear to produce. Each prices the other as producing;
+  // if both verified, the conjunction would lead on every document with a
+  // value. The narrower one produces and leads, so the other verifies only
+  // its matches.
+  NumericPredicateQuery narrow("cluster_is", 4096, 4607), wide("cluster_is", 4096, 5119);
+  std::array<Query*, 2> filters{&narrow, &wide};
+  BooleanQuery query({}, {}, {}, filters);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4095; doc <= 4607; doc++) expected.push_back(doc);
+  PullRun run = pullRun(*reader, query);
+  EXPECT_EQ(expected, run.docs);
+  EXPECT_EQ(1, run.zoneArms);
+  EXPECT_EQ(1, run.verifyArms);
+#ifndef NDEBUG
+  EXPECT_LE(run.verified[5119], (int64_t)expected.size());
+#endif
+}
+
+TEST_F(RangeFilterTest, VerifyingRangeFollowsACostlierTermLead) {
+  // The range estimates fewer matches than the term has postings, but a
+  // verifier iterates every document with a value: the plan costs the term,
+  // which leads the conjunction.
+  NumericPredicateQuery range("cluster_is", 4096, 4607);
+  TermQuery term("body_w", "dense_a");
+  std::array<Query*, 1> mandatory{&term};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery query(mandatory, {}, {}, filters);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  auto* plan = resolveScorerPlanForTests(pool, *supplier, N);
+  EXPECT_EQ(N / 16, plan->cost());
+  auto* scorer = plan->build(pool);
+  auto clauses = scorer->flatConjunctionScorers();
+  ASSERT_EQ(2u, clauses.size());
+  using Verifier = NumericPredicateQuery::PredicateScorer<IntColReader::SparseIterator>;
+  EXPECT_EQ(nullptr, dynamic_cast<Verifier*>(clauses[0]));
+  EXPECT_NE(nullptr, dynamic_cast<Verifier*>(clauses[1]));
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4095; doc <= 4607; doc++) if (doc % 16 == 0) expected.push_back(doc);
+  EXPECT_EQ(expected, docs);
+}
+
+TEST_F(RangeFilterTest, LoneRangeVerifiesAgainstItsOwnApproximation) {
+  // With no other approximation a verifying range leads on every document
+  // with a value, not on its own match estimate, so it produces.
+  NumericPredicateQuery range("cluster_is", 4096, 4607);
+  TermQuery b("body_w", "b");
+  std::array<Query*, 1> prohibited{&b};
+  std::array<Query*, 1> filters{&range};
+  BooleanQuery query({}, {}, prohibited, filters);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4095; doc <= 4607; doc++) if (doc % 3 != 0) expected.push_back(doc);
+  PullRun run = pullRun(*reader, query);
+  EXPECT_EQ(expected, run.docs);
+  EXPECT_EQ(1, run.zoneArms);
+  EXPECT_EQ(0, run.verifyArms);
+  // Describing prices the same demand, so it reports no verification.
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  EXPECT_EQ(Query::VerificationWork::ABSENT,
+            supplier->verificationWork(supplier->makePlanContext(Query::Demand::fromLeadCost(N))));
+}
+
 TEST_F(RangeFilterTest, EitherPricesPointProductionAgainstSurvivorVerification) {
-  // Half the docs: 16,384 points into a 512-word bitset, 16,896 point
-  // emissions against 24 per verified survivor and 4 per spared alignment.
-  // Unknown survivors keep 8 per raw candidate.
+  // Half the docs: 16,384 points into a 512-word bitset, about 16,461 point
+  // emissions against a price per verified survivor plus the consumer's
+  // spared work. Unknown survivors verify every candidate.
   struct Case {
     int64_t candidates;
     double survivors;
-    double alignments;
+    double spared;
     bool verifies;
   };
   NumericPredicateQuery range("points_i", 0, N - 1);
-  for (auto [candidates, survivors, alignments, verifies] : {
-           Case{1000, 1000, 0, false}, Case{1000, 100, 0, true},
-           Case{600, 600, 0, true}, Case{600, 600, 1800, false},
-           Case{1000, -1, 0, true}, Case{3000, -1, 0, false}}) {
-    SCOPED_TRACE(::testing::Message() << candidates << " " << survivors << " " << alignments);
+  for (auto [candidates, survivors, spared, verifies] : {
+           Case{4000, 4000, 0, false}, Case{4000, 200, 0, true},
+           Case{200, 200, 0, true}, Case{200, 200, 30000, false},
+           Case{200, -1, 0, true}, Case{4000, -1, 0, false}}) {
+    SCOPED_TRACE(::testing::Message() << candidates << " " << survivors << " " << spared);
     MemPool pool;
     Query::Context context(pool, *reader);
     auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
     ASSERT_EQ(N / 2, supplier->cost());
     auto demand = Query::Demand::fromCandidatesAndSpan(candidates, N, Use::COUNT_WINDOWS);
     demand.expectedCandidates = survivors;
-    demand.precedingAlignments = alignments;
+    demand.sparedWork = spared;
     auto build = supplier->makePlanContext(demand);
     build.membershipConsumption = Consumption::EITHER;
     EXPECT_EQ(verifies ? Consumption::CANDIDATES : Consumption::WINDOWS,
@@ -469,7 +590,9 @@ TEST_F(RangeFilterTest, ProofsSkipProductionInDenseAndSparseMembership) {
 }
 
 TEST_F(RangeFilterTest, ProofsRejectInsideWindowsAfterExactElimination) {
-  TermQuery a("body_w", "threshold"), b("body_w", "b"), excluded("body_w", "excluded");
+  // A rare conjunction (threshold docs are a subset of a's) verifies the
+  // striped range; its proof rejects the odd stripes first.
+  TermQuery a("body_w", "threshold"), b("body_w", "a"), excluded("body_w", "excluded");
   NumericPredicateQuery range("striped_i", 0, 0);
   std::array<Query*, 2> required{&a, &b};
   std::array<Query*, 1> filters{&range}, prohibited{&excluded};
@@ -477,14 +600,14 @@ TEST_F(RangeFilterTest, ProofsRejectInsideWindowsAfterExactElimination) {
   RAMBitDocSet domain(N);
   domain.mutableBits().set(768);
   std::vector<int32_t> expected;
-  for (int32_t doc = 0; doc < N; doc += 768) {
+  for (int32_t doc = 0; doc < N; doc += 256) {
     if ((doc / 512) % 2 == 0) expected.push_back(doc);
   }
   for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
     int64_t verified = 0;
     NumericVerificationObserver observe([&](int32_t doc) {
       EXPECT_EQ(0, (doc / 512) % 2);
-      EXPECT_EQ(0, doc % 768);
+      EXPECT_EQ(0, doc % 256);
       verified++;
     });
     EXPECT_EQ(expected, membership(query, use));
@@ -1027,24 +1150,36 @@ TEST_F(RangeFilterTest, CandidateExposurePricesOnlyTheIncomingFilterStream) {
   }
 }
 
-TEST_F(RangeFilterTest, ExplicitWindowExposureComparesZonesBelowLegacyVerifierFence) {
+TEST_F(RangeFilterTest, ZonesArePricedByTheWindowsTheirConsumerReaches) {
+  // An explicit exposure refines its windows' blocks; pull candidates each
+  // reach a zone iteration window, so a thousand of them span the column,
+  // which is classified whole, and one verifies.
   NumericPredicateQuery range("proof_points_i", 0, N - 1);
-  for (auto [use, explicitSpan] : {
-           std::pair{Use::MATCH_WINDOWS, true}, {Use::MATCH_WINDOWS, false}, {Use::PULL, true}}) {
+  struct Case {
+    Use use;
+    int64_t candidates;
+    bool explicitSpan;
+    bool zones;
+    int64_t classified;
+  };
+  for (auto [use, candidates, explicitSpan, zones, classified] : {
+           Case{Use::MATCH_WINDOWS, 1024, true, true, 1}, Case{Use::MATCH_WINDOWS, 1, false, false, 0},
+           Case{Use::PULL, 1, true, false, 0}, Case{Use::PULL, 1024, false, true, 8}}) {
+    SCOPED_TRACE(::testing::Message() << (int)use << " " << candidates << " " << explicitSpan);
     MemPool pool;
     Query::Context context(pool, *reader);
     SkipStatsScope stats;
     auto* supplier = range.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
-    auto build = supplier->makePlanContext(Query::Demand::fromCandidatesAndSpan(1024, 1024, use));
-    if (explicitSpan) build.expectedSpan = 1024;
+    auto build = supplier->makePlanContext(
+        Query::Demand::fromCandidatesAndSpan(candidates, candidates, use));
+    if (explicitSpan) build.expectedSpan = candidates;
     auto* scorer = supplier->resolve(pool, build)->build(pool);
-    bool zones = explicitSpan && use == Use::MATCH_WINDOWS;
     EXPECT_EQ(zones ? 1 : 0, SkipStats::numericPredicateZoneArms);
     EXPECT_EQ(zones ? 0 : 1, SkipStats::numericPredicateSparseVerifyArms);
     std::array<uint64_t, 1> bits{};
     scorer->fillWindowBits(bits, 4096, 4160);
     EXPECT_EQ(~0ULL, bits[0]);
-    EXPECT_EQ(zones ? 1 : 0, SkipStats::numericPredicateClassifiedBlocks);
+    EXPECT_EQ(classified, SkipStats::numericPredicateClassifiedBlocks);
   }
 }
 

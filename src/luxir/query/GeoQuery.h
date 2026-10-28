@@ -291,8 +291,11 @@ public:
         MemPool& planPool,
         const Query::PlanContext& planContext) override {
       ScorerArm arm = selectScorerArm(planContext.demand.candidates);
+      // Verifying and scanning arms iterate every document with a value.
+      int64_t iterated = arm == ScorerArm::BKD ? cost()
+          : std::max(cost(), (int64_t)reader.docsWithValue());
       return planPool.make<Plan>(
-          *this, planContext, shapeFor(arm), cost(), arm);
+          *this, planContext, shapeFor(arm), iterated, arm);
     }
 
     BulkPlan planBulk(

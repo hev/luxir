@@ -547,26 +547,39 @@ public:
     RAW_MEMBERSHIP,
   };
 
+  // Producers and consumers price membership work in one unit, the point
+  // emission: decoding one point into a bitset, about 0.8 ns on hugin. A
+  // producer quotes its arms in it (NumericPredicateQuery's prices) and a
+  // consumer the work that producing would spare it (Demand::sparedWork).
   struct Demand {
     int64_t candidates = std::numeric_limits<int64_t>::max();
     int64_t span = std::numeric_limits<int64_t>::max();
     ExecutionUse horizon = ExecutionUse::PULL;
-    // A conjunction entry's expected incoming survivors (the independence
-    // yield of the entries ahead of it), or -1 when not supplied. candidates
-    // stays the lead's opportunity count.
+    // The candidates expected to reach this clause, or -1 when not supplied:
+    // the conjunction yield of a window entry's entries ahead, a pull
+    // clause's other approximations, or a filtered body's matches.
+    // candidates stays the lead's opportunity count.
     double expectedCandidates = -1;
-    // Lead candidates times the siblings aligned ahead of this entry: the
-    // alignment an early producer spares and a late verifier cannot.
-    double precedingAlignments = 0;
+    // The consumer's own work, in point emissions, that producing this entry
+    // would spare in proportion to the candidates it rejects: siblings it
+    // would align or advance and lead emissions it would skip. A verifier
+    // cannot spare it, because it is confirmed after that work.
+    double sparedWork = 0;
 
     // Child opportunities precede sibling rejection. Scale a child's own
     // full-domain estimate by the original consumer exposure, not final K.
+    // The consumer's expected candidates and spared work are full-domain too
+    // and arrive within the exposure, so they scale with it.
     Demand exposedTo(int64_t expectedSpan, int32_t maxDoc) const {
       if (expectedSpan >= maxDoc) return *this;
       double fraction = (double)std::max<int64_t>(0, expectedSpan)
           / std::max(1, maxDoc);
-      return {(int64_t)std::ceil(std::min(candidates, (int64_t)maxDoc) * fraction),
-              std::min(span, expectedSpan), horizon};
+      Demand exposed = *this;
+      exposed.candidates = (int64_t)std::ceil(std::min(candidates, (int64_t)maxDoc) * fraction);
+      exposed.span = std::min(span, expectedSpan);
+      if (expectedCandidates >= 0) exposed.expectedCandidates = expectedCandidates * fraction;
+      exposed.sparedWork = sparedWork * fraction;
+      return exposed;
     }
 
     static Demand fromCandidatesAndSpan(
@@ -904,6 +917,10 @@ public:
       // Whether matches estimates the supplier's yield. Otherwise it is only
       // an opportunity bound (a phrase's cheapest term, a capped threshold).
       bool knownMatches = false;
+      // Fraction of the docid space the matches can occupy: everything but
+      // the docid runs that hold no match. A conjunction leapfrogging a
+      // produced supplier skips its siblings' documents in those runs.
+      double hull = 1;
 
       void addWork(const MembershipWork& child) {
         produce += child.produce;
@@ -918,6 +935,16 @@ public:
         return reset + 74 * seekSteps * std::clamp(fraction, 0.0, 1.0);
       }
     };
+
+    // Appends the costs of the approximations a conjunction iterates for this
+    // supplier resolved under `context`: one, its cost(), unless its scorer
+    // exposes approximation enums that the conjunction flattens in its place.
+    virtual void approximationCosts(
+        MemPool& planPool, const PlanContext& context,
+        boost::container::small_vector_base<int64_t>& out) {
+      unused(planPool, context);
+      out.push_back(cost());
+    }
 
     virtual MembershipWork membershipWork(int32_t maxDoc) {
       double matches = (double)std::min<int64_t>(cost(), maxDoc);
@@ -2101,6 +2128,9 @@ public:
 
     const ScorerShape& shape() const noexcept { return recordedShape; }
     const Demand& demand() const noexcept { return planContext.demand; }
+    // What the built scorer iterates as a conjunction lead: its matches, or
+    // for a two-phase scorer its approximation, which the supplier's match
+    // estimate can understate. Conjunctions order their clauses by it.
     int64_t cost() const noexcept { return resolvedCost; }
     // Inspect the resolved graph only when reuse is requested. Computing
     // this recursively during construction taxes ordinary forward searches.
