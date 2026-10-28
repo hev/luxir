@@ -1527,6 +1527,17 @@ class BooleanQuery::ConjunctionScorer final : public Query::Scorer {
     }
   }
 
+  static std::optional<ExactApproxKind> directKind(Query::Scorer& scorer) {
+    // These leaves are final, so exact type equality identifies the
+    // specialization without walking their inheritance trees.
+    static_assert(std::is_final_v<DirectTermScorer>
+                  && std::is_final_v<PreparedDocSetScorer>);
+    const std::type_info& type = typeid(scorer);
+    if (type == typeid(DirectTermScorer)) return ExactApproxKind::TERM_SCORER;
+    if (type == typeid(PreparedDocSetScorer)) return ExactApproxKind::DOC_SET;
+    return std::nullopt;
+  }
+
   int32_t exactNext(size_t index) {
     const ApproxSlot& approximation = approximations[index];
     switch (exactApproxKinds[index]) {
@@ -1734,10 +1745,6 @@ public:
               });
     if (!competitivePruning
         && !disableExactDirectApproximationsForTests) {
-      // These leaves are final, so exact type equality identifies the
-      // specialization without walking their inheritance trees.
-      static_assert(std::is_final_v<DirectTermScorer>
-                    && std::is_final_v<PreparedDocSetScorer>);
       auto kinds =
           pool.make_span<ExactApproxKind>(approximations.size());
       bool supported = true;
@@ -1748,13 +1755,8 @@ public:
           continue;
         }
         if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE) {
-          const std::type_info& type = typeid(*approximation.scorer);
-          if (type == typeid(DirectTermScorer)) {
-            kinds[i] = ExactApproxKind::TERM_SCORER;
-            continue;
-          }
-          if (type == typeid(PreparedDocSetScorer)) {
-            kinds[i] = ExactApproxKind::DOC_SET;
+          if (auto kind = directKind(*approximation.scorer)) {
+            kinds[i] = *kind;
             continue;
           }
         }
@@ -1766,6 +1768,18 @@ public:
         skipCount(SkipStats::conjExactDirectApproxEngagements);
       }
     }
+  }
+
+  // Whether a conjunction of just these clauses runs the exact
+  // direct-approximation loop: no pruning, and each clause single-phase and
+  // a direct term or doc set.
+  static bool exactAlone(std::span<Query::Scorer* const> clauses,
+                         std::span<const uint8_t> twoPhase, bool competitivePruning) {
+    if (competitivePruning || disableExactDirectApproximationsForTests) return false;
+    for (size_t i = 0; i < clauses.size(); i++) {
+      if (twoPhase[i] != 0 || !directKind(*clauses[i])) return false;
+    }
+    return true;
   }
 
   int32_t advanceWindow(int32_t min, int32_t max) override {
@@ -7808,16 +7822,20 @@ class BooleanQuery::Weight final : public Query::Weight {
     }
   }
 
-  // Outcome of building the required (mandatory + filter) conjunction for a
-  // segment. `scorer` is null when there are no required clauses at all;
-  // `unsatisfiable` is true when a required clause cannot match this segment,
-  // so the whole boolean cannot match it.
+  // The required (mandatory + filter) clauses of one segment, built but not
+  // yet composed: `all`, in ascending cost (`costs`), is empty when there
+  // are no required clauses at all, and `scoring` is the subset that
+  // contributes to score(). `unsatisfiable` is true when a required clause
+  // cannot match this segment, so the whole boolean cannot match it. `cost`
+  // is the cheapest required supplier's cost, which the filter-density gates
+  // read.
   struct Required {
-    Query::Scorer* scorer;
+    std::span<Query::Scorer*> all;
+    std::span<int64_t> costs;
+    std::span<uint8_t> twoPhase;
+    std::span<Query::Scorer*> scoring;
     bool unsatisfiable;
     int64_t cost;
-    size_t scoringCount;
-    bool twoPhase;
   };
 
   struct PullChildPlan {
@@ -7854,21 +7872,19 @@ class BooleanQuery::Weight final : public Query::Weight {
         Query::Demand::fromLeadCost(leadCost, horizon));
   }
 
-  // Build the required-clause conjunction from the child plans retained by
-  // the Boolean plan. Mandatory clauses score; filters only constrain
-  // iteration. Resolve has already frozen the pre-expansion supplier order
-  // and passed the sparsest required cost to every child plan.
+  // Build the required clauses from the child plans retained by the Boolean
+  // plan. Mandatory clauses score; filters only constrain iteration. Resolve
+  // has already frozen the pre-expansion supplier order and passed the
+  // Boolean's lead cost to every child plan.
   static Required assembleRequired(
       MemPool& targetPool,
       std::span<PullChildPlan> entries,
-      int64_t leadCost,
-      bool allowsPruning,
-      bool enableTwoPhase) {
+      int64_t leadCost) {
     size_t scoringCapacity = 0;
     for (const PullChildPlan& entry : entries) {
       scoringCapacity += entry.scoring ? 1 : 0;
     }
-    if (entries.empty()) return {nullptr, false, 0, 0, false};
+    if (entries.empty()) return {{}, {}, {}, {}, false, 0};
 
     auto* all = targetPool.make_arr<Query::Scorer*>(entries.size());
     auto* costs = targetPool.make_arr<int64_t>(entries.size());
@@ -7880,7 +7896,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     size_t scoringCount = 0;
     for (auto& e : entries) {
       auto* scorer = e.plan->build(targetPool);
-      if (scorer == nullptr) return {nullptr, true, 0, 0, false};
+      if (scorer == nullptr) return {{}, {}, {}, {}, true, 0};
       all[allCount] = scorer;
       assert(e.plan->shape().reportedTwoPhase
              != Query::ReportedTwoPhase::UNKNOWN);
@@ -7890,18 +7906,40 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (e.scoring) scoring[scoringCount++] = scorer;
     }
 
-    // A lone scoring clause (one mandatory, no filters) needs no wrapper.
-    if (allCount == 1 && scoringCount == 1) {
-      return {all[0], false, leadCost, 1,
-              twoPhase[0] != 0};
+    return {std::span<Query::Scorer*>(all, allCount),
+            std::span<int64_t>(costs, allCount), twoPhase.first(allCount),
+            std::span<Query::Scorer*>(scoring, scoringCount), false, leadCost};
+  }
+
+  // The required clauses as one scorer. A lone scoring clause (one
+  // mandatory, no filters) needs no wrapper; a conjunction confirms its
+  // two-phase clauses itself, so it is not two-phase to its parent.
+  static Query::Scorer* composeRequired(
+      MemPool& targetPool, const Required& req, bool allowsPruning,
+      bool enableTwoPhase, bool& twoPhase) {
+    if (req.all.size() == 1 && req.scoring.size() == 1) {
+      twoPhase = req.twoPhase[0] != 0;
+      return req.all[0];
     }
-    return {targetPool.make<BooleanQuery::ConjunctionScorer>(
-              targetPool, std::span<Query::Scorer*>(all, allCount),
-              std::span<int64_t>(costs, allCount),
-              twoPhase.first(allCount),
-              std::span<Query::Scorer*>(scoring, scoringCount),
-              allowsPruning, enableTwoPhase),
-            false, leadCost, scoringCount, false};
+    twoPhase = false;
+    return targetPool.make<BooleanQuery::ConjunctionScorer>(
+        targetPool, req.all, req.costs, req.twoPhase, req.scoring,
+        allowsPruning, enableTwoPhase);
+  }
+
+  // The required clauses composed as one clause led by the cheapest.
+  static Required nestRequired(
+      MemPool& targetPool, const Required& req, bool allowsPruning,
+      bool enableTwoPhase) {
+    auto all = targetPool.make_span<Query::Scorer*>(1);
+    auto costs = targetPool.make_span<int64_t>(1);
+    auto twoPhase = targetPool.make_span<uint8_t>(1);
+    bool composedTwoPhase;
+    all[0] = composeRequired(targetPool, req, allowsPruning, enableTwoPhase, composedTwoPhase);
+    costs[0] = req.costs.front();
+    twoPhase[0] = (uint8_t)composedTwoPhase;
+    return {all, costs, twoPhase, req.scoring.empty() ? all.first(0) : all,
+            false, req.cost};
   }
 
   template <template <bool> class Scorer, typename... Args>
@@ -7934,19 +7972,17 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool allowsPruning,
       ScorePolicy scorePolicy,
       const Query::PlanContext& planContext) {
-    Required req = assembleRequired(
-        targetPool, requiredPlans, requiredLeadCost, allowsPruning,
-        !planContext.disableBooleanTwoPhaseForTests);
+    bool enableTwoPhase = !planContext.disableBooleanTwoPhaseForTests;
+    Required req = assembleRequired(targetPool, requiredPlans, requiredLeadCost);
     if (req.unsatisfiable) return nullptr;
-    Query::Scorer* reqScorer = req.scorer;
-    bool hasScoringMandatory = req.scoringCount > 0;
+    bool hasRequired = !req.all.empty();
     // Whether the optional group CONSTRAINS matching (Lucene bool
     // semantics): min_match >= 1 makes it a real constraint; otherwise
     // optionals only rank, provided a required or filter clause already
-    // carries the match (reqScorer non-null iff such clauses exist).  With
+    // carries the match (hasRequired iff such clauses exist).  With
     // nothing else, at least one optional must match - the classic
     // should-only boolean.
-    bool optionalsConstrain = minShouldMatch >= 1 || reqScorer == nullptr;
+    bool optionalsConstrain = minShouldMatch >= 1 || !hasRequired;
 
     // For min-should-match (> 1) order the optional scorers by cost so the
     // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
@@ -7990,8 +8026,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     if (!optionalScorers.empty()) {
       int optCount = (int)optionalScorers.size();
       bool directWindowFilters = false;
-      if (mandatoryCount == 0 && filterCount != 0
-          && reqScorer != nullptr) {
+      if (mandatoryCount == 0 && filterCount != 0 && hasRequired) {
         directWindowFilters = requiredPlans.size() == filterCount
             && std::all_of(
                 requiredPlans.begin(), requiredPlans.end(),
@@ -8005,21 +8040,21 @@ class BooleanQuery::Weight final : public Query::Weight {
               optionalDirectTerm.begin(), optionalDirectTerm.end(),
               [](uint8_t value) { return value != 0; });
       // The filtered scored-bulk density gate has selected pull for this
-      // exact shape. The filter remains the conjunction lead, and WAND is the
-      // sole scoring disjunction member.
+      // exact shape. The filter leads the constraining conjunction unless it
+      // verifies, and WAND is the sole scoring disjunction member.
       bool useFilteredUnionWand = !disableFilteredUnionWandForTests
           && needsScores && minShouldMatch == 1
           && mandatoryCount == 0 && prohibitedSourceCount == 0
           && directWindowFilters && flatTermDisjunction
-          && req.scoringCount == 0
+          && req.scoring.empty()
           && filterDensityRoutesToPull(req.cost, segment.maxDoc());
       bool plainExternalDisjunction = externallyDriven && needsScores
-        && reqScorer == nullptr && prohibitedSourceCount == 0
+        && !hasRequired && prohibitedSourceCount == 0
         && minShouldMatch <= 1 && optCount >= 2;
       if (plainExternalDisjunction) {
         sortByMaxScore(targetPool, optionalScorers);
       }
-      bool useMaxScoreDisjunction = needsScores && reqScorer == nullptr
+      bool useMaxScoreDisjunction = needsScores && !hasRequired
         && prohibitedSourceCount == 0 && minShouldMatch <= 1 && optCount >= 2
         && !plainExternalDisjunction;
       // minShouldMatch applies to optional scorers that exist in this segment.
@@ -8053,7 +8088,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           allowsPruning,
           !planContext.disableBooleanTwoPhaseForTests);
       } else if (optCount > minShouldMatch) {
-        bool useWand = needsScores && reqScorer == nullptr
+        bool useWand = needsScores && !hasRequired
             && prohibitedSourceCount == 0;
         if (useWand) {
           optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
@@ -8066,45 +8101,67 @@ class BooleanQuery::Weight final : public Query::Weight {
     }
 
     Query::Scorer* boolScorer = nullptr;
-    if (reqScorer == nullptr) {
+    if (!hasRequired) {
       // No required clauses: the optional side stands alone.
       if (optScorer == nullptr) return nullptr;
       boolScorer = optScorer;
     } else if (optScorer == nullptr) {
-      // reqScorer present, but no optional scorer survived this segment (the
-      // optional terms are absent, or fewer survive than minShouldMatch).  A
-      // constraining optional group means no match here - returning
-      // reqScorer would wrongly emit filter/required-only docs.  A rank-only
-      // group is simply absent.
+      // Required clauses present, but no optional scorer survived this
+      // segment (the optional terms are absent, or fewer survive than
+      // minShouldMatch).  A constraining optional group means no match here -
+      // returning the required side would wrongly emit filter/required-only
+      // docs.  A rank-only group is simply absent.
       if (optionalsConstrain && optionalSourceCount != 0) return nullptr;
-      boolScorer = reqScorer;
+      bool twoPhase;
+      boolScorer = composeRequired(targetPool, req, allowsPruning, enableTwoPhase, twoPhase);
     } else if (!optionalsConstrain) {
       // min_match unset with required/filter clauses: optionals rank
       // coincident matches but never decide them.
+      bool reqTwoPhase;
+      Query::Scorer* reqScorer = composeRequired(
+          targetPool, req, allowsPruning, enableTwoPhase, reqTwoPhase);
       boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(
-          targetPool, reqScorer, req.twoPhase, optScorer, optTwoPhase,
-          !planContext.disableBooleanTwoPhaseForTests);
+          targetPool, reqScorer, reqTwoPhase, optScorer, optTwoPhase,
+          enableTwoPhase);
     } else {
       // min_match >= 1 alongside required/filter clauses: the optional
-      // group is a constraint, conjoined with the required side.  Scoring
-      // clauses on both sides contribute (filters score nothing).
-      std::span<Query::Scorer*> allSpan(targetPool.make_arr<Query::Scorer*>(2), 2);
-      allSpan[0] = reqScorer;
-      allSpan[1] = optScorer;
-      std::span<int64_t> allCosts(targetPool.make_arr<int64_t>(2), 2);
-      allCosts[0] = req.cost;
-      allCosts[1] = optionalCost(
+      // group is one more required clause, placed in cost order (required
+      // first on ties) so the cheaper side leads. The required clauses join
+      // the group's conjunction, which confirms each two-phase one per
+      // candidate; a nested required conjunction would confirm them inside
+      // its advance and walk them doc by doc. Only required clauses that run
+      // the exact direct-approximation loop on their own, which the group
+      // would leave, stay one nested clause. Scores sum the scoring required
+      // clauses, then the group (filters score nothing).
+      if (BooleanQuery::ConjunctionScorer::exactAlone(req.all, req.twoPhase, allowsPruning)) {
+        req = nestRequired(targetPool, req, allowsPruning, enableTwoPhase);
+      }
+      size_t count = req.all.size() + 1;
+      auto all = targetPool.make_span<Query::Scorer*>(count);
+      auto costs = targetPool.make_span<int64_t>(count);
+      auto twoPhase = targetPool.make_span<uint8_t>(count);
+      int64_t groupCost = optionalCost(
           optionalCosts, minShouldMatch, segment.maxDoc());
-      size_t nscoring = hasScoringMandatory ? 2 : 1;
-      std::span<Query::Scorer*> scoringSpan(targetPool.make_arr<Query::Scorer*>(nscoring), nscoring);
-      scoringSpan[nscoring - 1] = optScorer;
-      if (hasScoringMandatory) scoringSpan[0] = reqScorer;
-      std::array<uint8_t, 2> allTwoPhase{
-          (uint8_t)req.twoPhase, (uint8_t)optTwoPhase};
+      size_t group = 0;
+      while (group < req.all.size() && req.costs[group] <= groupCost) group++;
+      for (size_t i = 0, j = 0; j < count; j++) {
+        if (j == group) {
+          all[j] = optScorer;
+          costs[j] = groupCost;
+          twoPhase[j] = (uint8_t)optTwoPhase;
+          continue;
+        }
+        all[j] = req.all[i];
+        costs[j] = req.costs[i];
+        twoPhase[j] = req.twoPhase[i];
+        i++;
+      }
+      auto scoring = targetPool.make_span<Query::Scorer*>(req.scoring.size() + 1);
+      std::copy(req.scoring.begin(), req.scoring.end(), scoring.begin());
+      scoring.back() = optScorer;
       boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-          targetPool, allSpan, allCosts,
-          allTwoPhase, scoringSpan, allowsPruning,
-          !planContext.disableBooleanTwoPhaseForTests);
+          targetPool, all, costs, twoPhase, scoring, allowsPruning,
+          enableTwoPhase);
     }
 
     auto prohibitedStorage =
@@ -8968,8 +9025,11 @@ class BooleanQuery::Weight final : public Query::Weight {
       std::copy(prohibited.begin(), prohibited.end(), prohibitedPlans.begin());
 
       if (!requiredUnsatisfiable) {
+        // Required clauses are advanced to the Boolean's candidates, so their
+        // demand is its lead: cost() includes the optional group when it must
+        // match. requiredLeadCost stays the required side's own lead.
         Query::PlanContext requiredContext = childPlanContext(
-            planContext, requiredLeadCost);
+            planContext, resolvedCost);
         for (PullChildPlan& child : requiredPlans) {
           child.plan = child.supplier->resolve(
               planPool, requiredContext);
