@@ -1583,8 +1583,7 @@ public:
       static Query::ScorerShape shapeFor(
           Selection selection, Query::MatchState matchState) {
         ScorerArm arm = selection.arm;
-        bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
-            || arm == ScorerArm::SCAN;
+        bool twoPhase = arm == ScorerArm::SPARSE_VERIFY;
         return {
           .matchState = matchState,
           .directKind = Query::DirectScorerKind::OTHER,

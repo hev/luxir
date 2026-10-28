@@ -207,8 +207,8 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
                     : Query::MembershipConsumption::WINDOWS
                 : consumption,
             shape.membershipConsumption);
-  bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY
-      || expectedKind == ExpectedScorerKind::SCAN;
+  // A scan produces matches; only the sparse verifier defers its value test.
+  bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY;
   EXPECT_EQ(expectedMatchState, shape.matchState);
   EXPECT_EQ(Query::DirectScorerKind::OTHER, shape.directKind);
   EXPECT_EQ(expectedTwoPhase ? Query::ReportedTwoPhase::YES
