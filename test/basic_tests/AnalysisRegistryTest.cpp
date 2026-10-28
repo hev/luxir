@@ -149,13 +149,13 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
   auto named = compileWith(registry, R"({"name":"english"})");
   auto bare = compileWith(registry, R"("english")");
   auto authored = compileWith(registry,
-      R"({"tokenizer":"unicode_word","filters":["nfkc_cf","fold","english_possessive",{"name":"kstem","params":{"possessive":false}}]})");
+      R"({"tokenizer":"unicode_word","filters":["nfkc_cf","fold","kstem"]})");
   EXPECT_EQ("english", named->presetName);
   EXPECT_EQ("english", bare->presetName);
   EXPECT_TRUE(authored->presetName.empty());
   EXPECT_EQ(authored->canonical, named->canonical);  // the persisted form never names the preset
   EXPECT_EQ(authored->canonical, bare->canonical);
-  EXPECT_EQ(R"({"char_filters":[],"filters":["nfkc_cf","fold","english_possessive",{"name":"kstem","params":{"possessive":false}}],"tokenizer":"unicode_word"})",
+  EXPECT_EQ(R"({"char_filters":[],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})",
             named->canonical);
   EXPECT_TRUE(named->fusedHead);
   EXPECT_TRUE(named->fusedFold);
@@ -177,7 +177,7 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerTakesOnlyCharFilters) {
   // char filters next to a name replace the preset's
   auto withCharFilters = compileWith(registry, R"({"name":"english","char_filters":["html_strip"]})");
   EXPECT_EQ("english", withCharFilters->presetName);
-  EXPECT_EQ(R"({"char_filters":["html_strip"],"filters":["nfkc_cf","fold","english_possessive",{"name":"kstem","params":{"possessive":false}}],"tokenizer":"unicode_word"})",
+  EXPECT_EQ(R"({"char_filters":["html_strip"],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})",
             withCharFilters->canonical);
   EXPECT_EQ(R"({"char_filters":["nfkc_cf"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
             compileWith(globalAnalysisRegistry(), R"({"name":"example","char_filters":["nfkc_cf"]})")->canonical);
