@@ -13,8 +13,9 @@ and it registers its components through a generated translation unit.
   `luxir_test` links `luxir_test_plugins`, which adds the test-only plugins.
 - Each area owns its function-local static registry.
   `luxir::Registries::global()` binds references to them for registration.
-  `luxir::initPlugins()` fills and freezes them: later registration throws,
-  and lookups read immutable tables without locking.
+  Each constructor seeds its built-ins. `luxir::initPlugins()` adds plugins and
+  freezes the registries: later registration throws, and lookups read immutable
+  tables without locking. Reads before the freeze are safe while nothing registers.
 - One `Plugin` instance per process supplies metadata and registers types once.
   Mutable node-level work belongs in a separate `PluginNodeState` per node;
   registered makers get the current node from their context.
@@ -31,8 +32,9 @@ initialization is terminal: every later call rethrows the original exception,
 even with a different adder. The registries may be partially populated or frozen;
 nothing about their state may be relied on afterwards, and the process must exit.
 
-1. Each area constructs its registry on first access and seeds its built-ins
-   there (these registries have none yet). This does not initialize plugins.
+1. Each area constructs its registry on first access and seeds its built-ins,
+   so built-in names are taken before any plugin can claim them. Construction
+   does not initialize or freeze plugins.
 2. The `addPlugins` callback (executables pass `addConfiguredPlugins`, so the reference
    comes from the executable and the generated object is linked in) adds every
    configured plugin, in link-list order.
@@ -265,3 +267,85 @@ counters. The makers and handlers reach that state through their contexts.
 `PluginExtensionTest` and `PluginQueryTest` exercise the plugin end to end,
 including independent live nodes; `PluginTest` covers registry validation and
 state creation/destruction order.
+
+## Analysis components
+
+`Registries::analysis` (`src/luxir/analysis/AnalysisRegistry.h`) maps names to makers
+for four kinds of component. A maker receives the authored `api::AnalyzerComponent` (its
+`name` and typed `params`), validates the params, and returns an immutable factory that
+creates one stage per chain. Makers throw `std::invalid_argument` with a message that
+teaches (what was wrong, what is valid); the registry adds "unknown filter 'x'; valid
+filters: ..." for unknown names.
+
+| Registration | Maker returns | Stage |
+|---|---|---|
+| `addTokenizer(name, maker)` | `TokenizerFactory` | splits the value into tokens |
+| `addFilter(name, maker)` | `TokenFilterFactory` | wraps the previous stage (`TokenFilter`); `prepare` may analyze params through the preceding stages |
+| `addCharFilter(name, maker)` | `CharFilterFactory` | rewrites the value before tokenization (`CharFilter`) |
+| `addAnalyzer(name, def)` | (a complete `api::AnalyzerDef`) | a named analyzer |
+
+Rules:
+
+- Names are `[a-z0-9_]+`, unique per kind. A duplicate, or any add after the freeze,
+  throws. Built-ins cannot be replaced.
+- Put expensive shared state (a word set, a dictionary) in the factory, which is shared by
+  every field using the definition; stages are per chain and not thread-safe.
+- Follow the token borrow contract in `Analyzer.h`: a filter never writes the bytes it was
+  given, it copies into its own buffer and repoints `token.text`. Set `normalizing = true`
+  and override `normalizeTerm` only if the transformation is safe to apply to a multiterm
+  (prefix, fuzzy) literal; stemmers are not. Set `stateful = true` if the stage buffers
+  across tokens and needs `reset()` per value.
+- A char filter (`src/luxir/analysis/CharFilter.h`) overrides `filter()`, reading `input`
+  and calling `replace(start, end, text)` for each rewrite in increasing input order;
+  unchanged input is borrowed and the base class records the edits, so
+  `TokenChain::sourceOffset` maps token offsets back to the original text. A
+  `normalizing` char filter also runs on multiterm literals.
+- `addAnalyzer` deep-copies the definition into registry-owned storage, so the
+  `AnalyzerDef` and its arena views may die right after the call. A definition may not
+  itself be a named analyzer. Its components are checked when the registries freeze, so
+  they may be registered after the analyzer; one that does not resolve fails startup.
+  `Analyzer::compile` stores the expanded definition, never the name, in the canonical
+  JSON that field signatures and the resolved view use. The stored schema keeps the name and expands it
+  again at every load, so changing a registered analyzer takes effect for a collection
+  when it next loads, for queries and new documents alike.
+- The fused `unicode_word` + `nfkc_cf` fast path applies only to exactly those built-in
+  components; plugin stages always run as written.
+- A collection whose persisted schema names a component this binary does not have fails to
+  load with the "unknown ..." message; the node keeps serving its other collections.
+
+The example plugin registers a `reverse` filter (reverses token bytes, `normalizing`), a
+`strip_x` char filter (removes every `x` through `replace`) and the analyzer `example` =
+`whitespace` + char filter `strip_x` + filters `lowercase`, `reverse`:
+
+```cpp
+void registerComponents(luxir::Registries& r) override {
+  r.analysis.addFilter("reverse", [](const luxir::api::AnalyzerComponent& def) {
+    struct Factory : luxir::TokenFilterFactory {
+      std::unique_ptr<luxir::TokenStream> create(std::unique_ptr<luxir::TokenStream> source) const override {
+        return std::make_unique<ReverseFilter>(std::move(source));
+      }
+    };
+    auto factory = std::make_unique<Factory>();
+    factory->name = "reverse";
+    factory->normalizing = true;
+    return std::unique_ptr<luxir::TokenFilterFactory>(std::move(factory));
+  });
+  // addCharFilter("strip_x", ...) is the same shape with a CharFilterFactory.
+
+  luxir::api::AnalyzerComponent whitespace, stripX, lowercase, reverse;
+  whitespace.name = "whitespace";
+  // ... set the other names ...
+  luxir::api::AnalyzerDef example;
+  example.tokenizer = whitespace;
+  const luxir::api::AnalyzerComponent charFilters[] = {stripX};
+  const luxir::api::AnalyzerComponent filters[] = {lowercase, reverse};
+  example.char_filters = charFilters;
+  example.filters = filters;
+  r.analysis.addAnalyzer("example", example);
+}
+```
+
+A schema then uses the plugin by name (`"analyzer": "example"`) or composes its components
+(`"analyzer": {"tokenizer": "whitespace", "filters": ["reverse"]}`).
+Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
+always run.

@@ -40,11 +40,13 @@ PluginRegistry& PluginRegistry::global() {
 }
 
 Registries Registries::global() {
-  return {PluginRegistry::global(), QueryRegistry::global(), SearchOpRegistry::global(), HttpRouteRegistry::global()};
+  return {PluginRegistry::global(), AnalysisRegistry::global(), QueryRegistry::global(),
+          SearchOpRegistry::global(), HttpRouteRegistry::global()};
 }
 
 void Registries::freeze() {
   plugins.freeze();
+  analysis.freeze();
   query.freeze();
   searchOps.freeze();
   http.freeze();
