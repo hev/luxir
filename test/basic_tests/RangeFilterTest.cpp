@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/query/BooleanWeight.h"
+#include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
@@ -525,6 +527,131 @@ TEST_F(RangeFilterTest, EitherProducesBroadUnionsAndVerifiesRareOnes) {
     EXPECT_EQ(verifies ? 1 : 0, SkipStats::numericPredicateSparseVerifyArms);
     EXPECT_EQ(verifies ? 0 : 1, SkipStats::numericPredicatePointsArms);
   }
+}
+
+TEST_F(RangeFilterTest, ProducedFiltersFaceAUnionAsTheirIntersection) {
+  // Two produced ranges intersect to about 512 docs (estimated 1,024), fewer
+  // than the union's 1,280 candidates, although each alone has more: they
+  // lead as one nested conjunction instead of each facing the union.
+  NumericPredicateQuery spread("points_i", 0, 4095);          // 2,048 docs
+  NumericPredicateQuery run("proof_points_i", 4096, 12287);   // 8,192 docs
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> optional{&a, &c};
+  std::array<Query*, 2> filters{&spread, &run};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+  auto clauses = scorer->flatConjunctionScorers();
+  ASSERT_EQ(2u, clauses.size());
+  EXPECT_NE(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clauses[0]));
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  std::vector<int32_t> expected;
+  for (int32_t doc = 4096; doc < 12288; doc++) {
+    bool body = doc % 64 == 0 || doc % 64 == 1 || doc % 128 == 0;
+    if (body && 2 * ((doc * 1543) % N) <= 4095) expected.push_back(doc);
+  }
+  EXPECT_EQ(expected, docs);
+}
+
+TEST_F(RangeFilterTest, CachedFiltersUnderTopKFaceAUnionAsTheirIntersection) {
+  // The filter cache admits both ranges on their second sighting and serves
+  // them as prepared doc sets from the third. Under top-k pruning they nest
+  // as one unpruned conjunction ahead of the union (their ~512-doc
+  // intersection, estimated 1,024, is below the union's 1,280 candidates),
+  // and rank exactly as the uncached plan does.
+  NumericPredicateQuery spread("points_i", 0, 4095), run("proof_points_i", 4096, 12287);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> optional{&a, &c};
+  std::array<Query*, 2> filters{&spread, &run};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  auto cached = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto collect = [&](IndexReader& source, bool expectNested) {
+    MemPool pool;
+    Query::Context context(pool, source);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto* supplier = weight->scorerSupplier(pool, source.segments()[0]);
+    EXPECT_NE(nullptr, supplier);
+    std::vector<std::pair<int32_t, float>> out;
+    if (supplier == nullptr) return out;
+    auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+    if (expectNested) {
+      auto clauses = scorer->flatConjunctionScorers();
+      EXPECT_EQ(2u, clauses.size());
+      auto* nested = clauses.empty() ? nullptr
+          : dynamic_cast<BooleanQuery::ConjunctionScorer*>(clauses[0]);
+      EXPECT_NE(nullptr, nested);
+      if (nested != nullptr) {
+        for (auto* clause : nested->flatConjunctionScorers()) {
+          EXPECT_NE(nullptr, dynamic_cast<QueryPrep::DocSetScorer*>(clause));
+        }
+      }
+    }
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      out.emplace_back(doc, scorer->score());
+    }
+    return out;
+  };
+  auto expected = collect(*reader, false);
+  EXPECT_FALSE(expected.empty());
+  collect(*cached, false);
+  collect(*cached, false);
+  EXPECT_EQ(expected, collect(*cached, true));
+}
+
+TEST_F(RangeFilterTest, LonePreparedFilterUnderTopKStaysFlat) {
+  // One prepared filter beside a union under pruning keeps its flat place in
+  // the group's conjunction.
+  NumericPredicateQuery spread("points_i", 0, 4095);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  ForcePrepareQuery prepareA(&a);
+  std::array<Query*, 2> optional{&prepareA, &c};
+  std::array<Query*, 1> filters{&spread};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  Query::Weight::PrepareContext prepareContext{*reader, std::span<DocSet* const>{}, false, nullptr};
+  auto preparedWeight = weight->prepare(prepareContext);
+  auto* supplier = preparedWeight->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  auto clauses = resolveScorerPlanForTests(pool, *supplier, N)->build(pool)->flatConjunctionScorers();
+  ASSERT_EQ(2u, clauses.size());
+  for (auto* clause : clauses) {
+    EXPECT_EQ(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clause));
+  }
+}
+
+TEST_F(RangeFilterTest, TwoPhaseFilterStaysBesideTheNestedFilters) {
+  // The two produced ranges nest by their intersection; a third range that
+  // verifies stays its own clause beside them.
+  NumericPredicateQuery spread("points_i", 0, 4095), run("proof_points_i", 4096, 12287);
+  NumericPredicateQuery broad("column_i", 0, 59000);
+  TermQuery a("body_w", "a"), c("body_w", "c");
+  std::array<Query*, 2> optional{&a, &c};
+  std::array<Query*, 3> filters{&spread, &run, &broad};
+  BooleanQuery query({}, optional, {}, filters, 1);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  SkipStatsScope stats;
+  auto* scorer = resolveScorerPlanForTests(pool, *supplier, N)->build(pool);
+  EXPECT_EQ(1, SkipStats::numericPredicateSparseVerifyArms);
+  auto clauses = scorer->flatConjunctionScorers();
+  ASSERT_EQ(3u, clauses.size());
+  EXPECT_NE(nullptr, dynamic_cast<BooleanQuery::ConjunctionScorer*>(clauses[0]));
+  std::vector<int32_t> docs, expected;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) docs.push_back(doc);
+  for (int32_t doc = 4096; doc < 12288; doc++) {
+    int64_t value = 2 * ((doc * 1543) % N);
+    bool body = doc % 64 == 0 || doc % 64 == 1 || doc % 128 == 0;
+    if (body && value <= 4095 && value <= 59000) expected.push_back(doc);
+  }
+  EXPECT_EQ(expected, docs);
 }
 
 TEST_F(RangeFilterTest, MembershipYieldIsKnownOnlyWhereEstimated) {

@@ -7940,19 +7940,71 @@ class BooleanQuery::Weight final : public Query::Weight {
         allowsPruning, enableTwoPhase);
   }
 
-  // The required clauses composed as one clause led by the cheapest.
+  // The required clauses composed as one clause led by the cheapest. A
+  // parent places it by what it emits, the conjunction yield of its
+  // clauses, not by its lead's cost.
   static Required nestRequired(
       MemPool& targetPool, const Required& req, bool allowsPruning,
-      bool enableTwoPhase) {
+      bool enableTwoPhase, int32_t maxDoc) {
     auto all = targetPool.make_span<Query::Scorer*>(1);
     auto costs = targetPool.make_span<int64_t>(1);
     auto twoPhase = targetPool.make_span<uint8_t>(1);
     bool composedTwoPhase;
     all[0] = composeRequired(targetPool, req, allowsPruning, enableTwoPhase, composedTwoPhase);
-    costs[0] = req.costs.front();
+    double universe = (double)std::max(1, maxDoc);
+    boost::container::small_vector<double, 16> selectivities;
+    for (int64_t cost : req.costs) selectivities.push_back((double)cost / universe);
+    costs[0] = std::min(req.costs.front(), (int64_t)std::ceil(
+        universe * Supplier::conjunctionYield(selectivities)));
     twoPhase[0] = (uint8_t)composedTwoPhase;
     return {all, costs, twoPhase, req.scoring.empty() ? all.first(0) : all,
             false, req.cost};
+  }
+
+  // The required clauses with their single-phase unscored ones, when two or
+  // more, nested as one clause placed by their intersection (nestRequired):
+  // filters, or any required clause that does not score, so their
+  // conjunction needs no pruning. Scoring and two-phase clauses stay beside
+  // it in cost order.
+  static Required nestUnscoredSinglePhase(
+      MemPool& targetPool, const Required& req, bool enableTwoPhase, int32_t maxDoc) {
+    auto unscored = [&](size_t i) {
+      return req.twoPhase[i] == 0
+          && std::find(req.scoring.begin(), req.scoring.end(), req.all[i]) == req.scoring.end();
+    };
+    size_t count = 0;
+    for (size_t i = 0; i < req.all.size(); i++) count += unscored(i);
+    if (count < 2) return req;
+    auto innerAll = targetPool.make_span<Query::Scorer*>(count);
+    auto innerCosts = targetPool.make_span<int64_t>(count);
+    auto innerTwoPhase = targetPool.make_span<uint8_t>(count);
+    for (size_t i = 0, j = 0; i < req.all.size(); i++) {
+      if (!unscored(i)) continue;
+      innerAll[j] = req.all[i];
+      innerCosts[j] = req.costs[i];
+      innerTwoPhase[j++] = 0;
+    }
+    Required inner{innerAll, innerCosts, innerTwoPhase, {}, false, innerCosts[0]};
+    Required nested = nestRequired(targetPool, inner, false, enableTwoPhase, maxDoc);
+    size_t size = req.all.size() - count + 1;
+    auto all = targetPool.make_span<Query::Scorer*>(size);
+    auto costs = targetPool.make_span<int64_t>(size);
+    auto twoPhase = targetPool.make_span<uint8_t>(size);
+    bool placed = false;
+    for (size_t i = 0, j = 0; i <= req.all.size(); i++) {
+      bool rest = i < req.all.size() && !unscored(i);
+      if (!placed && (i == req.all.size() || (rest && nested.costs[0] < req.costs[i]))) {
+        all[j] = nested.all[0];
+        costs[j] = nested.costs[0];
+        twoPhase[j++] = nested.twoPhase[0];
+        placed = true;
+      }
+      if (!rest) continue;
+      all[j] = req.all[i];
+      costs[j] = req.costs[i];
+      twoPhase[j++] = req.twoPhase[i];
+    }
+    return {all, costs, twoPhase, req.scoring, false, req.cost};
   }
 
   template <template <bool> class Scorer, typename... Args>
@@ -8142,12 +8194,17 @@ class BooleanQuery::Weight final : public Query::Weight {
       // first on ties) so the cheaper side leads. The required clauses join
       // the group's conjunction, which confirms each two-phase one per
       // candidate; a nested required conjunction would confirm them inside
-      // its advance and walk them doc by doc. Only required clauses that run
-      // the exact direct-approximation loop on their own, which the group
-      // would leave, stay one nested clause. Scores sum the scoring required
-      // clauses, then the group (filters score nothing).
+      // its advance and walk them doc by doc. Required clauses that run the
+      // exact direct-approximation loop on their own, which the group would
+      // leave, stay one nested clause. Otherwise two or more single-phase
+      // unscored ones (filters, or any required clause under an unscored
+      // consumer) nest as one: their intersection, often far smaller than
+      // any one of them, faces the group and the other required clauses as
+      // a unit. Scores sum the scoring required clauses, then the group.
       if (BooleanQuery::ConjunctionScorer::exactAlone(req.all, req.twoPhase, allowsPruning)) {
-        req = nestRequired(targetPool, req, allowsPruning, enableTwoPhase);
+        req = nestRequired(targetPool, req, allowsPruning, enableTwoPhase, segment.maxDoc());
+      } else {
+        req = nestUnscoredSinglePhase(targetPool, req, enableTwoPhase, segment.maxDoc());
       }
       size_t count = req.all.size() + 1;
       auto all = targetPool.make_span<Query::Scorer*>(count);
