@@ -212,9 +212,6 @@ public:
   struct EstimateResult {
     uint64_t estimatedCount;
     uint64_t upperBound;
-    // The part of estimatedCount in leaves whose doc ids are CONTIG or BITSET
-    // (runs and words to emit, typical of an index-sorted segment).
-    uint64_t runEncoded = 0;
     // Points of the crossing leaves, which an intersection tests one by one.
     uint64_t crossingPoints = 0;
   };
@@ -736,17 +733,12 @@ public:
   EstimateResult estimateIntersect(Relation&& relation) const {
     uint64_t estimated = 0;
     uint64_t upper = 0;
-    uint64_t runEncoded = 0;
-    auto runs = [](const LeafInfo& info) {
-      return info.docCodec == BKDWriter::DOC_CONTIG || info.docCodec == BKDWriter::DOC_BITSET;
-    };
     uint64_t crossing = 0;
     auto addLeaves = [&](uint32_t firstLeaf, uint32_t leaves) {
       for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
-        LeafInfo info = leafInfo(leaf);
-        estimated += info.count;
-        upper += info.count;
-        if (runs(info)) runEncoded += info.count;
+        uint64_t count = leafInfo(leaf).count;
+        estimated += count;
+        upper += count;
       }
     };
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
@@ -786,17 +778,15 @@ public:
       if (tight == BKDRelation::INSIDE) {
         estimated += info.count;
         upper += info.count;
-        if (runs(info)) runEncoded += info.count;
       } else if (tight == BKDRelation::CROSSES) {
         estimated += ((uint64_t)info.count + 1) / 2;
         upper += info.count;
-        if (runs(info)) runEncoded += ((uint64_t)info.count + 1) / 2;
         crossing += info.count;
       }
     };
     visit(visit, 1, leavesCount, 0, INT32_MIN, INT32_MAX,
           INT32_MIN, INT32_MAX);
-    return {estimated, upper, runEncoded, crossing};
+    return {estimated, upper, crossing};
   }
 
   template <class Relation>

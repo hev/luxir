@@ -14,7 +14,6 @@
 
 #include <boost/sort/spreadsort/integer_sort.hpp>
 
-#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PointsMaterialize.h"
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
@@ -144,9 +143,6 @@ public:
     Relation relation;
     int64_t estimatedCost;
     uint64_t materializeUpperBound;
-    // The part of the estimate in CONTIG or BITSET leaves, which materialization
-    // emits as runs and words instead of point by point.
-    uint64_t runEncoded;
     // Points of the crossing leaves, which the traversal tests one by one.
     uint64_t crossingPoints;
 
@@ -155,7 +151,6 @@ public:
     // segment, 2026-10-28): 0.69 ns per emitted point, 1.3 ns per crossing
     // point (nine boxes, emitted 0.8k-2.5M, crossing 1.5k-88k).
     static constexpr double CROSSING_POINTS = 2;
-    static constexpr int64_t RUN_VERIFY_DIVISOR = 8;
 
     BKDReader::Scratch scratch(MemPool& pool) const {
       size_t size = bkd->maxPointsPerLeaf();
@@ -214,11 +209,8 @@ public:
     // estimate capped at the documents with a value; a multivalued box's BKD
     // emits each matching point.
     double bkdPrice() const {
-      double emit = PointsMaterialize::price((uint64_t)estimatedCost, segment.maxDoc());
-      // A bitset takes run-encoded leaves (an index-sorted segment) as runs
-      // and words, without a per-point cost.
-      if (PointsMaterialize::useBitset((uint64_t)estimatedCost, segment.maxDoc())) emit -= (double)runEncoded;
-      return emit + CROSSING_POINTS * (double)crossingPoints;
+      return PointsMaterialize::price((uint64_t)estimatedCost, segment.maxDoc())
+          + CROSSING_POINTS * (double)crossingPoints;
     }
 
     // Verify or produce the BKD. A consumer that fills windows over an
@@ -240,12 +232,7 @@ public:
         return PointsMaterialize::verifyPrice(candidates, demand) <= bkdPrice()
             ? ScorerArm::SPARSE_VERIFY : ScorerArm::BKD;
       }
-      // Where most of the estimate sits in run-encoded leaves, producing is
-      // cheap (runs and words), so verifying needs far fewer candidates: the
-      // Hilbert index-sort benchmark measured verification with nearly as
-      // many candidates as matches up to 2x slower than the BKD arm.
-      int64_t limit = 2 * runEncoded > (uint64_t)estimatedCost ? estimatedCost / RUN_VERIFY_DIVISOR : estimatedCost;
-      if (demand.candidates < limit) return ScorerArm::SPARSE_VERIFY;
+      if (demand.candidates < estimatedCost) return ScorerArm::SPARSE_VERIFY;
       return bkd != nullptr ? ScorerArm::BKD : ScorerArm::SCAN;
     }
 
@@ -319,7 +306,6 @@ public:
           estimatedCost((int64_t)std::min<uint64_t>(
               estimate.estimatedCount, (uint64_t)reader.docsWithValue())),
           materializeUpperBound(estimate.upperBound),
-          runEncoded(estimate.runEncoded),
           crossingPoints(estimate.crossingPoints) {}
 
     int64_t cost() override { return estimatedCost; }
