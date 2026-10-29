@@ -155,6 +155,7 @@ public:
     // segment, 2026-10-28): 0.69 ns per emitted point, 1.3 ns per crossing
     // point (nine boxes, emitted 0.8k-2.5M, crossing 1.5k-88k).
     static constexpr double CROSSING_POINTS = 2;
+    static constexpr int64_t RUN_VERIFY_DIVISOR = 8;
 
     BKDReader::Scratch scratch(MemPool& pool) const {
       size_t size = bkd->maxPointsPerLeaf();
@@ -239,7 +240,12 @@ public:
         return PointsMaterialize::verifyPrice(candidates, demand) <= bkdPrice()
             ? ScorerArm::SPARSE_VERIFY : ScorerArm::BKD;
       }
-      if (demand.candidates < estimatedCost) return ScorerArm::SPARSE_VERIFY;
+      // Where most of the estimate sits in run-encoded leaves, producing is
+      // cheap (runs and words), so verifying needs far fewer candidates: the
+      // Hilbert index-sort benchmark measured verification with nearly as
+      // many candidates as matches up to 2x slower than the BKD arm.
+      int64_t limit = 2 * runEncoded > (uint64_t)estimatedCost ? estimatedCost / RUN_VERIFY_DIVISOR : estimatedCost;
+      if (demand.candidates < limit) return ScorerArm::SPARSE_VERIFY;
       return bkd != nullptr ? ScorerArm::BKD : ScorerArm::SCAN;
     }
 
