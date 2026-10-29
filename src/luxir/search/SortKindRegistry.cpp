@@ -45,6 +45,11 @@ size_t closingParen(std::string_view expr, size_t open) {
 
 }  // namespace
 
+SortKindRegistry& SortKindRegistry::global() {
+  static SortKindRegistry instance;
+  return instance;
+}
+
 void SortKindRegistry::add(std::string name, SortKindMaker maker) {
   if (isFrozen) throw std::logic_error("sort kind registry is frozen; sort kinds must be added during startup");
   if (name.empty()) throw std::invalid_argument("sort kind name must not be empty");
