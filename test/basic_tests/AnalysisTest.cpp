@@ -693,7 +693,7 @@ TEST_F(AnalysisTest, nfkcCfStringsAndIdempotence) {
 TEST_F(AnalysisTest, nfkcCfDropsInvisibleTokensWithoutPositionGap) {
   std::string input = "\u3164 before \u3164 \u3164 co\u00adoperate after \u3164";
   for (bool fused : {false, true}) {
-    std::unique_ptr<Tokenizer> head = fused ? makeStandardTokenizer() : makeUnicodeWordTokenizer();
+    std::unique_ptr<Tokenizer> head = fused ? makeStandardTokenizer() : makeReferenceWordTokenizer();
     Tokenizer& tokenizer = *head;
     std::unique_ptr<TokenStream> tail = fused ? std::move(head) : makeNfkcCasefoldFilter(std::move(head));
     TokenChain chain(tokenizer, std::move(tail), true);
@@ -854,7 +854,7 @@ TEST_F(AnalysisTest, standardFusionMatchesComposedChain) {
                              "Café 中文 Straße señor naïve",
                              "  ...!?  mixed-CASE  ",
                              "ﬃ ligature ＡＢＣ fullwidth"}) {
-    auto t1 = makeUnicodeWordTokenizer();
+    auto t1 = makeReferenceWordTokenizer();
     Tokenizer& h1 = *t1;
     auto composedTail = makeNfkcCasefoldFilter(std::move(t1));
     TokenChain composed(h1, std::move(composedTail), true);
@@ -869,16 +869,23 @@ TEST_F(AnalysisTest, standardFusionMatchesComposedChain) {
 }
 
 namespace {
-// Build the composed reference chain (unicode_word + nfkc_cf)
-// and the fused StandardTokenizer (region dispatch + ASCII DFA + bulk
-// lowercase), and return both term lists for `v`. The fast paths are correct
-// iff these are always identical.
+constexpr WordFold ALL_WORD_FOLDS[] = {WordFold::NONE, WordFold::LOWERCASE, WordFold::NFKC_CF,
+                                       WordFold::NFKC_CF_ACCENTS};
+
+// Build the composed reference chain (uni-algo unicode_word, then the fold's
+// filters) and the StandardTokenizer for that fold (region dispatch + ASCII
+// DFA + bulk lowercase), and return both term lists for `v`. The fast paths
+// are correct iff these are always identical.
 std::pair<std::vector<std::string>, std::vector<std::string>> composedVsFused(std::string_view v,
-                                                                             bool fold = false) {
-  auto t1 = makeUnicodeWordTokenizer();
+                                                                             WordFold fold) {
+  auto t1 = makeReferenceWordTokenizer();
   Tokenizer& h1 = *t1;
-  std::unique_ptr<TokenStream> composedTail = makeNfkcCasefoldFilter(std::move(t1));
-  if (fold) composedTail = makeAccentFoldFilter(std::move(composedTail));
+  std::unique_ptr<TokenStream> composedTail = std::move(t1);
+  if (fold == WordFold::LOWERCASE) composedTail = std::make_unique<LowercaseFilter>(std::move(composedTail));
+  if (fold == WordFold::NFKC_CF || fold == WordFold::NFKC_CF_ACCENTS) {
+    composedTail = makeNfkcCasefoldFilter(std::move(composedTail));
+  }
+  if (fold == WordFold::NFKC_CF_ACCENTS) composedTail = makeAccentFoldFilter(std::move(composedTail));
   TokenChain composed(h1, std::move(composedTail), true);
 
   auto t2 = makeStandardTokenizer(fold);
@@ -925,9 +932,9 @@ TEST_F(AnalysisTest, standardFusionAdversarialEquivalence) {
       "",
   };
   for (std::string_view v : cases) {
-    for (bool fold : {false, true}) {
+    for (WordFold fold : ALL_WORD_FOLDS) {
       auto [composed, fused] = composedVsFused(v, fold);
-      EXPECT_EQ(composed, fused) << "fold=" << fold << " mismatch on: " << v;
+      EXPECT_EQ(composed, fused) << "fold=" << (int) fold << " mismatch on: " << v;
     }
   }
 }
@@ -952,9 +959,9 @@ TEST_F(AnalysisTest, standardFusionMatchesComposedOnWordBreakCorpus) {
     }
     if (input.empty()) continue;
     ++total;
-    for (bool fold : {false, true}) {
+    for (WordFold fold : ALL_WORD_FOLDS) {
       auto [composed, fused] = composedVsFused(input, fold);
-      ASSERT_EQ(composed, fused) << "fold=" << fold << " WordBreakTest input: " << l;
+      ASSERT_EQ(composed, fused) << "fold=" << (int) fold << " WordBreakTest input: " << l;
     }
   }
   RecordProperty("wordbreak_equivalence_lines", total);
@@ -977,9 +984,9 @@ TEST_F(AnalysisTest, standardFusionRandomizedEquivalence) {
     std::string v;
     int n = (int) rng.rint(40);
     for (int i = 0; i < n; i++) v += atoms[rng.rint(natoms)];
-    for (bool fold : {false, true}) {
+    for (WordFold fold : ALL_WORD_FOLDS) {
       auto [composed, fused] = composedVsFused(v, fold);
-      ASSERT_EQ(composed, fused) << "fold=" << fold << " value: " << v;
+      ASSERT_EQ(composed, fused) << "fold=" << (int) fold << " value: " << v;
     }
   }
 }
@@ -991,9 +998,9 @@ TEST_F(AnalysisTest, standardFusionRandomizedEquivalence) {
 TEST_F(AnalysisTest, standardFusionMatchesComposedOnScientificText) {
   for (uint64_t seed = 1; seed <= 6; seed++) {
     std::string v = scientificText(8 * 1024, seed);
-    for (bool fold : {false, true}) {
+    for (WordFold fold : ALL_WORD_FOLDS) {
       auto [composed, fused] = composedVsFused(v, fold);
-      ASSERT_EQ(composed, fused) << "fold=" << fold << " seed " << seed;
+      ASSERT_EQ(composed, fused) << "fold=" << (int) fold << " seed " << seed;
     }
   }
 }
@@ -1010,9 +1017,9 @@ TEST_F(AnalysisTest, standardFusionNonAsciiAtEveryOffset) {
       std::string v = ascii.substr(0, pos);
       v += planted;
       v += ascii.substr(pos);
-      for (bool fold : {false, true}) {
+      for (WordFold fold : ALL_WORD_FOLDS) {
         auto [composed, fused] = composedVsFused(v, fold);
-        ASSERT_EQ(composed, fused) << "fold=" << fold << " pos " << pos << " value: " << v;
+        ASSERT_EQ(composed, fused) << "fold=" << (int) fold << " pos " << pos << " value: " << v;
       }
     }
   }
@@ -1085,6 +1092,24 @@ TEST_F(AnalysisTest, standardAsciiPathAllocationFree) {
   long allocated = s.bytes();  // capture before any EXPECT (gtest macros allocate)
   EXPECT_EQ(0, allocated);
   EXPECT_GT(bytes, 0u);
+}
+
+// unicode_word + lowercase compiles to one fused stage. Terms match the
+// composed chain (see composedVsFused), and the bare-term normalization used
+// for multiterm literals still lowercases.
+TEST_F(AnalysisTest, unicodeWordLowercaseFuses) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::AnalyzerDef def;
+  ASSERT_TRUE(api::read_json(def, R"({"tokenizer":"unicode_word","filters":["lowercase","kstem"]})", arena));
+  auto analyzer = Analyzer::compile(def);
+  EXPECT_TRUE(analyzer->fusedLowercase);
+  EXPECT_FALSE(analyzer->fusedHead);
+  auto chain = analyzer->createChain();
+  EXPECT_EQ((std::vector<std::string>{"the", "café", "école", "pony"}),
+            analyze(*chain, "The CAFÉ École PONIES").terms);
+  std::string term = "ÉCOLE Ponies";
+  chain->normalizeTerm(term);
+  EXPECT_EQ("école ponies", term);
 }
 
 // unicode_word without a fold filter: segmentation only, original bytes preserved.

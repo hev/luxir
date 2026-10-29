@@ -303,10 +303,12 @@ struct SkipStats {
   static inline int64_t fieldSortSeedPass2Skips = 0;
   // Plugin seed windows (FieldComparator::seedWindows): segments seeded,
   // and the windows run before their sweep; the seeded segments that ran
-  // through a pull scorer (no match-window product).
+  // through a pull scorer (no match-window product); the rounds after the
+  // first one asked for more windows because the heap was not full.
   static inline int64_t fieldSortSeedWindowActivations = 0;
   static inline int64_t fieldSortSeedWindows = 0;
   static inline int64_t fieldSortSeedWindowPullActivations = 0;
+  static inline int64_t fieldSortSeedWindowRounds = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
@@ -341,6 +343,8 @@ struct SkipStats {
   static inline int64_t numericPredicatePointsArms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
+  static inline int64_t numericPredicateClassifiedBlocks = 0;
+  static inline int64_t numericPredicateProofIndexes = 0;
   static inline int64_t rangeFacetPointsArms = 0;
   // Range facet zones (blocks or leaves) counted whole, without a decode.
   static inline int64_t rangeFacetZoneRuns = 0;
@@ -609,6 +613,7 @@ struct SkipStats {
     fieldSortSeedWindowActivations = 0;
     fieldSortSeedWindows = 0;
     fieldSortSeedWindowPullActivations = 0;
+    fieldSortSeedWindowRounds = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;
@@ -643,6 +648,8 @@ struct SkipStats {
     numericPredicatePointsArms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
+    numericPredicateClassifiedBlocks = 0;
+    numericPredicateProofIndexes = 0;
     rangeFacetPointsArms = 0;
     rangeFacetZoneRuns = 0;
     rangeFacetZoneDomainRuns = 0;

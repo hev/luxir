@@ -445,9 +445,9 @@ std::unique_ptr<const CharFilterFactory> plainCharFilter(const api::AnalyzerComp
 std::unique_ptr<CharFilter> makeHtmlStripFilter() { return std::make_unique<HtmlStripFilter>(); }
 } // namespace
 
-void registerBuiltinCharFilters(AnalysisRegistry& r) {
-  r.addCharFilter("nfkc_cf", plainCharFilter<makeNfkcCfCharFilter, true>);
-  r.addCharFilter("mapping", mappingCharFilter);
-  r.addCharFilter("html_strip", plainCharFilter<makeHtmlStripFilter, false>);
+void AnalysisRegistry::registerBuiltinCharFilters() {
+  addCharFilter("nfkc_cf", plainCharFilter<makeNfkcCfCharFilter, true>);
+  addCharFilter("mapping", mappingCharFilter);
+  addCharFilter("html_strip", plainCharFilter<makeHtmlStripFilter, false>);
 }
 } // namespace luxir

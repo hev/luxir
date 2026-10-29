@@ -618,3 +618,59 @@ TEST_F(PluginSortTest, pullPathSeedingKeepsTheResults) {
   for (const auto& r : rows) if (r.small >= -3) domain.push_back(r);
   EXPECT_EQ(bruteForce(domain, key, false, 0, 25), sorted(R"j("abs_diff(x_i, 17)")j", 25, 0, filter));
 }
+
+// A filter much sparser near the center than overall: round 0, sized by the
+// overall density, leaves the heap short, so later rounds widen the windows
+// until it fills and the sweep prunes from its first consult. On the windowed
+// and the pull path, and with later rounds overlapping the earlier ones or
+// malformed, the results are brute force's and each doc is collected once.
+TEST_F(PluginSortTest, seedRoundsFillTheHeapUnderASparseFilter) {
+  using SeedAnswer = example::AbsDiffStats::SeedAnswer;
+  constexpr int N = 20000;
+  std::vector<Row> corpus;
+  for (int i = 0; i < N; i++) {
+    // Nearest last; of the nearest quarter, only every 100th doc passes.
+    int64_t small = i >= N * 3 / 4 ? (i % 100 == 0 ? 3 : 0) : i % 7;
+    corpus.push_back(Row{i, CENTER + (N - 1 - i) / 3, small, {}, "g" + std::to_string(i % 5)});
+  }
+  reindex(corpus, N);
+  UncachedFilters uncached(helper);
+  SkipStatsScope stats;
+  auto key = [](const Row& r) { return absDiff(r.x); };
+  std::vector<Row> domain;
+  for (const auto& r : corpus) if (r.small >= 2) domain.push_back(r);
+  // A filter over a points field runs windowed; a query over a column-only
+  // field has no match-window product, so it runs through a pull scorer.
+  for (std::string field : {"small_i", "c_i"}) {
+    std::string range = R"j({"range":{"field":")j" + field + R"j(","gte":2}})j";
+    bool pull = field == "c_i";
+    auto run = [&](int64_t limit, int64_t offset) {
+      auto result = search(R"j({"sort":"abs_diff(x_i, 17)","limit":)j" + std::to_string(limit) + R"j(,"offset":)j"
+                           + std::to_string(offset) + R"j(,"fields":["id"],)j"
+                           + (pull ? R"j("query":)j" + range : R"j("query":{"all":true},"filter":[)j" + range + "]")
+                           + "}");
+      EXPECT_EQ(200, result.status) << result.body.substr(0, 500);
+      return result.ids;
+    };
+    disableFieldSortSeeding = true;
+    auto unseeded = run(10, 0);
+    disableFieldSortSeeding = false;
+    for (auto answer : {SeedAnswer::OWN, SeedAnswer::OVERLAP, SeedAnswer::MALFORMED}) {
+      example::AbsDiffStats::seedAnswer = answer;
+      SkipStats::reset();
+      example::AbsDiffStats::skippedDocs = 0;
+      example::AbsDiffStats::seedRounds = 0;
+      auto seeded = run(10, 0);
+      std::string what = field + " " + std::to_string((int)answer);
+      EXPECT_EQ(bruteForce(domain, key, false, 0, 10), seeded) << what;
+      EXPECT_EQ(unseeded, seeded) << what;
+      EXPECT_EQ(1, SkipStats::fieldSortSeedWindowActivations) << what;
+      EXPECT_EQ(pull ? 1 : 0, SkipStats::fieldSortSeedWindowPullActivations) << what;
+      EXPECT_GT(SkipStats::fieldSortSeedWindowRounds, 0) << what;
+      EXPECT_GT(example::AbsDiffStats::seedRounds.load(), 0) << what;
+      EXPECT_GT(example::AbsDiffStats::skippedDocs.load(), N * 9 / 10) << what;
+      EXPECT_EQ(bruteForce(domain, key, false, 30, 20), run(20, 30)) << what;
+      EXPECT_EQ(bruteForce(domain, key, false, 0, domain.size()), run((int64_t)domain.size(), 0)) << what;
+    }
+  }
+}

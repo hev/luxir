@@ -209,7 +209,7 @@ public:
 };
 
 // The field type registry: name -> maker. The process-wide instance is
-// Registries::global().fieldTypes, read through globalFieldTypeRegistry() by
+// FieldTypeRegistry::global(), read through globalFieldTypeRegistry() by
 // code that does not link the plugin headers. Filled during initPlugins(), then
 // frozen; lookups after the freeze read an immutable table without locking.
 //
@@ -220,6 +220,8 @@ public:
 // message that teaches (what was wrong, what is valid).
 class FieldTypeRegistry {
 public:
+  static FieldTypeRegistry& global();
+
   using Maker = std::function<std::unique_ptr<const PluginFieldType>(const PluginParams& params)>;
 
   // The name is [a-z0-9_]+ and not a built-in type name or "plugin". A
@@ -245,7 +247,7 @@ private:
   bool isFrozen = false;
 };
 
-// The frozen process-wide registry (Registries::global().fieldTypes).
+// The frozen process-wide registry (FieldTypeRegistry::global()).
 const FieldTypeRegistry& globalFieldTypeRegistry();
 
 }  // namespace luxir

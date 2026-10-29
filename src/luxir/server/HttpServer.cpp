@@ -46,7 +46,7 @@
 #include <glaze/core/read.hpp>
 #include <glaze/json/prettify.hpp>
 
-#include "luxir/plugin/Registries.h"
+#include "luxir/server/HttpRouteRegistry.h"
 #include "luxir/util/log.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchEngine.h"
@@ -177,13 +177,21 @@ struct HttpStreamAccumError {
 
 struct HttpStreamBatchState {
   ~HttpStreamBatchState() { Signal::emit("httpBatchBodyDestroyed"); }
+  // The request envelope (collection, request id, commit, field map); it lives
+  // until the batch completes.
   std::pmr::monotonic_buffer_resource resource;
-  HttpUpdateReqProto proto;  // non-owning; backed by `resource`
-  // Raw document records: views into the stream's NDJSON chunks, which
+  HttpUpdateReqProto proto;  // non-owning; backed by `resource`, docs by `staging`
+  // Raw document records (views into the stream's NDJSON chunks, which
   // `chunks` keeps alive until decodeDocs() has turned them into proto.docs on
-  // the task arena.  The I/O thread only frames them.
-  luxir::api::build::SpanBuilder<std::string_view> records;
-  std::vector<std::shared_ptr<NdjsonChunk>> chunks;
+  // the task arena; the I/O thread only frames them) and the decoded docs.
+  // Dropped once the batch is indexed, so a batch waiting for the ones before
+  // it to complete holds only its envelope.
+  struct Staging {
+    std::pmr::monotonic_buffer_resource resource;
+    luxir::api::build::SpanBuilder<std::string_view> records{resource};
+    std::vector<std::shared_ptr<NdjsonChunk>> chunks;
+  };
+  std::unique_ptr<Staging> staging = std::make_unique<Staging>();
   std::shared_ptr<HttpStreamControlRequest> requestOwner;
   std::string collectionName;
   std::size_t sourceBytes = 0;
@@ -195,38 +203,46 @@ struct HttpStreamBatchState {
   // completion.
   std::shared_ptr<ProtoUpdateMessage> message;
 
-  explicit HttpStreamBatchState(std::size_t reserveDocs) : records(resource) {
-    records.reserve(reserveDocs);
+  explicit HttpStreamBatchState(std::size_t reserveDocs) {
+    staging->records.reserve(reserveDocs);
   }
 
+  std::size_t recordCount() const { return staging->records.size(); }
+
   void addRecord(std::string_view record, const std::shared_ptr<NdjsonChunk>& chunk) {
-    records.push_back(record);
+    staging->records.push_back(record);
+    auto& chunks = staging->chunks;
     if (chunks.empty() || chunks.back() != chunk) chunks.push_back(chunk);
   }
 
   // Decodes the raw records into proto.docs.  Called from the update message's
   // handle() on an indexing worker, so a single connection's JSON decoding
   // scales with the task arena instead of its I/O thread.  The I/O thread no
-  // longer touches the batch once it is submitted, and `resource` lives as long
-  // as the batch, which outlives the message.  Decoded strings are copied into
-  // `resource`, so the raw bytes go as soon as decoding succeeds.  A malformed
-  // record fails the whole batch before any of it is indexed.
+  // longer touches the batch once it is submitted.  Decoded strings are copied
+  // into the staging arena, so the raw bytes go as soon as decoding succeeds.
+  // A malformed record fails the whole batch before any of it is indexed.
   void decodeDocs() {
-    auto raw = records.finish();
+    auto raw = staging->records.finish();
     if (raw.empty()) return;
-    luxir::api::build::SpanBuilder<luxir::api::Map> docs(resource);
+    luxir::api::build::SpanBuilder<luxir::api::Map> docs(staging->resource);
     docs.reserve(raw.size());
     std::string err;
     for (std::size_t i = 0; i < raw.size(); i++) {
       luxir::api::Map& map = docs.emplace_back();
-      if (!luxir::api::read_json(map, raw[i], resource, &err)) {
+      if (!luxir::api::read_json(map, raw[i], staging->resource, &err)) {
         throw RequestError("malformed NDJSON record (stream document " + std::to_string(firstDocIndex + i) +
                                "): " + (err.empty() ? std::string("invalid JSON") : err),
                            "invalid_json");
       }
     }
     proto.docs = docs.finish();
-    chunks.clear();
+    staging->chunks.clear();
+  }
+
+  // Called once the docs are indexed; nothing reads them after that.
+  void releaseStaging() {
+    proto.docs = {};
+    staging.reset();
   }
 };
 
@@ -322,7 +338,13 @@ struct HttpStreamUpdateState {
   std::string tenant; // the stream's, fixed when it starts
   std::unique_ptr<HttpStreamBatchState> batch;
   bool batchReady = false;
-  std::map<std::uint64_t, std::shared_ptr<HttpStreamBatchState>> inFlightBatches;
+  // Submitted batches by ordinal until they complete; `indexing` marks the
+  // ones still holding an admission slot.
+  struct InFlightBatch {
+    std::shared_ptr<HttpStreamBatchState> batch;
+    bool indexing = true;
+  };
+  std::map<std::uint64_t, InFlightBatch> inFlightBatches;
   std::map<std::uint64_t, HttpStreamBatchResult> completedBatchResults;
   std::optional<HttpStreamControl> pendingControl;
   std::optional<ErrorInfo> inputFailurePending;
@@ -330,8 +352,20 @@ struct HttpStreamUpdateState {
   HttpStreamInterval interval;
   std::size_t docsSeen = 0;
   std::size_t docsIndexedSoFar = 0;
-  std::size_t inFlight = 0;
+  // Batches are admitted while fewer than maxIndexing are decoding or being
+  // indexed, which bounds staging memory and inverter concurrency.  The graph
+  // completes batches in stream order, so if a batch held its slot until it
+  // completed, one slow batch would hold every slot behind it and idle the
+  // workers.  An indexed batch frees its slot and keeps only its envelope and
+  // result, and the stream runs at most kCompletionLag windows ahead of its
+  // oldest incomplete batch.
+  static constexpr std::size_t kCompletionLag = 16;
+  std::size_t inFlight = 0;   // submitted, not yet completed
+  std::size_t indexing = 0;   // submitted, not yet indexed
+  std::size_t maxIndexing;
   std::size_t maxInFlight;
+  // A batch failed while indexing; its completion ends the stream.
+  bool admissionHalted = false;
   std::uint64_t nextSubmitOrdinal = 0;
   std::uint64_t nextFoldOrdinal = 0;
   // url.commit is cleared once the EOF commit is submitted.
@@ -354,17 +388,22 @@ struct HttpStreamUpdateState {
 
   HttpStreamUpdateState(std::size_t batchTargetBytes, std::size_t batchMaxDocs,
                         std::size_t maxRecordBytes, std::size_t maxRequestBody,
-                        std::size_t maxInFlight)
+                        std::size_t maxIndexing)
     : batchTargetBytes(batchTargetBytes),
       batchMaxDocs(batchMaxDocs),
       maxRequestBody(maxRequestBody),
       framer(maxRecordBytes, batchTargetBytes),
       batch(std::make_unique<HttpStreamBatchState>(batchMaxDocs)),
-      maxInFlight(maxInFlight) {
-    assert(maxInFlight > 0);
+      maxIndexing(maxIndexing),
+      maxInFlight(maxIndexing > SIZE_MAX / kCompletionLag ? SIZE_MAX
+                                                           : maxIndexing * kCompletionLag) {
+    assert(maxIndexing > 0);
   }
 
-  bool canAdmit() const { return inFlight < maxInFlight && !barrierPending; }
+  bool canAdmit() const {
+    return indexing < maxIndexing && inFlight < maxInFlight && !barrierPending &&
+           !admissionHalted;
+  }
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
@@ -801,8 +840,28 @@ private:
       // The in-flight map owns the batch (and req) until done() has run.
       auto batch = batch_.lock();
       assert(batch != nullptr);
-      batch->decodeDocs();
-      ProtoUpdateMessage::handle(iw);
+      Signal::emit("httpBatchIndexing", (void*)(uintptr_t)ordinal_);
+      try {
+        batch->decodeDocs();
+        ProtoUpdateMessage::handle(iw);
+      } catch (...) {
+        indexed(false);
+        throw;
+      }
+      bool ok = result.ok();
+      if (ok) batch->releaseStaging();
+      indexed(ok);
+    }
+
+    // Hands the batch's admission slot back as soon as it is indexed; done()
+    // follows in stream order.  If the handoff fails, completion frees the slot.
+    void indexed(bool ok) noexcept {
+      try {
+        net::post(session_->stream_.get_executor(),
+            [session = session_, state = state_, ordinal = ordinal_, ok] {
+              session->onStreamBatchIndexed(state, ordinal, ok);
+            });
+      } catch (...) { LOG_ERROR("Streaming update indexed handoff failed"); }
     }
 
     void done(IndexWriter& iw) noexcept override {
@@ -813,11 +872,11 @@ private:
             [session = session_, state = state_, ordinal = ordinal_, result = std::move(result_), completed]() mutable {
               auto entry = state->inFlightBatches.find(ordinal);
               assert(entry != state->inFlightBatches.end());
-              // Preserve the admission slot until visibility completion, but free
-              // the decoded body and message before registering the wait.
-              if (state->resetGroupAfterBatch && entry->second->requestOwner == state->group.request)
+              // Keep the entry until visibility completion folds the result, but
+              // free the batch and message before registering the wait.
+              if (state->resetGroupAfterBatch && entry->second.batch->requestOwner == state->group.request)
                 state->group.request.reset();
-              entry->second.reset();
+              entry->second.batch.reset();
               if (completed->wait) session->watchWaitDisconnect();
               completed->await(session->node_, [session, state, ordinal, waiting = completed->wait.has_value(), result = std::move(result)](auto response) mutable {
                 const auto& resp = response->response;
@@ -1445,7 +1504,7 @@ private:
     }
     if (m.route == Route::NONE) {
       // Built-in routes win; a plugin route answers only paths they do not.
-      if (auto plugin = Registries::global().http.match(target)) {
+      if (auto plugin = HttpRouteRegistry::global().match(target)) {
         m.route = Route::PLUGIN;
         m.allow = plugin->allow;
         for (const auto& [key, value] : plugin->params) {
@@ -3142,7 +3201,7 @@ private:
     assert(state->batch != nullptr);
     assert(state->batchReady);
     if (!barrierSubmission && !state->canAdmit()) return false;
-    assert(state->inFlight < state->maxInFlight);
+    assert(state->indexing < state->maxIndexing);
 
     ErrorInfo err;
     HttpStreamWriterTarget* target = streamWriterTarget(state->batch->collectionName, err);
@@ -3169,11 +3228,13 @@ private:
         &batch->proto, shared_from_this(), state, ordinal, batch);
     message->target = target->collection->getId();
     batch->message = message;
-    auto [entry, inserted] = state->inFlightBatches.emplace(ordinal, batch);
+    auto [entry, inserted] =
+        state->inFlightBatches.emplace(ordinal, HttpStreamUpdateState::InFlightBatch{batch});
     unused(entry);
     assert(inserted);
     unused(inserted);
     state->inFlight++;
+    state->indexing++;
 
     // This handler runs on the session shard. execute enters the node arena
     // only for the immediate try_put and returns without waiting for indexing.
@@ -3238,7 +3299,7 @@ private:
     assert(state->batch != nullptr);
     assert(!state->batchReady);
 
-    accountStreamSubmission(*state->batch, state->batch->records.size(), 0);
+    accountStreamSubmission(*state->batch, state->batch->recordCount(), 0);
     state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
     applyStreamBatchFieldMap(*state, *state->batch);
@@ -3269,7 +3330,7 @@ private:
                            "_update_ inline request exceeds indexing.max-request-body"});
       return false;
     }
-    if (state->batch->records.size() != 0) {
+    if (state->batch->recordCount() != 0) {
       failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "internal error: inline _update_ encountered a non-empty stream batch"));
       return false;
     }
@@ -3313,7 +3374,7 @@ private:
       commitParams = &*state->group.request->proto.commit;
     }
 
-    if (state->batch->records.size() > 0 || commitParams != nullptr) {
+    if (state->batch->recordCount() > 0 || commitParams != nullptr) {
       state->emitAfterBatch = true;
       state->resetGroupAfterBatch = true;
       bool submitted = submitStreamBatch(commitParams, true);
@@ -3356,7 +3417,7 @@ private:
     assert(control.kind != HttpStreamControlKind::Noop);
 
     if (control.kind == HttpStreamControlKind::Open) {
-      if (state->group.open || streamIntervalHasActivity(*state) || state->batch->records.size() > 0) {
+      if (state->group.open || streamIntervalHasActivity(*state) || state->batch->recordCount() > 0) {
         if (!closeCurrentStreamGroup(nullptr, state->group.open)) {
           state->pendingControl = std::move(control);
           return false;
@@ -3493,7 +3554,7 @@ private:
                               "all_or_none NDJSON group exceeds indexing.max-request-body"});
           return false;
         }
-        if (state->batch->records.size() == 0 &&
+        if (state->batch->recordCount() == 0 &&
             state->batch->sourceBytes >= state->batchTargetBytes) {
           state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
         }
@@ -3513,11 +3574,32 @@ private:
       return true;
     }
     if (state->batch->sourceBytes >= state->batchTargetBytes ||
-        state->batch->records.size() >= state->batchMaxDocs) {
+        state->batch->recordCount() >= state->batchMaxDocs) {
       if (!submitStreamBatch(nullptr)) return false;
       return state->canAdmit();
     }
     return true;
+  }
+
+  // A batch is indexed: its slot admits the next one while its completion
+  // waits for the batches before it.  A failed batch keeps its slot and halts
+  // admission; its completion ends the stream.
+  void onStreamBatchIndexed(const std::shared_ptr<HttpStreamUpdateState>& state,
+                            std::uint64_t ordinal, bool ok) {
+    auto entry = state->inFlightBatches.find(ordinal);
+    if (entry == state->inFlightBatches.end() || !entry->second.indexing) return;
+    if (!ok) {
+      state->admissionHalted = true;
+      return;
+    }
+    entry->second.indexing = false;
+    assert(state->indexing > 0);
+    state->indexing--;
+    if (state->failed || streamUpdate_ != state) return;
+    if (state->batchReady && state->canAdmit()) {
+      if (!submitPreparedStreamBatch()) return;
+    }
+    drainStreamRecords();
   }
 
   void onStreamBatchDone(const std::shared_ptr<HttpStreamUpdateState>& state,
@@ -3527,6 +3609,7 @@ private:
     if (entry == state->inFlightBatches.end()) return;
     assert(state->inFlight > 0);
     state->inFlight--;
+    if (entry->second.indexing) state->indexing--;
     state->inFlightBatches.erase(entry);
 
     if (state->failed || streamUpdate_ != state) {

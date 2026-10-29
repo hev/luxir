@@ -2248,67 +2248,88 @@ void collectTopKMatchWindowedSeeded(
                            maxDoc, true, visited, plan.leafSize);
 }
 
-// Seed-window two-pass driver for a primary comparator that offers seed
-// windows (FieldComparator::seedWindows): run the query over the windows,
-// which fills the heap with real matches holding keys near the best, rebind
-// the comparators for the rewind, then reposition the same product and sweep
-// the segment from its start through the competitive ranges, jumping the
-// windows. Only the visit order changes, so the results are the unseeded
-// path's; each match is collected once, so hitCount keeps pruned-path
-// semantics. The plan must support reposition.
+// Seed-window driver for a primary comparator that offers seed windows
+// (FieldComparator::seedWindows): run the query over the windows, which fills
+// the heap with real matches holding keys near the best; while the heap is
+// short (the comparator sized the windows from a density estimate, and the
+// query may be sparser near the best keys), rebind the comparators, reposition
+// and run the next round's windows, without the runs already visited; then
+// rebind once more, reposition the same product and sweep the segment from
+// its start through the competitive ranges, jumping every visited run. Only
+// the visit order changes, so the results are the unseeded path's; each match
+// is collected once, so hitCount keeps pruned-path semantics. The plan must
+// support reposition.
 template <typename Collector>
 void collectTopKMatchWindowedSeedWindows(int32_t segnum, BulkScorer* bulk,
                                          DocSet* filter, Collector& collector,
                                          int32_t maxDoc) {
   assert(bulk != nullptr);
-  std::span<const SeedWindow> windows = collector.takeSeedWindows();
+  std::span<const SeedWindow> windows = collector.takeSeedWindows(0);
   if (!windows.empty()) {
     skipCount(SkipStats::fieldSortSeedWindowActivations);
-    for (const SeedWindow& window : windows) {
-      feedMatchWindows(segnum, bulk, filter, nullptr, collector, window.begin,
-                       window.end);
-      skipCount(SkipStats::fieldSortSeedWindows);
+    for (int32_t round = 0;;) {
+      for (const SeedWindow& window : windows) {
+        feedMatchWindows(segnum, bulk, filter, nullptr, collector, window.begin,
+                         window.end);
+        skipCount(SkipStats::fieldSortSeedWindows);
+      }
+      if (!collector.wantsSeedRound(++round)) break;
+      windows = collector.takeSeedWindows(round);
+      if (windows.empty()) break;
+      skipCount(SkipStats::fieldSortSeedWindowRounds);
+      collector.rebindAfterSeeding();
+      bulk->reposition(0);
     }
     collector.rebindAfterSeeding();
     bulk->reposition(0);
   }
   collectTopKMatchWindowed(segnum, bulk, filter, nullptr, collector, maxDoc,
-                           true, {}, 0, windows);
+                           true, {}, 0, collector.seededRuns());
 }
 
 // The pull-scorer form of collectTopKMatchWindowedSeedWindows, for plans
 // with no match-window product (such as an uncached range on a column-only
-// field): advance the scorer through the seed windows, collecting
-// the matches inside them, rebind the comparators, reset the scorer and run
-// the pruned collectTopK over the segment, jumping the windows. The same
-// guarantees hold: only the visit order changes and each match is collected
-// once. The plan must support reset, and the collector needs no scores.
+// field): advance the scorer through each round's seed windows, collecting
+// the matches inside them, rebind the comparators and reset the scorer
+// between rounds and before the pruned collectTopK over the segment, which
+// jumps every visited run. The same guarantees hold: only the visit order
+// changes and each match is collected once. The plan must support reset, and
+// the collector needs no scores.
 template <typename Collector>
 void collectTopKSeedWindows(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
                             Collector& collector, int32_t maxDoc,
                             Query::ReportedTwoPhase reportedTwoPhase) {
   assert(scorer != nullptr);
   assert(!collector.needsScores);
-  std::span<const SeedWindow> windows = collector.takeSeedWindows();
+  std::span<const SeedWindow> windows = collector.takeSeedWindows(0);
   if (!windows.empty()) {
     skipCount(SkipStats::fieldSortSeedWindowActivations);
     skipCount(SkipStats::fieldSortSeedWindowPullActivations);
     DocSetProbe accepted(filter);
-    for (const SeedWindow& window : windows) {
-      int32_t doc = scorer->docId();
-      if (doc < window.begin) doc = scorer->advance(window.begin);
-      for (; doc < window.end; doc = scorer->next()) {
-        if (accepted.get(doc)) collector.collect(segnum, doc, 0.0f);
+    for (int32_t round = 0;;) {
+      for (const SeedWindow& window : windows) {
+        int32_t doc = scorer->docId();
+        if (doc < window.begin) doc = scorer->advance(window.begin);
+        for (; doc < window.end; doc = scorer->next()) {
+          if (accepted.get(doc)) collector.collect(segnum, doc, 0.0f);
+        }
+        skipCount(SkipStats::fieldSortSeedWindows);
+        if (doc == PostingsReader::END) break;
       }
-      skipCount(SkipStats::fieldSortSeedWindows);
-      if (doc == PostingsReader::END) break;
+      if (!collector.wantsSeedRound(++round)) break;
+      windows = collector.takeSeedWindows(round);
+      if (windows.empty()) break;
+      skipCount(SkipStats::fieldSortSeedWindowRounds);
+      collector.rebindAfterSeeding();
+      scorer->reset();
+      accepted.reset(filter);  // a forward probe, rewound with the scorer
     }
     collector.rebindAfterSeeding();
     scorer->reset();
   }
   collectTopK(segnum, scorer, filter, nullptr, collector, true, nullptr,
               DomainBuildMode::FILTERED_MATCHES, nullptr, reportedTwoPhase,
-              windows, maxDoc);
+              collector.seededRuns(), maxDoc);
 }
 
 // Rank score windows into a top-k collector. This is intentionally only a
