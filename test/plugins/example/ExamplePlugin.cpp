@@ -386,6 +386,17 @@ public:
     });
   }
 
+  static void registerFieldTypes(Registries& r) {
+    r.fieldTypes.add("pair", [](const PluginParams& params) -> std::unique_ptr<const PluginFieldType> {
+      std::string separator(params.getString("separator", ":"));
+      if (separator.empty()) params.fail("separator", "must not be empty");
+      return std::make_unique<PairType>(std::move(separator), params.getBool("multi", false));
+    });
+    r.fieldTypes.add("spot", [](const PluginParams&) -> std::unique_ptr<const PluginFieldType> {
+      return std::make_unique<SpotType>();
+    });
+  }
+
   PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
 
   void registerComponents(Registries& r) override {
@@ -432,6 +443,7 @@ public:
       return std::make_unique<DescribeFilter>(std::move(source));
     });
     registerCollation(r);
+    registerFieldTypes(r);
 
     r.storage.addBackend("counting_ram", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingRamBackend>(ctx);
