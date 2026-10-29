@@ -6,15 +6,20 @@
 
 #include <gtest/gtest.h>
 
+#include "ExampleQuery.h"
+#include "ExampleNodeState.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/query/ProtobufQueryParser.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/util/luxir_util.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-int exampleNodesStarted();
-int exampleNodesStopped();
+void exampleThrowOnNodeStateCreation(bool value);
 
 using namespace luxir;
 using namespace luxir::test;
@@ -42,6 +47,15 @@ protected:
   }
   http::response<http::string_body> search(std::string body) {
     return post("/collections/main/_search", std::move(body));
+  }
+  LocalReqHandle sampleDocs(std::string_view params, api::DocFormat format) {
+    auto req = localReq(helper.getSearchEngine());
+    req->docFormatDefault = format;
+    std::string json = R"({"ops":{"s":{"sample_docs":)" + std::string(params) + "}}}";
+    auto text = api::build::arenaStr(req->mr, json);
+    EXPECT_TRUE(api::read_json(req->rawRequest(), text, req->mr));
+    req->execute();
+    return req;
   }
   // found for a filter-only search over `query` (a JSON query value).
   std::string found(const std::string& query) {
@@ -151,6 +165,94 @@ TEST_F(PluginExtensionTest, queryTypeErrors) {
   expectError(R"({"doc_ids":{"values":["d1"],"values":["d2"]}})", "duplicate plugin parameter");
   expectError(R"({"not_registered":{}})", "unknown_key");
   expectError(R"x("doc_ids(vals=[d1])")x", "unknown argument 'vals' for doc_ids()");
+  expectError(R"({"unscoped_value":{"value":"d1"}})",
+              "query type 'unscoped_value' returned a PLUGIN query that must derive from PluginQueryBase");
+  expectError(R"x("unscoped_value(d1)")x",
+              "query type 'unscoped_value' returned a PLUGIN query that must derive from PluginQueryBase");
+}
+
+TEST(PluginQueryTest, identityAndSharedFilterCache) {
+  LuxirNode node;
+  CollectionHelper helper(node, "plugin_identity");
+  FilterCacheConfig config;
+  config.minSegmentDocs = 0;
+  config.admissionThreshold = 1;
+  auto cache = std::make_shared<FilterCache>(config);
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "x", "cat_s", "y"), flatdoc("id", "y", "cat_s", "x")},
+                              UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  MemPool pool;
+  google::protobuf::Arena arena;
+  ParseContext parseContext(pool, *reader->schema(), arena, CoerceContext{}, "");
+  ProtobufQueryParser parser(parseContext);
+  auto parse = [&](std::string_view json) {
+    api::Query wire;
+    EXPECT_TRUE(api::read_json(wire, json, pool));
+    return parser.parse(wire);
+  };
+  auto* category = parse(R"({"field_value":{"value":"x"}})");
+  auto* same = parse(R"x("field_value(x)")x");
+  auto* byId = parse(R"({"field_value":{"value":"x","by_id":true}})");
+  auto* alias = parse(R"({"field_value_alias":{"value":"x"}})");
+  auto* different = parse(R"({"field_value":{"value":"y"}})");
+  ASSERT_EQ(QueryKind::PLUGIN, category->getKind());
+  EXPECT_NE(nullptr, dynamic_cast<example::CategoryValueQuery*>(category));
+  EXPECT_NE(nullptr, dynamic_cast<example::IdValueQuery*>(byId));
+  EXPECT_TRUE(category->equals(*same));
+  EXPECT_EQ(category->hash(), same->hash());
+  for (auto* other : {byId, alias, different}) {
+    EXPECT_FALSE(category->equals(*other));
+    EXPECT_FALSE(other->equals(*category));
+    EXPECT_NE(category->hash(), other->hash());
+  }
+  const auto& [name, def] = QueryRegistry::global().require("field_value");
+  EXPECT_EQ(name.data(), static_cast<PluginQueryBase*>(category)->registeredName().data());
+  EXPECT_EQ(name.data(), static_cast<PluginQueryBase*>(same)->registeredName().data());
+
+  const void* categoryEntry = nullptr;
+  // Each Context is a separate request: the second query must hit the shared
+  // cache, and the other class must materialize its own distinct document.
+  Query* queries[] = {category, same, byId, alias};
+  for (int i = 0; i < 4; i++) {
+    MemPool executionPool;
+    Query::Context context(executionPool, *reader);
+    queries[i]->validateLogical(context.planningContext());
+    auto* use = context.getFilterUse(*queries[i]);
+    ASSERT_NE(nullptr, use);
+    ASSERT_NE(nullptr, use->entryIdentityForTest());
+    if (i == 0) categoryEntry = use->entryIdentityForTest();
+    if (i == 1) {
+      EXPECT_EQ(categoryEntry, use->entryIdentityForTest());
+    }
+    if (i >= 2) {
+      EXPECT_NE(categoryEntry, use->entryIdentityForTest());
+    }
+    auto docs = QueryPrep::materializeEffectiveFilter(
+        *queries[i]->createWeight(context, 0), use, *reader, reader->segments()[0], nullptr);
+    ASSERT_NE(nullptr, docs.get());
+    EXPECT_EQ(1, docs.get()->card());
+    EXPECT_TRUE(docs.get()->get(i == 2 ? 0 : 1));
+    EXPECT_FALSE(docs.get()->get(i == 2 ? 1 : 0));
+    EXPECT_EQ((uint64_t)(i == 0 ? 1 : i), cache->counters().builds);
+  }
+  EXPECT_EQ(3u, cache->entryCountForTest());
+  EXPECT_GT(cache->counters().hits, 0u);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& op = req->collection("plugin_identity").topDocs("q").allQuery().countLimit();
+  api::Query filter;
+  ASSERT_TRUE(api::read_json(filter, R"({"field_value":{"value":"x","by_id":true}})", req->mr));
+  op.filter(filter).fields({"id"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(1, req->getMatchCount());
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  const auto* id = find(docs[0], "id");
+  ASSERT_NE(nullptr, id);
+  EXPECT_EQ("x", std::get<std::string>(*id));
 }
 
 TEST_F(PluginExtensionTest, explainRoundTripsPluginArms) {
@@ -187,10 +289,76 @@ TEST_F(PluginExtensionTest, searchOpWithExtraColumnAndNestedOps) {
   EXPECT_NE(std::string::npos, unknown.body().find("sample_docs")) << unknown.body();
 }
 
+TEST_F(PluginExtensionTest, extraColumnRejectsDiscoveredFieldCollisions) {
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "cat_s", "x", "price_i", 17)},
+                              UpdateMessage::COMMIT, true).success);
+  for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
+    SCOPED_TRACE((int)format);
+    for (std::string_view fields : {"", R"(,"fields":["*"])", R"(,"fields":["price*"])"}) {
+      SCOPED_TRACE(fields);
+      auto req = sampleDocs(R"({"ids":["d1"],"rank_names":["price_i"])" + std::string(fields) + "}", format);
+      EXPECT_FALSE(req->ok());
+      EXPECT_EQ(ErrorKind::INVALID_REQUEST, req->errorKind());
+      EXPECT_EQ("Extra column 'price_i' conflicts with a returned field; use an explicit field list"
+                " to omit the physical field or select the extra by name", req->errorMsg());
+      ASSERT_EQ(1u, req->responses.size());
+      EXPECT_TRUE(req->responses[0]->proto.ops.empty());
+    }
+  }
+}
+
+TEST_F(PluginExtensionTest, extraColumnNamesMustBeUniqueAndNotReserved) {
+  for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
+    SCOPED_TRACE((int)format);
+    auto duplicate = sampleDocs(R"({"ids":["d1"],"fields":["id"],"rank_names":["_rank","_rank"]})", format);
+    EXPECT_FALSE(duplicate->ok());
+    EXPECT_EQ(ErrorKind::INTERNAL, duplicate->errorKind());
+    EXPECT_EQ("Duplicate extra column '_rank'; extra column names must be unique", duplicate->errorMsg());
+    for (std::string_view name : {"_score_", "_version_"}) {
+      auto req = sampleDocs(R"({"ids":["d1"],"fields":["id"],"rank_names":[")" + std::string(name) + R"("]})", format);
+      EXPECT_FALSE(req->ok());
+      EXPECT_EQ(ErrorKind::INVALID_REQUEST, req->errorKind());
+      EXPECT_EQ("Extra column '" + std::string(name)
+                + "' conflicts with a reserved output name; choose a different extra column name", req->errorMsg());
+    }
+  }
+}
+
+TEST_F(PluginExtensionTest, explicitSelectorKeepsExtraAndOtherFields) {
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "cat_s", "x", "price_i", 17)},
+                              UpdateMessage::COMMIT, true).success);
+  for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
+    SCOPED_TRACE((int)format);
+    for (auto [fields, size] : {std::pair{R"(["price_i"])", 1u}, {R"(["price_i","cat_s"])", 2u},
+                                {R"(["id"])", 2u}, {R"(["*","price_i"])", 3u}, {R"(["price_i","*"])", 3u}}) {
+      SCOPED_TRACE(fields);
+      auto req = sampleDocs(R"({"ids":["d1"],"rank_names":["price_i"],"fields":)" + std::string(fields) + "}", format);
+      ASSERT_OK(req);
+      ASSERT_NE(nullptr, req->docList("s"));
+      EXPECT_EQ(format == api::DocFormat::COLUMNS, !req->docList("s")->columns.empty());
+      EXPECT_EQ(format == api::DocFormat::ROWS, !req->docList("s")->docs.empty());
+      auto docs = req->getDocs("s");
+      ASSERT_EQ(1u, docs.size());
+      EXPECT_EQ(size, docs[0].size());
+      const auto* price = find(docs[0], "price_i");
+      ASSERT_NE(nullptr, price);
+      EXPECT_EQ(1, std::get<int64_t>(*price));  // the rank, rather than the physical value 17
+      if (size == 3 || std::string_view(fields).contains("cat_s")) {
+        const auto* category = find(docs[0], "cat_s");
+        ASSERT_NE(nullptr, category);
+        EXPECT_EQ("x", std::get<std::string>(*category));
+      }
+    }
+  }
+}
+
 TEST_F(PluginExtensionTest, httpRoutes) {
+  auto* state = luxirNode->pluginState<example::NodeState>("example");
+  int routes = state->routes.load();
   auto ping = httpRequest(server->getPort(), http::verb::get, "/_plugins/example/ping?echo=hi");
   EXPECT_EQ(200, ping.result_int()) << ping.body();
   EXPECT_EQ(R"({"pong":"hi"})", ping.body());
+  EXPECT_EQ(routes + 1, state->routes.load());
   auto wrongMethod = post("/_plugins/example/ping", "");
   EXPECT_EQ(405, wrongMethod.result_int()) << wrongMethod.body();
   EXPECT_EQ("GET", std::string(wrongMethod[http::field::allow]));
@@ -205,10 +373,81 @@ TEST_F(PluginExtensionTest, httpRoutes) {
   EXPECT_NE(std::string::npos, badSample.body().find("unknown parameter 'idz'")) << badSample.body();
 }
 
-TEST_F(PluginExtensionTest, nodeLifecycle) {
-  EXPECT_GE(exampleNodesStarted(), 1);
-  int started = exampleNodesStarted(), stopped = exampleNodesStopped();
-  { LuxirNode node; }
-  EXPECT_EQ(started + 1, exampleNodesStarted());
-  EXPECT_EQ(stopped + 1, exampleNodesStopped());
+TEST(PluginQueryTest, makersReachTheirOwnNodeState) {
+  LuxirNode first, second;
+  auto* a = first.pluginState<example::NodeState>("example");
+  auto* b = second.pluginState<example::NodeState>("example");
+  ASSERT_NE(nullptr, a);
+  ASSERT_NE(nullptr, b);
+  EXPECT_NE(a, b);
+  EXPECT_EQ(nullptr, first.pluginState<example::NodeState>("missing"));
+  struct OtherState : PluginNodeState {};
+  EXPECT_EQ(nullptr, first.pluginState<OtherState>("example"));
+  auto run = [&](LuxirNode& node) {
+    CollectionHelper docs(node);
+    ASSERT_TRUE(docs.index(flatdoc("id", "d1"), UpdateMessage::COMMIT).success);
+    auto req = localReq(node.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"x({"ops":{
+      "q":{"top_docs":{"query":"doc_ids([d1], within=doc_ids([d1]))","fields":["id"]}},
+      "s":{"sample_docs":{"ids":["d1"],"fields":["id"]}}
+    }})x", req->mr));
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(1u, req->getDocs("q").size());
+    EXPECT_EQ(1u, req->getDocs("s").size());
+  };
+  run(first);
+  EXPECT_EQ(2, a->queries.load());
+  EXPECT_EQ(1, a->ops.load());
+  EXPECT_EQ(0, b->queries.load());
+  EXPECT_EQ(0, b->ops.load());
+  run(second);
+  EXPECT_EQ(2, a->queries.load());
+  EXPECT_EQ(1, a->ops.load());
+  EXPECT_EQ(2, b->queries.load());
+  EXPECT_EQ(1, b->ops.load());
+}
+
+TEST(PluginQueryTest, offlineQueryContextHasNoNode) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  google::protobuf::Arena arena;
+  ParseContext parse(pool, *schema, arena, CoerceContext{}, "offline");
+  ProtobufQueryParser parser(parse);
+  PluginQueryContext context(parse, "doc_ids", ParamReader("doc_ids", ParamReader::Entries{}),
+                             [&](const api::Query& query) { return parser.parse(query); });
+  EXPECT_EQ(nullptr, context.node());
+  api::Query query;
+  ASSERT_TRUE(api::read_json(query, R"({"doc_ids":{"values":["d1"]}})", pool));
+  EXPECT_NE(nullptr, parser.parse(query));
+}
+
+TEST(PluginQueryTest, nodeStateLifecycle) {
+  for (auto mode : {LuxirNode::Mode::SERVE, LuxirNode::Mode::PULL}) {
+    std::shared_ptr<std::atomic<bool>> stopped;
+    {
+      LuxirNode node(LuxirConfig{}, mode);
+      auto* state = node.pluginState<example::NodeState>("example");
+      ASSERT_NE(nullptr, state);
+      EXPECT_EQ(mode, state->mode);
+      stopped = state->stopped;
+      EXPECT_FALSE(stopped->load());
+    }
+    EXPECT_TRUE(stopped->load());
+  }
+}
+
+TEST(PluginQueryTest, nodeConstructorRethrowsStateCreationFailure) {
+  {
+    exampleThrowOnNodeStateCreation(true);
+    auto reset = scope_guard([]() { exampleThrowOnNodeStateCreation(false); });
+    try {
+      LuxirNode node;
+      FAIL();
+    } catch (const std::runtime_error& e) {
+      EXPECT_STREQ("example node state creation failed", e.what());
+    }
+  }
+  LuxirNode node;
+  EXPECT_NE(nullptr, node.pluginState<example::NodeState>("example"));
 }

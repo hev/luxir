@@ -117,6 +117,8 @@ class SortKindRegistry {
   bool isFrozen = false;
 
 public:
+  static SortKindRegistry& global();
+
   // The name is [a-z0-9_]+ and does not start with a digit; min, max and col
   // are the expression language's own. A claimed name may also be a value
   // function: the claim decides only a sort clause that is the call itself.
@@ -129,7 +131,7 @@ public:
   void freeze() { isFrozen = true; }
 };
 
-// Registries::global().sortKinds, for parsers that need no other registry.
+// SortKindRegistry::global(), for parsers that need no other registry.
 const SortKindRegistry& globalSortKindRegistry();
 
 // A sort expression whose root is a call to a claimed name, parsed.

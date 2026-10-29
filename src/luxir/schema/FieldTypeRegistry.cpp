@@ -76,6 +76,11 @@ void checkFields(std::string_view name, const PluginFieldType& type) {
 
 std::span<const std::string_view> FieldTypeRegistry::builtinNames() { return BUILTIN_NAMES; }
 
+FieldTypeRegistry& FieldTypeRegistry::global() {
+  static FieldTypeRegistry instance;
+  return instance;
+}
+
 void FieldTypeRegistry::add(std::string name, Maker maker) {
   if (isFrozen) throw std::logic_error("field type registry is frozen; field types must be added during startup");
   if (!validName(name)) throw std::invalid_argument("invalid field type name '" + name + "'; use [a-z0-9_]+");
