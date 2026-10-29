@@ -27,6 +27,8 @@
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/ParseContext.h"
+#include "luxir/query/QueryRegistry.h"
+#include "luxir/query/PluginQueryBase.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/query/MinScoreQuery.h"
@@ -72,9 +74,11 @@ luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuer
     // Val goes through the coercion contract: a numeric val against a
     // text/string field matches its canonical rendering (it used to
     // silently match nothing).
-    return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match);
+    return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match,
+                                    1.0f, matchQuery.case_insensitive);
   }
-  return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match);
+  return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match,
+                                  1.0f, matchQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseAnyOf(
@@ -172,19 +176,22 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
 luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix);
+  return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix,
+                                   prefixQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseWildcard(const luxir::api::WildcardQuery& wildcardQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern);
+  return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern,
+                                     wildcardQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseRegex(const luxir::api::RegexQuery& regexQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createRegexQuery(regexQuery.field, regexQuery.pattern);
+  return builder.createRegexQuery(regexQuery.field, regexQuery.pattern,
+                                  regexQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseExists(const luxir::api::ExistsQuery& existsQuery) {
@@ -584,6 +591,26 @@ luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& qu
   return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tie);
 }
 
+luxir::Query* ProtobufQueryParser::parsePlugin(const luxir::api::PluginQuery& query) {
+  const auto& [name, def] = QueryRegistry::global().require(query.name);
+  PluginQueryContext ctx(context, name, ParamReader(name, query.params),
+                         [this](const luxir::api::Query& nested) { return parse(nested); });
+  luxir::Query* result;
+  try {
+    result = def.maker(ctx);
+  } catch (const ParamError& e) {
+    throw RequestError(e.what());
+  }
+  if (result == nullptr) throw std::logic_error("query type '" + std::string(query.name) + "' made no query");
+  if (result->getKind() == QueryKind::PLUGIN) {
+    const auto* plugin = dynamic_cast<const PluginQueryBase*>(result);
+    if (plugin == nullptr) {
+      throw std::logic_error("query type '" + name + "' returned a PLUGIN query that must derive from PluginQueryBase");
+    }
+  }
+  return result;
+}
+
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // The one recursion choke point for structured trees: every nested node
   // passes through here, so the shared budget bounds tree depth no matter
@@ -616,6 +643,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     },
     [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
     [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
+    [&](const luxir::api::PluginQuery& p) -> luxir::Query* { return parsePlugin(p); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);

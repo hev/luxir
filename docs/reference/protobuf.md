@@ -152,6 +152,8 @@ defaults and constraints are described in the comments and guides.
 - [`OutcomeStats`](#message-luxir.outcomestats)
 - [`PhraseOptions`](#message-luxir.phraseoptions)
 - [`PhraseQuery`](#message-luxir.phrasequery)
+- [`PluginOp`](#message-luxir.pluginop)
+- [`PluginQuery`](#message-luxir.pluginquery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
 - [`PressureStats`](#message-luxir.pressurestats)
 - [`ProcessIoStats`](#message-luxir.processiostats)
@@ -245,6 +247,8 @@ One analysis-chain component - a tokenizer, character filter, or token filter - 
 
 ### luxir.AnalyzerDef
 
+A text analysis chain: char filters, then one tokenizer, then token filters. Alternatively \`name\` selects a registered analyzer (a built-in preset such as "english", or one a plugin provides); it excludes tokenizer and filters, and char\_filters alongside it replace the preset's char filters. The JSON dialect accepts a bare string for the named form: "english" == {"name": "english"}.
+
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
@@ -252,6 +256,7 @@ One analysis-chain component - a tokenizer, character filter, or token filter - 
 | <a id="field-luxir.analyzerdef.tokenizer"></a>[`tokenizer`](#field-luxir.analyzerdef.tokenizer) | 1 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | singular | "whitespace" (default when absent), "keyword", "unicode\_word" |
 | <a id="field-luxir.analyzerdef.filters"></a>[`filters`](#field-luxir.analyzerdef.filters) | 2 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated | applied after tokenization, in order |
 | <a id="field-luxir.analyzerdef.char_filters"></a>[`char_filters`](#field-luxir.analyzerdef.char_filters) | 3 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated | whole-value cleanup before tokenization, in order |
+| <a id="field-luxir.analyzerdef.name"></a>[`name`](#field-luxir.analyzerdef.name) | 4 | `string` | singular | a registered analyzer name; combines only with char\_filters |
 
 <a id="message-luxir.anyofquery"></a>
 
@@ -1040,6 +1045,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
+| <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
+| <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1516,6 +1523,7 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.val"></a>[`val`](#field-luxir.match.val) | 2 | [`Val`](#message-luxir.val) | singular |  |
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
+| <a id="field-luxir.match.case_insensitive"></a>[`case_insensitive`](#field-luxir.match.case_insensitive) | 10 | `bool` | singular | Match TEXT tokens and STRING/ID values regardless of simple Unicode case, after query analysis/normalization. Indexed case variants score as one word, with the query's exact case preferred slightly: frequency weight 1.0 for the analyzed/normalized query token, 0.9 for other variants. Frequencies sum before BM25 saturation, with shared statistics. Slower than a folding variant (\_t, \_un, \_wl), recommended for frequent use. Alternates come from analyzed tokens; case-preserving stemmers can be asymmetric (KStem stems lowercase only). Numeric and DATE fields ignore it. |
 
 <a id="message-luxir.memorystats"></a>
 
@@ -1647,6 +1655,33 @@ Phrase matching options. A present empty message requests an exact phrase.
 | <a id="field-luxir.phrasequery.slop"></a>[`slop`](#field-luxir.phrasequery.slop) | 6 | `int32` | singular | Maximum spread of rebased positions: max(docPos-queryPos) minus min(docPos-queryPos). Must be nonnegative. Adjacent transposition costs 2; this is not the number of words between terms. Zero is exact. |
 | <a id="field-luxir.phrasequery.positions"></a>[`positions`](#field-luxir.phrasequery.positions) | 15 | `int32` | repeated | optional positions of the terms |
 
+<a id="message-luxir.pluginop"></a>
+
+### luxir.PluginOp
+
+An operation registered by a compiled-in plugin (see docs/dev/plugins.md). The JSON dialect also accepts a registered plugin name as the arm key: {"my\_op": {"a": 1, "ops": {...}}} reads as {"plugin": {"name": "my\_op", "params": {"a": 1}, "ops": {...}}}. An unregistered name is a request error that lists the registered operations. The plugin validates params and defines the result shape; nested ops run over the domain the plugin gives them and may not override it.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.pluginop.name"></a>[`name`](#field-luxir.pluginop.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.pluginop.params"></a>[`params`](#field-luxir.pluginop.params) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
+| <a id="field-luxir.pluginop.ops"></a>[`ops`](#field-luxir.pluginop.ops) | 3 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map |  |
+
+<a id="message-luxir.pluginquery"></a>
+
+### luxir.PluginQuery
+
+A query type registered by a compiled-in plugin (see docs/dev/plugins.md). The JSON dialect also accepts a registered plugin name as the arm key: {"my\_query": {"a": 1}} reads as {"plugin": {"name": "my\_query", "params": {"a": 1}}}, and the expression language calls it as my\_query(...) with the arguments the plugin declares. An unregistered name is a request error that lists the registered query types. params are typed JSON values; a nested query is a Query-shaped value the plugin parses.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.pluginquery.name"></a>[`name`](#field-luxir.pluginquery.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.pluginquery.params"></a>[`params`](#field-luxir.pluginquery.params) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
+
 <a id="message-luxir.prefixquery"></a>
 
 ### luxir.PrefixQuery
@@ -1659,6 +1694,7 @@ Matches documents where \`field\` has a term starting with \`prefix\`. TEXT fiel
 |---|---|---|---|---|
 | <a id="field-luxir.prefixquery.field"></a>[`field`](#field-luxir.prefixquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.prefixquery.prefix"></a>[`prefix`](#field-luxir.prefixquery.prefix) | 2 | `string` | singular |  |
+| <a id="field-luxir.prefixquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.prefixquery.case_insensitive) | 3 | `bool` | singular | After whole-prefix normalization, also match simple Unicode case alternates. TEXT fields are supported. Uses a constant-score automaton. |
 
 <a id="message-luxir.pressurestats"></a>
 
@@ -1751,6 +1787,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
+| <a id="field-luxir.query.plugin"></a>[`plugin`](#field-luxir.query.plugin) | 26 | [`PluginQuery`](#message-luxir.pluginquery) | oneof [`kind`](#oneof-luxir.query.kind) | a query type registered by a compiled-in plugin |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -1868,6 +1905,7 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 |---|---|---|---|---|
 | <a id="field-luxir.regexquery.field"></a>[`field`](#field-luxir.regexquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
+| <a id="field-luxir.regexquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.regexquery.case_insensitive) | 3 | `bool` | singular | Literal characters, after field folding, and every member of character classes and ranges also match their simple Unicode case alternates. Negated classes exclude all case forms of their members. |
 
 <a id="message-luxir.replicarequirement"></a>
 
@@ -2073,6 +2111,7 @@ A named search operation. The name is its key in the enclosing ops map.
 | <a id="field-luxir.searchop.range_facet"></a>[`range_facet`](#field-luxir.searchop.range_facet) | 9 | [`RangeFacet`](#message-luxir.rangefacet) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.query_facet"></a>[`query_facet`](#field-luxir.searchop.query_facet) | 10 | [`QueryFacet`](#message-luxir.queryfacet) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.expr_op"></a>[`expr_op`](#field-luxir.searchop.expr_op) | 15 | [`ExprOp`](#message-luxir.exprop) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
+| <a id="field-luxir.searchop.plugin"></a>[`plugin`](#field-luxir.searchop.plugin) | 16 | [`PluginOp`](#message-luxir.pluginop) | oneof [`kind`](#oneof-luxir.searchop.kind) | an operation registered by a compiled-in plugin |
 | <a id="field-luxir.searchop.domain"></a>[`domain`](#field-luxir.searchop.domain) | 20 | [`Domain`](#message-luxir.domain) | singular | optional override of the incoming document domain |
 | <a id="field-luxir.searchop.flags"></a>[`flags`](#field-luxir.searchop.flags) | 21 | `uint64` | singular | Overrides the parent's packed options, including for this op's domain, queries and facet literals. Subops inherit this op's effective options. JSON uses the same lowercase flags name array as SearchRequest. |
 | <a id="field-luxir.searchop.flags_set"></a>[`flags_set`](#field-luxir.searchop.flags_set) | 22 | `uint64` | singular | Override mask. int64\_str is request-only: bit 2 is rejected in both flags and flags\_set, including an attempted clear. Other validation is the same as SearchRequest.flags\_set. Naming date\_native in JSON explicitly replaces an inherited date mode. |
@@ -2562,6 +2601,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 |---|---|---|---|---|
 | <a id="field-luxir.wildcardquery.field"></a>[`field`](#field-luxir.wildcardquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.wildcardquery.pattern"></a>[`pattern`](#field-luxir.wildcardquery.pattern) | 2 | `string` | singular |  |
+| <a id="field-luxir.wildcardquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.wildcardquery.case_insensitive) | 3 | `bool` | singular | Literal characters, after field folding, also match their simple Unicode case alternates (lower, upper and title forms). |
 
 ## Enums
 

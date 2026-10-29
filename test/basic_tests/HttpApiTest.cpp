@@ -28,6 +28,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir::test {
 
@@ -1123,6 +1124,46 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
+    "fields": {
+      "geo": {"type":"geo_point", "index":"range", "multi":true,
+              "ignore_malformed":true, "ignore_z_value":true}
+    }
+  })");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  auto authored = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  ASSERT_EQ(200, authored.result_int()) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_malformed": true)"), std::string::npos) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_z_value": true)"), std::string::npos) << authored.body();
+  auto resolved = httpRequest(port(), http::verb::get, "/collections/main/_schema?view=resolved");
+  ASSERT_EQ(200, resolved.result_int()) << resolved.body();
+  EXPECT_NE(resolved.body().find(R"("ignore_malformed": true)"), std::string::npos) << resolved.body();
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"obj","geo":{"lat":40.7128,"lon":-74.0060}},)"
+      R"j({"id":"str","geo":["40.7128,-74.0060","POINT (-0.1278 51.5074 12)"]},)j"
+      R"({"id":"hash","geo":"dr5regw3p"},)"
+      R"({"id":"bad","geo":"not a point","home_p":"51.5074,-0.1278"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(update.body().find(R"("errors")"), std::string::npos) << update.body();
+
+  auto near = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},)"
+      R"("fields":["id"],"count_limit":-1})");
+  ASSERT_EQ(200, near.result_int()) << near.body();
+  for (const char* id : {R"("obj")", R"("str")", R"("hash")"}) {
+    EXPECT_NE(near.body().find(id), std::string::npos) << id << near.body();
+  }
+  EXPECT_EQ(near.body().find(R"("bad")"), std::string::npos) << near.body();
+
+  auto london = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"home_p","lat":51.5074,"lon":-0.1278,"radius_meters":10}},)"
+      R"("fields":["id"]})");
+  ASSERT_EQ(200, london.result_int()) << london.body();
+  EXPECT_NE(london.body().find(R"("bad")"), std::string::npos) << london.body();
+}
+
 TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {
@@ -1597,6 +1638,60 @@ TEST_F(HttpApiTest, ndjsonPipelinedInputFailureDrainsSubmittedPrefix) {
   ASSERT_EQ(200, query.status()) << query.rawResponse();
   EXPECT_EQ((int64_t)kDocCount, query.found()) << query.rawResponse();
 
+  localServer.shutdown();
+}
+
+// Batches complete in stream order, but a batch frees its admission slot once
+// it is indexed: a stalled batch must not hold back the batches behind it.
+TEST_F(HttpApiTest, ndjsonStalledBatchDoesNotHoldBackLaterBatches) {
+  LuxirConfig config;
+  config.server.workers = 4;
+  config.ingest.stream_batch_docs = 1;
+  config.ingest.max_inflight_batches = 2;
+  LuxirNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  static constexpr int kDocCount = 12;
+  // If slots were held until completion, only the rest of the window (one
+  // batch) could index behind the stalled one.
+  static constexpr int kOvertakers = 5;
+  std::promise<void> release;
+  std::shared_future<void> released = release.get_future().share();
+  std::promise<void> overtaken;
+  std::atomic<int> behind{0};
+  Signal::listen("httpBatchIndexing", [&](void* ordinal, void*, void*) -> void* {
+    if ((uintptr_t)ordinal == 0) {
+      released.wait_for(std::chrono::seconds(10));
+    } else if (++behind == kOvertakers) {
+      overtaken.set_value();
+    }
+    return nullptr;
+  });
+
+  std::string body;
+  for (int i = 0; i < kDocCount; i++) {
+    body += R"({"id":"stall-)" + std::to_string(i) + R"(","title_w":"stalledbatch"})" "\n";
+  }
+  body += R"({"_end_":{"commit":{}}})" "\n";
+  auto update = std::async(std::launch::async, [&] {
+    return httpRequest(localServer.getPort(), http::verb::post, "/collections/stall/_update",
+                       std::move(body), "application/x-ndjson");
+  });
+  auto overtakenState = overtaken.get_future().wait_for(std::chrono::seconds(5));
+  int behindWhileStalled = behind.load();
+  release.set_value();
+  auto response = update.get();
+  Signal::unlisten("httpBatchIndexing");
+  EXPECT_EQ(std::future_status::ready, overtakenState)
+      << behindWhileStalled << " batches indexed behind the stalled one";
+  ASSERT_EQ(200, response.result_int()) << response.body();
+
+  HttpReq query(localServer.getPort());
+  query.collection("stall").matchQuery("title_w", "stalledbatch").fields({"id"})
+      .limit(kDocCount).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)kDocCount, query.found()) << query.rawResponse();
   localServer.shutdown();
 }
 

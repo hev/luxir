@@ -91,6 +91,7 @@ message SearchOp {
     RangeFacet range_facet = 9;
     QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
+    PluginOp plugin = 16;           // an operation registered by a compiled-in plugin
   }
   Domain domain = 20; // optional override of the incoming document domain
   // Overrides the parent's packed options, including for this op's domain,
@@ -102,6 +103,19 @@ message SearchOp {
   // the same as SearchRequest.flags_set.
   // Naming date_native in JSON explicitly replaces an inherited date mode.
   uint64 flags_set = 22;
+}
+
+// An operation registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_op": {"a": 1, "ops": {...}}} reads as
+// {"plugin": {"name": "my_op", "params": {"a": 1}, "ops": {...}}}.  An
+// unregistered name is a request error that lists the registered operations.
+// The plugin validates params and defines the result shape; nested ops run
+// over the domain the plugin gives them and may not override it.
+message PluginOp {
+  string name = 1;
+  map<string, Val> params = 2;
+  map<string, SearchOp> ops = 3;
 }
 
 // An expression aggregate over the operation's incoming document domain.
@@ -329,6 +343,7 @@ message Query {
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
+    PluginQuery plugin = 26;        // a query type registered by a compiled-in plugin
   }
 }
 
@@ -425,6 +440,16 @@ message Match {
   // ground).  When set it overrides `operator`; clamped to the term count.
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
+
+  // Match TEXT tokens and STRING/ID values regardless of simple Unicode case,
+  // after query analysis/normalization. Indexed case variants score as one word,
+  // with the query's exact case preferred slightly: frequency weight 1.0 for
+  // the analyzed/normalized query token, 0.9 for other variants. Frequencies sum
+  // before BM25 saturation, with shared statistics. Slower than a folding
+  // variant (_t, _un, _wl), recommended for frequent use. Alternates come from
+  // analyzed tokens; case-preserving stemmers can be asymmetric (KStem stems
+  // lowercase only). Numeric and DATE fields ignore it.
+  bool case_insensitive = 10;
 
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
@@ -529,6 +554,19 @@ message AnyOfQuery {
   Val values = 2;
 }
 
+// A query type registered by a compiled-in plugin (see docs/dev/plugins.md).
+// The JSON dialect also accepts a registered plugin name as the arm key:
+// {"my_query": {"a": 1}} reads as
+// {"plugin": {"name": "my_query", "params": {"a": 1}}}, and the expression
+// language calls it as my_query(...) with the arguments the plugin declares.
+// An unregistered name is a request error that lists the registered query
+// types. params are typed JSON values; a nested query is a Query-shaped
+// value the plugin parses.
+message PluginQuery {
+  string name = 1;
+  map<string, Val> params = 2;
+}
+
 // Matches documents whose field value falls in the given range.  All bounds
 // are optional; omit a side for an open-ended range.  Set at most one of
 // gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is
@@ -614,6 +652,10 @@ message BooleanQuery {
 message PrefixQuery {
   string field = 1;
   string prefix = 2;
+
+  // After whole-prefix normalization, also match simple Unicode case
+  // alternates. TEXT fields are supported. Uses a constant-score automaton.
+  bool case_insensitive = 3;
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one
@@ -624,6 +666,10 @@ message PrefixQuery {
 message WildcardQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, also match their simple Unicode
+  // case alternates (lower, upper and title forms).
+  bool case_insensitive = 3;
 }
 
 // Matches an anchored whole indexed term using `|`, concatenation, groups,
@@ -634,6 +680,11 @@ message WildcardQuery {
 message RegexQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, and every member of character
+  // classes and ranges also match their simple Unicode case alternates.
+  // Negated classes exclude all case forms of their members.
+  bool case_insensitive = 3;
 }
 
 // Matches indexed terms within byte-wise Levenshtein distance of `term`. TEXT
@@ -2113,10 +2164,17 @@ message AnalyzerComponent {
   map<string, Val> params = 2;
 }
 
+// A text analysis chain: char filters, then one tokenizer, then token filters.
+// Alternatively `name` selects a registered analyzer (a built-in preset such as
+// "english", or one a plugin provides); it excludes tokenizer and filters, and
+// char_filters alongside it replace the preset's char filters.
+// The JSON dialect accepts a bare string for the named form:
+// "english" == {"name": "english"}.
 message AnalyzerDef {
   AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
   repeated AnalyzerComponent filters = 2;  // applied after tokenization, in order
   repeated AnalyzerComponent char_filters = 3; // whole-value cleanup before tokenization, in order
+  string name = 4;                         // a registered analyzer name; combines only with char_filters
 }
 
 // Alternate representations of the same input value, keyed by local label.
@@ -2330,6 +2388,16 @@ message FieldDef {
     NS = 1; // nanoseconds
   }
   optional DateUnit unit = 24;
+
+  // GEO_POINT only. Skip a value that is not a valid point (unreadable, out of
+  // range, or a z coordinate when ignore_z_value is false) and index the rest
+  // of the document; in a multi-valued field only the bad points are skipped.
+  // Unset inherits, else false: a malformed point fails the document.
+  optional bool ignore_malformed = 28;
+
+  // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
+  // inherits, else true. Set false to reject a point with a z coordinate.
+  optional bool ignore_z_value = 29;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

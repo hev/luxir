@@ -18,7 +18,7 @@ Choose a type based on how you want to search and use the values:
 | `double` | 64-bit floating-point number for greater precision than `float`. |
 | `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
-| `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
 
 ### `text` versus `string`
@@ -123,6 +123,7 @@ The built-in templates are:
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
+| `_p`, `_ps` | Geo point column with a points index (`index: "range"`), single- or multi-valued. |
 | `_t` | Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. The general-purpose text field. |
 | `_u` | Unicode-word text, case- and accent-sensitive. |
 | `_un` | Unicode-word text with NFKC case folding; accents preserved, no stemming. |
@@ -136,7 +137,8 @@ Text fields are **stored** in the default compressed **stored_resource**.
 Numeric suffixes are column-backed but do not build a points index by default;
 range and exact-match queries still work by quickly scanning the column. Define a
 concrete field with `index: "range"` when those operations need a points index.
-There is no default geo suffix; define geo fields explicitly.
+The geo suffixes `_p` and `_ps` build one by default, because geo queries are
+their only use.
 
 ## Field templates for dynamic fields
 
@@ -283,7 +285,7 @@ publication advances the schema generation.
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
-| `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`; see [Text analysis](#text-analysis) |
+| `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`, or the name of a registered analyzer such as `"english"`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
 | `unit` | `date` only: `ms` (default) or `ns`. Inherits from the parent and is part of the field signature. An existing date definition cannot change its resolved unit. |
@@ -291,17 +293,19 @@ publication advances the schema generation.
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
 wrote.
 
-An empty `analyzer: {}` inherits the parent's analyzer. Naming a tokenizer or
-listing any token filter replaces the whole chain, including character filters
-(token filters alone get the `whitespace` tokenizer). Setting only `char_filters`
-keeps the parent's tokenizer and token filters, replacing its character filters.
-Without a parent analyzer, the base is `whitespace` with no token filters.
+An empty `analyzer: {}` inherits the parent's analyzer. Naming a tokenizer,
+listing any token filter, or naming a registered analyzer replaces the whole
+chain, including character filters (token filters alone get the `whitespace`
+tokenizer). Setting only `char_filters` keeps the parent's tokenizer and token
+filters, replacing its character filters. Without a parent analyzer, the base
+is `whitespace` with no token filters.
 
 `column` and `stored` solve different problems. A column is a typed,
 per-field structure used by sorting, faceting, analytics, numeric/geo queries,
@@ -581,6 +585,35 @@ accent folding without possessive removal or stemming. Neither
 
 For Unicode text without English stemming, use `_un`, or configure
 `unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
+
+### Named analyzers
+
+An analyzer can be a registered name instead of a definition. A bare string is
+shorthand for the object form:
+
+```json
+{"fields": {"body": {"type": "text", "analyzer": "english"}}}
+{"fields": {"body": {"type": "text", "analyzer": {"name": "english"}}}}
+```
+
+A named analyzer takes no tokenizer or filters alongside the name.
+`char_filters` next to the name replace the analyzer's own character filters,
+just as setting only `char_filters` does under an inherited analyzer. Built in:
+
+| Name | Expands to |
+|---|---|
+| `standard` | `unicode_word` + `["nfkc_cf"]` |
+| `english` | `unicode_word` + `["nfkc_cf", "fold", "kstem"]`, the same chain as `_t`, with kstem's default `possessive=true` |
+
+Plugins can register more (a language bundle, for example). The schema stores
+the name, and expands it through the registry each time the collection loads,
+so a changed registration applies at the next load, to queries and new
+documents alike. Reindex after such a change so existing segments match. The
+[resolved view](#resolved-view) reports the current expansion in `analyzer` and
+the name in `analyzer_preset`. A schema naming an analyzer or component that this build
+does not have is rejected on write; a collection already holding such a schema
+fails to load with that message while the node keeps serving its other
+collections.
 
 ## Field variants
 
@@ -908,7 +941,7 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 | `fields` | Declared concrete fields and their variants; suffix-template instances are not listed. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
-| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
+| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer` (always the expanded definition; `analyzer_preset` adds the registered name when one was used), `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
 | `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist` and `pq.m` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
 | `introduced_generation` | Start of this representation's current continuous availability. Redefining a representation or removing and re-adding its label starts a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
@@ -945,5 +978,3 @@ Removing and reusing a name does not erase its old indexed values.
   or facet on whole values.
 - `english_possessive` and `kstem` are analyzer filters only; STRING
   normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
-- There is no default geo suffix; geo fields need an explicit definition (see
-  [Geo search](geo-search.md)).
