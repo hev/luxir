@@ -30,12 +30,16 @@ struct AbsDiffStats {
   // PENDING_AT names a doc to be asked again at.
   enum class Answer { OWN, MALFORMED, PENDING, PENDING_AT, UNSUPPORTED };
   static inline std::atomic<Answer> answer{Answer::OWN};
-  // Segments seedWindows answered with windows, and the windows it offered.
+  // Segments seedWindows answered with windows in round 0, the later rounds
+  // it answered, and the windows it offered in all rounds.
   static inline std::atomic<int64_t> seededSegments{0};
+  static inline std::atomic<int64_t> seedRounds{0};
   static inline std::atomic<int64_t> seedWindows{0};
   // Test-only: what seedWindows answers. NONE offers none; MALFORMED adds
-  // unsorted, overlapping, empty and out-of-range windows to its own.
-  enum class SeedAnswer { OWN, NONE, MALFORMED };
+  // unsorted, overlapping, empty and out-of-range windows to its own;
+  // OVERLAP offers, in a later round, the earlier rounds' leaves again with
+  // the new ring.
+  enum class SeedAnswer { OWN, NONE, MALFORMED, OVERLAP };
   static inline std::atomic<SeedAnswer> seedAnswer{SeedAnswer::OWN};
 };
 
@@ -101,6 +105,9 @@ class AbsDiffComparator : public luxir::ValueSortComparator<int64_t> {
   int64_t builtRadius = -1;
   std::vector<uint32_t> residualScratch;
   std::vector<int64_t> rawScratch;
+  // The points index leaves seedWindows offered in this segment so far.
+  int64_t seedFirstLeaf = 0;
+  int64_t seedPastLeaf = 0;
 
   static int64_t saturatingAdd(int64_t a, int64_t b) {
     __int128 sum = (__int128)a + b;
@@ -123,6 +130,7 @@ public:
     points.reset();
     candidates.clear();
     builtRadius = -1;
+    seedFirstLeaf = seedPastLeaf = 0;
     maxDoc = segment.maxDoc();
     if (prunes && info != nullptr && info->pointsMetaOff != 0) {
       points.emplace(segment.postingsReader(), *info);
@@ -136,22 +144,57 @@ public:
   bool offersSeedWindows() const override { return points.has_value(); }
 
   // The docs of the points index leaves holding the points nearest the
-  // center: enough points for the heap's matches at the query's density.
+  // center: in round 0, enough points for the heap's matches at the query's
+  // density. When those left the heap short (the query is sparser near the
+  // center than overall), each later round widens the leaves offered so far
+  // by matches / collected, at least doubling them, and offers the new ring.
   void seedWindows(const SeedRequest& request, std::vector<luxir::SeedWindow>& out) override {
     if (!points || AbsDiffStats::seedAnswer.load() == AbsDiffStats::SeedAnswer::NONE) return;
-    int64_t count = (int64_t)points->pointCount();
-    int64_t density = std::max<int64_t>(1, request.sourceDocs);
-    int64_t want = (int64_t)std::min<__int128>(
-        count, std::max<__int128>(1, (__int128)request.matches * maxDoc / density));
-    int64_t mid = (int64_t)points->ordinalOfFirstAtLeast(center, residualScratch, rawScratch);
-    // The `want` points nearest the center lie within `want` ordinals of mid.
-    int64_t lo = std::max<int64_t>(0, mid - want);
-    int64_t hi = std::min(count, mid + want);
-    if (lo >= hi) return;
-    std::vector<int32_t> docs;
-    for (int64_t leaf = lo / points->maxPointsPerLeaf(); leaf <= (hi - 1) / points->maxPointsPerLeaf(); leaf++) {
-      for (const auto& point : points->decodeLeaf((uint32_t)leaf)) docs.push_back(point.docid);
+    int64_t perLeaf = points->maxPointsPerLeaf();
+    int64_t leaves = points->leafCount();
+    int64_t firstLeaf = 0;
+    int64_t pastLeaf = 0;
+    if (request.round == 0) {
+      int64_t count = (int64_t)points->pointCount();
+      int64_t density = std::max<int64_t>(1, request.sourceDocs);
+      int64_t want = (int64_t)std::min<__int128>(
+          count, std::max<__int128>(1, (__int128)request.matches * maxDoc / density));
+      int64_t mid = (int64_t)points->ordinalOfFirstAtLeast(center, residualScratch, rawScratch);
+      // The `want` points nearest the center lie within `want` ordinals of mid.
+      int64_t lo = std::max<int64_t>(0, mid - want);
+      int64_t hi = std::min(count, mid + want);
+      if (lo >= hi) return;
+      firstLeaf = lo / perLeaf;
+      pastLeaf = (hi - 1) / perLeaf + 1;
+    } else {
+      int64_t width = seedPastLeaf - seedFirstLeaf;
+      int64_t grown = (int64_t)std::min<__int128>(
+          leaves, std::max<__int128>(2 * (__int128)width,
+                                     (__int128)width * request.matches / std::max<int64_t>(1, request.collected)));
+      // Split the growth around the leaves offered so far, the rest of it to
+      // one side where the other ends.
+      int64_t add = grown - width;
+      int64_t left = std::min(seedFirstLeaf, add / 2);
+      int64_t right = std::min(leaves - seedPastLeaf, add - left);
+      left = std::min(seedFirstLeaf, add - right);
+      firstLeaf = seedFirstLeaf - left;
+      pastLeaf = seedPastLeaf + right;
+      if (left == 0 && right == 0) return;
     }
+    std::vector<int32_t> docs;
+    auto addLeaves = [&](int64_t from, int64_t past) {
+      for (int64_t leaf = from; leaf < past; leaf++) {
+        for (const auto& point : points->decodeLeaf((uint32_t)leaf)) docs.push_back(point.docid);
+      }
+    };
+    if (request.round == 0 || AbsDiffStats::seedAnswer.load() == AbsDiffStats::SeedAnswer::OVERLAP) {
+      addLeaves(firstLeaf, pastLeaf);
+    } else {
+      addLeaves(firstLeaf, seedFirstLeaf);
+      addLeaves(seedPastLeaf, pastLeaf);
+    }
+    seedFirstLeaf = firstLeaf;
+    seedPastLeaf = pastLeaf;
     std::sort(docs.begin(), docs.end());
     docs.erase(std::unique(docs.begin(), docs.end()), docs.end());
     size_t first = out.size();
@@ -169,7 +212,8 @@ public:
       out.push_back({7, 7});
       out.push_back({20, 10});
     }
-    AbsDiffStats::seededSegments++;
+    if (request.round == 0) AbsDiffStats::seededSegments++;
+    else AbsDiffStats::seedRounds++;
     AbsDiffStats::seedWindows += (int64_t)out.size();
   }
 

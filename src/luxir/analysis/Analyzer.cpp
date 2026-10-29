@@ -127,12 +127,13 @@ void classifyWord(std::string_view word, Token& token) {
   token.script = script;
 }
 
-// UAX#29 word-boundary tokenizer. Emits word-like segments only (letters,
-// numbers, ideographs, ...); punctuation and whitespace runs are dropped, like
-// Lucene's StandardTokenizer. Each token is a string_view into the source (no
-// copy), honoring the borrow contract. Stateful: it holds a segmentation cursor
-// over the current value and rebuilds it in reset().
-class UnicodeWordTokenizer : public Tokenizer {
+// UAX#29 word-boundary tokenizer straight over uni-algo, codepoint by
+// codepoint. Emits word-like segments only (letters, numbers, ideographs, ...);
+// punctuation and whitespace runs are dropped, like Lucene's StandardTokenizer.
+// Each token is a string_view into the source (no copy). Chains use the
+// region-dispatching StandardTokenizer below; this is the conformance oracle
+// its fast paths are tested against.
+class ReferenceWordTokenizer : public Tokenizer {
   using View = decltype(una::views::word_only::utf8(std::declval<std::string_view>()));
   using Iter = decltype(std::declval<View&>().begin());
   std::optional<View> view;  // word_only view over the current value
@@ -294,17 +295,20 @@ inline bool isAsciiWs(unsigned char c) {
   return c == ' ' || (c >= '\t' && c <= '\r');  // \t \n \v \f \r
 }
 
-// The fused default tokenizer: UAX#29 word segmentation with per-token NFKC_CF
-// applied in the same stage. Equivalent to unicode_word + nfkc_cf (asserted in
-// AnalysisTest) but without the extra filter hop / redundant ASCII scan. When
-// the chain continues with `fold` (the _t chain), that is fused in too, but
-// only as an equivalent shortcut: fold stays a separate, optional component
-// (lossy, language-dependent; it is what distinguishes _t from _un).
+// The unicode_word tokenizer: UAX#29 word segmentation, optionally with the
+// chain's leading case filter applied in the same stage. WordFold::NONE is
+// plain unicode_word; LOWERCASE fuses unicode_word + lowercase; NFKC_CF fuses
+// unicode_word + nfkc_cf, and NFKC_CF_ACCENTS also a following `fold` (the _t
+// chain), only as an equivalent shortcut: fold stays a separate, optional
+// component (lossy, language-dependent; it is what distinguishes _t from _un).
+// Each fused mode is equivalent to the composed chain (asserted in
+// AnalysisTest) without the extra filter hop / redundant ASCII scan.
 //
-// Hot-path structure: reset() copies the value into `lowered`, ASCII-lowercasing
-// in one bulk SIMD pass (ASCII byte ops cannot corrupt multibyte UTF-8
-// sequences, and pre-lowercasing ASCII never changes NFKC_CF output since
-// casefold subsumes it). The scan then carves the value into regions delimited
+// Hot-path structure: with a case filter, reset() copies the value into
+// `lowered`, ASCII-lowercasing in one bulk SIMD pass (ASCII byte ops cannot
+// corrupt multibyte UTF-8 sequences, and pre-lowercasing ASCII changes neither
+// word-break classes nor NFKC_CF or lowercase output, which subsume it).
+// Without one, the scan runs over the value itself. The scan then carves the value into regions delimited
 // at *safe splits*: an ASCII whitespace byte followed by an ASCII byte (or end).
 // ASCII whitespace always hard-breaks words (WSegSpace/CR/LF/Newline classes;
 // TAB is Other, which also breaks both sides), and the only UAX#29 rule that
@@ -319,49 +323,55 @@ inline bool isAsciiWs(unsigned char c) {
 // after it, goes through uni-algo word_only + per-token NFKC_CF (+ fold), the
 // fully conformant path.
 //
-// Tokens point into `lowered` (or the NFKC / fold scratch buffers): the
-// producer's private reusable buffers, per the borrow contract.
+// Tokens point into the value or `lowered` (or the case / fold scratch
+// buffers): the producer's private reusable buffers, per the borrow contract.
 class StandardTokenizer : public Tokenizer {
   using View = decltype(una::views::word_only::utf8(std::declval<std::string_view>()));
   using Iter = decltype(std::declval<View&>().begin());
-  std::string lowered;           // ASCII-lowercased copy of the current value
-  const char* loweredBase = nullptr;  // = lowered.data(), cached so offset math avoids reloading it
-  const char* cur = nullptr;     // region scan cursor into `lowered`
+  std::string lowered;           // ASCII-lowercased copy of the value, with a case filter
+  const char* textBase = nullptr;  // the scanned text: the value or lowered.data()
+  const char* cur = nullptr;     // region scan cursor into the scanned text
   const char* valEnd = nullptr;
   const char* nextHigh = nullptr;  // first non-ASCII byte at or after cur once refreshed; valEnd if none
   const char* dfaCur = nullptr;  // active pure-ASCII region: [dfaCur, dfaEnd)
   const char* dfaEnd = nullptr;
   std::optional<View> view;      // active non-ASCII region: word_only over it
   Iter it{};
-  std::string buf;               // NFKC_CF scratch for the current token
+  std::string buf;               // case-filter scratch for the current token
   std::string foldBuf;           // accent-fold scratch for the current token
-  const bool foldAccents;        // fused `fold` filter (see Analyzer::fusedFold)
+  const WordFold fold;
 
 public:
-  explicit StandardTokenizer(bool foldAccents) : foldAccents(foldAccents) {}
+  explicit StandardTokenizer(WordFold fold) : fold(fold) {}
 
   void reset() override {
     size_t n = (size_t) (end_ - start_);
-    const char* src = start_;
-    lowered.resize_and_overwrite(n, [src](char* dst, size_t len) {
-      ascii::lowerCopy(dst, src, len);
-      return len;
-    });
-    loweredBase = lowered.data();
-    cur = loweredBase;
-    valEnd = cur + lowered.size();
+    if (fold == WordFold::NONE) {
+      textBase = start_;
+    } else {
+      const char* src = start_;
+      lowered.resize_and_overwrite(n, [src](char* dst, size_t len) {
+        ascii::lowerCopy(dst, src, len);
+        return len;
+      });
+      textBase = lowered.data();
+    }
+    cur = textBase;
+    valEnd = cur + n;
     nextHigh = cur + ascii::findNonAscii(cur, n);
     dfaCur = dfaEnd = nullptr;
     view.reset();
   }
 
-  // The fused nfkc_cf half applies to a bare term; the segmentation half does
+  // The fused filter half applies to a bare term; the segmentation half does
   // not (see TokenStream::normalizeTerm).
   void normalizeTerm(std::string& term) override {
+    if (fold == WordFold::NONE) return;
     std::string scratch;
-    std::string_view folded = applyNfkcCf(term, scratch);
+    std::string_view folded = fold == WordFold::LOWERCASE ? applyLowercase(term, scratch)
+                                                          : applyNfkcCf(term, scratch);
     if (folded.data() != term.data()) term.assign(folded);
-    if (foldAccents && !isAscii(term)) term = una::norm::to_unaccent_utf8(term);
+    if (fold == WordFold::NFKC_CF_ACCENTS && !isAscii(term)) term = una::norm::to_unaccent_utf8(term);
   }
 
   // Aligned because the inlined ASCII DFA loop below is sensitive to where the
@@ -386,20 +396,28 @@ private:
   // released) when it is exhausted.
   [[gnu::noinline]] bool viewNext() {
     while (it != view->end()) {
-      // Capture the source span before NFKC_CF repoints token.text at `buf`.
-      // `lowered` is a length-preserving ASCII-lowercased copy, so byte
-      // offsets into it equal byte offsets into the original value.
+      // Capture the source span before the case filter repoints token.text
+      // at `buf`. `lowered` is a length-preserving ASCII-lowercased copy, so
+      // byte offsets into it equal byte offsets into the original value.
       std::string_view w = *it;
-      token.setOffset((int) (w.data() - loweredBase),
-                      (int) (w.data() + w.size() - loweredBase));
-      token.text = applyNfkcCf(w, buf);
-      ++it;
-      if (token.text.empty()) continue;  // invisible words consume no position
+      token.setOffset((int) (w.data() - textBase),
+                      (int) (w.data() + w.size() - textBase));
       classifyWord(w, token);
+      ++it;
+      if (fold == WordFold::NONE) {
+        token.text = w;
+        return true;
+      }
+      if (fold == WordFold::LOWERCASE) {
+        token.text = applyLowercase(w, buf);
+        return true;
+      }
+      token.text = applyNfkcCf(w, buf);
+      if (token.text.empty()) continue;  // invisible words consume no position
       // Fused `fold`, exactly as AccentFoldFilter applies it after nfkc_cf
       // (including keeping a token that folds to empty). DFA tokens are
       // ASCII, which fold leaves alone, so only this path pays for it.
-      if (foldAccents && !isAscii(token.text)) {
+      if (fold == WordFold::NFKC_CF_ACCENTS && !isAscii(token.text)) {
         foldBuf = una::norm::to_unaccent_utf8(token.text);
         token.text = foldBuf;
       }
@@ -490,7 +508,7 @@ private:
       }
       if (kinds & (WB_LET | WB_NUM)) {
         token.text = std::string_view(w, (size_t) (s - w));
-        token.setOffset((int) (w - loweredBase), (int) (s - loweredBase));
+        token.setOffset((int) (w - textBase), (int) (s - textBase));
         // ASCII letters are Latin; a digits-only word has no script.
         // type and script in one 16-bit store (adjacent, little-endian: see Token).
         static constexpr uint16_t classes[4] = {0, asciiClass(TokenType::ALPHA, Script::LATIN),
@@ -593,12 +611,16 @@ std::string_view applyLowercase(std::string_view in, std::string& buf) {
   return buf;
 }
 
-std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer() {
-  return std::make_unique<UnicodeWordTokenizer>();
+std::unique_ptr<Tokenizer> makeReferenceWordTokenizer() {
+  return std::make_unique<ReferenceWordTokenizer>();
 }
 
-std::unique_ptr<Tokenizer> makeStandardTokenizer(bool foldAccents) {
-  return std::make_unique<StandardTokenizer>(foldAccents);
+std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer() {
+  return std::make_unique<StandardTokenizer>(WordFold::NONE);
+}
+
+std::unique_ptr<Tokenizer> makeStandardTokenizer(WordFold fold) {
+  return std::make_unique<StandardTokenizer>(fold);
 }
 
 std::unique_ptr<TokenStream> makeNfkcCasefoldFilter(std::unique_ptr<TokenStream> source) {
@@ -882,42 +904,35 @@ std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def
 
 }  // namespace
 
-void registerBuiltinAnalysis(AnalysisRegistry& r) {
+void AnalysisRegistry::registerBuiltins() {
   // unicode_word is stateful: it carries a segmentation cursor and rebuilds it in reset().
-  r.addTokenizer("whitespace", plainTokenizer<makeWhitespaceTokenizer>);
-  r.addTokenizer("keyword", plainTokenizer<makeKeywordTokenizer>);
-  r.addTokenizer("unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>);
-  r.addFilter("lowercase", plainFilter<makeLowercaseFilter>);
-  r.addFilter("nfkc_cf", plainFilter<makeNfkcCasefoldFilter>);
-  r.addFilter("fold", plainFilter<makeAccentFoldFilter>);
-  r.addFilter("english_possessive", plainFilter<makeEnglishPossessiveFilter, false>);
-  r.addFilter("kstem", kstemFilter);
-  r.addFilter("stop", stopFilter);
-  registerBuiltinCharFilters(r);
+  addTokenizer("whitespace", plainTokenizer<makeWhitespaceTokenizer>);
+  addTokenizer("keyword", plainTokenizer<makeKeywordTokenizer>);
+  addTokenizer("unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>);
+  addFilter("lowercase", plainFilter<makeLowercaseFilter>);
+  addFilter("nfkc_cf", plainFilter<makeNfkcCasefoldFilter>);
+  addFilter("fold", plainFilter<makeAccentFoldFilter>);
+  addFilter("english_possessive", plainFilter<makeEnglishPossessiveFilter, false>);
+  addFilter("kstem", kstemFilter);
+  addFilter("stop", stopFilter);
+  registerBuiltinCharFilters();
 
   api::AnalyzerComponent unicodeWord;
   unicodeWord.name = "unicode_word";
-  api::AnalyzerComponent nfkc, fold, possessive, kstem;
+  api::AnalyzerComponent nfkc, fold, kstem;
   nfkc.name = "nfkc_cf";
   fold.name = "fold";
-  possessive.name = "english_possessive";
   kstem.name = "kstem";
   api::AnalyzerDef standard;
   standard.tokenizer = unicodeWord;
   std::array<api::AnalyzerComponent, 1> standardFilters{nfkc};
   standard.filters = standardFilters;
-  r.addAnalyzer("standard", standard);
-  // possessive removal happens in english_possessive; kstem must not strip it a second time
-  api::Val noPossessive;
-  noPossessive.kind = false;
-  using ParamPair = std::pair<std::string_view, ::hpp_proto::indirect_view<api::Val>>;
-  const ParamPair kstemParams[] = {{"possessive", &noPossessive}};
-  kstem.params = api::map_view<std::string_view, ::hpp_proto::indirect_view<api::Val>>(std::span<const ParamPair>(kstemParams));
+  addAnalyzer("standard", standard);
   api::AnalyzerDef english;
   english.tokenizer = unicodeWord;
-  std::array<api::AnalyzerComponent, 4> englishFilters{nfkc, fold, possessive, kstem};
+  std::array<api::AnalyzerComponent, 3> englishFilters{nfkc, fold, kstem};
   english.filters = englishFilters;
-  r.addAnalyzer("english", english);
+  addAnalyzer("english", english);
 }
 
 std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def) {
@@ -1003,14 +1018,18 @@ Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
       filters(std::move(fs)), charFilters(std::move(cs)), presetName(std::move(presetName)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
       fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),
+      fusedLowercase(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "lowercase"),
       stateful(tokenizer->stateful ||
                std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })) {}
 
 std::unique_ptr<TokenChain> Analyzer::createChain() const {
-  std::unique_ptr<Tokenizer> head = fusedHead ? makeStandardTokenizer(fusedFold) : tokenizer->create();
+  std::unique_ptr<Tokenizer> head =
+      fusedHead ? makeStandardTokenizer(fusedFold ? WordFold::NFKC_CF_ACCENTS : WordFold::NFKC_CF)
+      : fusedLowercase ? makeStandardTokenizer(WordFold::LOWERCASE)
+      : tokenizer->create();
   auto& headRef = *head;
   std::unique_ptr<TokenStream> tail = std::move(head);
-  for (size_t i = fusedFold ? 2 : fusedHead ? 1 : 0; i < filters.size(); i++) {
+  for (size_t i = fusedFold ? 2 : fusedHead || fusedLowercase ? 1 : 0; i < filters.size(); i++) {
     tail = filters[i]->create(std::move(tail));
   }
   std::vector<TokenChain::CharStage> cleanups;

@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include "luxir/server/PluginNodeState.h"
+
 namespace luxir {
 
 struct PluginInfo {
@@ -15,7 +17,7 @@ struct PluginInfo {
   std::string description;  // one line
 };
 
-class Registries;
+struct Registries;
 class LuxirNode;
 
 // A compiled-in extension. Plugins are linked into the executable at build time
@@ -27,11 +29,10 @@ public:
   // Called once during initPlugins(). Register components into `r`.
   // Throwing aborts startup with the message.
   virtual void registerComponents(Registries& r) = 0;
-  // Called when a node has opened its collections, and before it shuts down
-  // (a process may run several nodes, e.g. in tests). Throwing from
-  // nodeStarted aborts the node's construction; nodeStopping must not throw.
-  virtual void nodeStarted(LuxirNode& node) { (void)node; }
-  virtual void nodeStopping(LuxirNode& node) noexcept { (void)node; }
+  // Called per node after its collections are open. Null means no node state.
+  // A throw aborts node construction; RAII must clean up partial work.
+  // Both modes create states; node.getMode() distinguishes SERVE and PULL.
+  virtual std::unique_ptr<PluginNodeState> createNodeState(LuxirNode&) { return nullptr; }
 };
 
 class PluginRegistry {
@@ -39,6 +40,8 @@ class PluginRegistry {
   bool isFrozen = false;
 
 public:
+  PluginRegistry();
+  static PluginRegistry& global();
   // Throws std::invalid_argument on a bad or duplicate name, std::logic_error after freeze.
   void add(std::unique_ptr<Plugin> plugin);
   const std::vector<std::unique_ptr<Plugin>>& plugins() const { return list; }
@@ -51,16 +54,14 @@ public:
 // luxir_lib: adds every configured plugin to `r`.
 void addConfiguredPlugins(PluginRegistry& r);
 
-// Idempotent. Registers builtins, calls addPlugins (executables pass addConfiguredPlugins, so the
+// Idempotent. Calls addPlugins (executables pass addConfiguredPlugins, so the
 // generated object is referenced from the executable and pulled in naturally), then runs
 // each plugin's registerComponents, logs the plugin list, then freezes the global registries.
-// Call before any LuxirNode or Schema exists.
+// Each area seeds its built-ins at registry construction. Call before any LuxirNode or Schema exists.
+// A null adder means no plugins. Repeating the same adder is a no-op; a different
+// adder is an error. Initialization failure is terminal: later calls rethrow the
+// original exception. No registry state may be relied on afterwards; the process must exit.
 void initPlugins(void (*addPlugins)(PluginRegistry&));
-
-// Node lifecycle: call every plugin's nodeStarted / nodeStopping, in
-// registration order (stopping in reverse).
-void notifyNodeStarted(LuxirNode& node);
-void notifyNodeStopping(LuxirNode& node) noexcept;
 
 }  // namespace luxir
 
