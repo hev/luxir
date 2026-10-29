@@ -16,6 +16,7 @@
 #include "luxir/api/RequestFlags.h"
 #include "luxir/search/SearchOpRegistry.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/search/ops/RootOp.h"
@@ -230,7 +231,7 @@ public:
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
       coerceContext(*req.timeZone),
-      "root", &req.warnings, &fields};
+      "root", &req.warnings, &fields, &req.engine.getNode()};
     parseContext.reader = req.reader.get();
     ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
@@ -329,7 +330,7 @@ public:
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
       ParseContext context{req.requestPool, *req.schema, req.arena,
           coerceContext(*req.timeZone),
-          currOp.name, &req.warnings, &fields};
+          currOp.name, &req.warnings, &fields, &req.engine.getNode()};
       context.collapse = enclosingCollapse;
       context.reader = req.reader.get();
       auto domains = parseChildDomains(ops, context);
@@ -486,7 +487,7 @@ public:
           ParseContext parseContext{
             req.requestPool, *req.schema, req.arena,
             coerceContext(*req.timeZone),
-            name, &req.warnings, &fields};
+            name, &req.warnings, &fields, &req.engine.getNode()};
           parseContext.collapse = enclosingCollapse;
           parseContext.reader = req.reader.get();
           ProtobufQueryParser parser(parseContext);
@@ -1572,7 +1573,7 @@ public:
     }
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
     parseContext.collapse = enclosingCollapse;
     parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
@@ -2184,10 +2185,11 @@ public:
   public:
     PluginOpContextImpl(SearchParserImpl& parser, std::string_view name, const luxir::api::PluginOp& proto, int depth)
       : PluginOpContext(parser.req, name, proto,
-                        PluginParams("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
+                        ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
         parser(parser), depth(depth),
         context(parser.req.requestPool, *parser.req.schema, parser.req.arena,
-                parser.coerceContext(*parser.req.timeZone), name, &parser.req.warnings, &parser.fields) {
+                parser.coerceContext(*parser.req.timeZone), name, &parser.req.warnings,
+                &parser.fields, &parser.req.engine.getNode()) {
       context.collapse = parser.enclosingCollapse;
       context.reader = parser.req.reader.get();
     }
@@ -2257,9 +2259,14 @@ public:
   };
 
   SearchOp* parsePluginOp(std::string_view name, const luxir::api::PluginOp& pluginOp, int depth) {
-    const auto& maker = globalSearchOpRegistry().require(pluginOp.name);
+    const auto& maker = SearchOpRegistry::global().require(pluginOp.name);
     PluginOpContextImpl context(*this, name, pluginOp, depth);
-    SearchOp* op = maker(context);
+    SearchOp* op;
+    try {
+      op = maker(context);
+    } catch (const ParamError& e) {
+      throw RequestError(e.what());
+    }
     if (op == nullptr) throw std::logic_error("search op '" + std::string(pluginOp.name) + "' made no operation");
     return op;
   }
@@ -2358,7 +2365,7 @@ public:
 
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      coerceContext(*req.timeZone), name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
     parseContext.collapse = enclosingCollapse;
     parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);

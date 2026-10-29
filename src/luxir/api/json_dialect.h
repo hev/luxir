@@ -1005,6 +1005,10 @@ struct from<JSON, luxir::api::AnalyzerDef> {
     static constexpr auto O = ws_handled<Opts>();
     if ((char)*it == '"') {
       util::from_json<O>(value.name, ctx, it, end);
+      if (!bool(ctx.error) && value.name.empty()) {
+        ctx.error = error_code::syntax_error;
+        ctx.custom_error_message = "analyzer name must not be empty; use {} to inherit or name an analyzer";
+      }
       return;
     }
     static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
@@ -1023,6 +1027,10 @@ struct from<JSON, luxir::api::AnalyzerDef> {
             glz::util::parse_repeated<V>(false, charFilters, ctx, vit, vend);
           } else if (key == "name") {
             util::from_json<V>(value.name, ctx, vit, vend);
+            if (!bool(ctx.error) && value.name.empty()) {
+              ctx.error = error_code::syntax_error;
+              ctx.custom_error_message = "analyzer name must not be empty; use {} to inherit or name an analyzer";
+            }
           } else {
             ctx.error = error_code::unknown_key;
             return true;

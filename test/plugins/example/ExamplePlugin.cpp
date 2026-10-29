@@ -9,6 +9,7 @@
 
 #include "CountingStorage.h"
 #include "ExampleSearch.h"
+#include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/store/DelegatingDirectory.h"
@@ -193,43 +194,8 @@ namespace {
 // collations, query types, search ops, HTTP routes, the node lifecycle, and
 // storage backends and layers.
 class ExamplePlugin : public Plugin {
-  static void registerAnalysis(Registries& r) {
-    r.analysis.addFilter("reverse", [](const api::AnalyzerComponent& def) {
-      noParams(def);
-      struct Factory : TokenFilterFactory {
-        std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
-          return std::make_unique<ReverseFilter>(std::move(source));
-        }
-      };
-      auto factory = std::make_unique<Factory>();
-      factory->name = "reverse";
-      factory->normalizing = true;
-      return std::unique_ptr<TokenFilterFactory>(std::move(factory));
-    });
-    r.analysis.addCharFilter("strip_x", [](const api::AnalyzerComponent& def) {
-      noParams(def);
-      struct Factory : CharFilterFactory {
-        std::unique_ptr<CharFilter> create() const override { return std::make_unique<StripXFilter>(); }
-      };
-      auto factory = std::make_unique<Factory>();
-      factory->name = "strip_x";
-      factory->normalizing = true;
-      return std::unique_ptr<const CharFilterFactory>(std::move(factory));
-    });
-
-    api::AnalyzerComponent whitespace, stripX, lowercase, reverse;
-    whitespace.name = "whitespace";
-    stripX.name = "strip_x";
-    lowercase.name = "lowercase";
-    reverse.name = "reverse";
-    api::AnalyzerDef example;
-    example.tokenizer = whitespace;
-    const api::AnalyzerComponent charFilters[] = {stripX};
-    const api::AnalyzerComponent filters[] = {lowercase, reverse};
-    example.char_filters = charFilters;
-    example.filters = filters;
-    r.analysis.addAnalyzer("example", example);
-  }
+public:
+  static inline std::atomic<bool> throwOnNodeStateCreation{false};
 
   static void registerFilter(Registries& r, std::string name,
                              std::unique_ptr<TokenStream> (*make)(std::unique_ptr<TokenStream>)) {
@@ -272,7 +238,53 @@ class ExamplePlugin : public Plugin {
     });
   }
 
-  static void registerStorage(Registries& r) {
+  PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
+
+  void registerComponents(Registries& r) override {
+    r.analysis.addFilter("reverse", [](const api::AnalyzerComponent& def) {
+      noParams(def);
+      struct Factory : TokenFilterFactory {
+        std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+          return std::make_unique<ReverseFilter>(std::move(source));
+        }
+      };
+      auto factory = std::make_unique<Factory>();
+      factory->name = "reverse";
+      factory->normalizing = true;
+      return std::unique_ptr<TokenFilterFactory>(std::move(factory));
+    });
+    r.analysis.addCharFilter("strip_x", [](const api::AnalyzerComponent& def) {
+      noParams(def);
+      struct Factory : CharFilterFactory {
+        std::unique_ptr<CharFilter> create() const override { return std::make_unique<StripXFilter>(); }
+      };
+      auto factory = std::make_unique<Factory>();
+      factory->name = "strip_x";
+      factory->normalizing = true;
+      return std::unique_ptr<const CharFilterFactory>(std::move(factory));
+    });
+
+    api::AnalyzerComponent whitespace, stripX, lowercase, reverse;
+    whitespace.name = "whitespace";
+    stripX.name = "strip_x";
+    lowercase.name = "lowercase";
+    reverse.name = "reverse";
+    api::AnalyzerDef example;
+    example.tokenizer = whitespace;
+    const api::AnalyzerComponent charFilters[] = {stripX};
+    const api::AnalyzerComponent filters[] = {lowercase, reverse};
+    example.char_filters = charFilters;
+    example.filters = filters;
+    r.analysis.addAnalyzer("example", example);
+
+    registerFilter(r, "span2", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
+      return std::make_unique<Span2Filter>(std::move(source));
+    });
+    registerFilter(r, "describe", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
+      return std::make_unique<DescribeFilter>(std::move(source));
+    });
+    registerCollation(r);
+
     r.storage.addBackend("counting_ram", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingRamBackend>(ctx);
     });
@@ -280,12 +292,14 @@ class ExamplePlugin : public Plugin {
                                        -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingLayer>(std::move(inner));
     });
-  }
 
-  static void registerSearch(Registries& r) {
     r.query.add("doc_ids", ::example::docIdsDef());
+    r.query.add("field_value", ::example::fieldValueDef());
+    r.query.add("field_value_alias", ::example::fieldValueDef());
+    r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
+      request.node.pluginState<::example::NodeState>("example")->routes++;
       const std::string* echo = request.queryParam("echo");
       response.body = R"({"pong":")" + (echo ? *echo : std::string()) + R"("})";
     });
@@ -295,34 +309,17 @@ class ExamplePlugin : public Plugin {
       response.searchBody = R"({"ops":{"sample":{"sample_docs":)" + std::string(request.body) + "}}}";
     });
   }
-
-public:
-  static inline std::atomic<int> startedNodes{0};
-  static inline std::atomic<int> stoppedNodes{0};
-
-  PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
-  void registerComponents(Registries& r) override {
-    registerAnalysis(r);
-    registerSearch(r);
-    registerFilter(r, "span2", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
-      return std::make_unique<Span2Filter>(std::move(source));
-    });
-    registerFilter(r, "describe", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
-      return std::make_unique<DescribeFilter>(std::move(source));
-    });
-    registerCollation(r);
-    registerStorage(r);
+  std::unique_ptr<luxir::PluginNodeState> createNodeState(luxir::LuxirNode& node) override {
+    if (throwOnNodeStateCreation.load()) throw std::runtime_error("example node state creation failed");
+    return std::make_unique<::example::NodeState>(node);
   }
-  void nodeStarted(LuxirNode&) override { startedNodes++; }
-  void nodeStopping(LuxirNode&) noexcept override { stoppedNodes++; }
 };
 
 }  // namespace
 
 }  // namespace luxir::example
 
-// For PluginExtensionTest: how many nodes the example plugin saw start and stop.
-int exampleNodesStarted() { return luxir::example::ExamplePlugin::startedNodes.load(); }
-int exampleNodesStopped() { return luxir::example::ExamplePlugin::stoppedNodes.load(); }
+// For the node-construction failure test.
+void exampleThrowOnNodeStateCreation(bool value) { luxir::example::ExamplePlugin::throwOnNodeStateCreation.store(value); }
 
 LUXIR_PLUGIN(example, luxir::example::ExamplePlugin)

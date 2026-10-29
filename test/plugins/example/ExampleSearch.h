@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "ExampleNodeState.h"
 #include "luxir/api/build.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/QueryRegistry.h"
@@ -26,6 +27,7 @@ namespace example {
 // expression form is doc_ids([a, b], within=cat_s:x).
 inline luxir::Query* makeDocIds(luxir::PluginQueryContext& ctx) {
   namespace api = luxir::api;
+  if (auto* node = ctx.node()) node->pluginState<NodeState>("example")->queries++;
   auto& pool = ctx.parse.pool;
   auto values = ctx.params.getStringList("values");
   const api::Val* within = ctx.params.get("within");
@@ -58,6 +60,7 @@ class SampleDocsOp : public luxir::SearchOp {
 public:
   std::vector<std::string_view> ids;
   std::vector<std::string_view> fields;
+  std::vector<std::string_view> rankNames{"_rank"};
 
   SampleDocsOp(luxir::SearchRequest& req, std::string_view name) : SearchOp(req, name) {}
 
@@ -98,7 +101,8 @@ public:
       auto& reader = *op.req.reader;
       auto& segment = reader.segments()[(size_t)segnum];
       if (const auto* info = reader.field("id").at(segment)) {
-        luxir::TermsEnum terms(luxir::MemPool::threadLocal(), segment.postingsReader(), *info);
+        auto poolGuard = luxir::MemPool::threadLocalPoolGuard();
+        luxir::TermsEnum terms(poolGuard.pool(), segment.postingsReader(), *info);
         for (size_t i = 0; i < sampleOp().ids.size(); i++) {
           if (!terms.seek(sampleOp().ids[i])) continue;
           luxir::DocsOnlyEnum docs(terms);
@@ -134,10 +138,13 @@ public:
           return [this, subCalc, tg]() { subCalc->calcAll(tg, domains); };
         });
       }
-      luxir::ExtraColumn rank{"_rank", [this](int64_t i, luxir::api::Val& out, std::pmr::memory_resource&) {
-        out.kind = ranks[(size_t)i];
-      }};
+      std::vector<luxir::ExtraColumn> extraColumns;
       auto& sop = sampleOp();
+      for (auto name : sop.rankNames) {
+        extraColumns.push_back({name, [this](int64_t i, luxir::api::Val& out, std::pmr::memory_resource&) {
+          out.kind = ranks[(size_t)i];
+        }});
+      }
       luxir::emitDocsResponse(
           op.req, op.flags, [this](luxir::SearchResponse* r) -> luxir::api::DocList& {
             return *slotArm<luxir::api::DocList>(r);
@@ -145,7 +152,7 @@ public:
           (int64_t)ranked.size(), [this](int64_t i) { return ranked[(size_t)i]; },
           [](int64_t) { return 0.0f; }, (int64_t)ranked.size(), sop.fields, 0, 0, true, false,
           luxir::api::DocFormat{}, underBucketSlot() ? luxir::DocEmission::FINAL_RESPONSE : luxir::DocEmission::STREAM,
-          {}, false, std::span<const luxir::ExtraColumn>(&rank, 1));
+          {}, false, extraColumns);
     }
   };
 
@@ -156,9 +163,11 @@ public:
 };
 
 inline luxir::SearchOp* makeSampleDocs(luxir::PluginOpContext& ctx) {
+  ctx.node().pluginState<NodeState>("example")->ops++;
   auto* op = luxir::arenaCreate<SampleDocsOp>(ctx.req.arena, ctx.req, ctx.name);
   op->ids = ctx.params.getStringList("ids");
   op->fields = ctx.params.getStringList("fields");
+  if (ctx.params.has("rank_names")) op->rankNames = ctx.params.getStringList("rank_names");
   ctx.params.rejectUnknown();
   ctx.addSubs(*op);
   return op;

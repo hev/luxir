@@ -62,6 +62,8 @@ public:
 // should teach (what was wrong, what is valid).
 class CollationRegistry {
 public:
+  static CollationRegistry& global();
+
   using Maker = std::function<std::unique_ptr<const CollatorFactory>(const api::AnalyzerComponent&)>;
 
   // The name is [a-z0-9_]+. A duplicate throws std::invalid_argument; any add
@@ -82,7 +84,7 @@ private:
   bool isFrozen = false;
 };
 
-// The frozen process-wide registry (Registries::global().collation).
+// The frozen process-wide registry (CollationRegistry::global()).
 const CollationRegistry& globalCollationRegistry();
 
 }  // namespace luxir

@@ -9,6 +9,11 @@
 
 namespace luxir {
 
+CollationRegistry& CollationRegistry::global() {
+  static CollationRegistry instance;
+  return instance;
+}
+
 void CollationRegistry::add(std::string name, Maker maker) {
   if (isFrozen) throw std::logic_error("collation registry is frozen; collations must be added during startup");
   if (name.empty()) throw std::invalid_argument("collation name must not be empty");

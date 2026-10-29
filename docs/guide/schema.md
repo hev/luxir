@@ -593,7 +593,7 @@ just as setting only `char_filters` does under an inherited analyzer. Built in:
 | Name | Expands to |
 |---|---|
 | `standard` | `unicode_word` + `["nfkc_cf"]` |
-| `english` | `unicode_word` + `["nfkc_cf", "fold", "english_possessive", {"name": "kstem", "params": {"possessive": false}}]`, the same analysis as `_t` |
+| `english` | `unicode_word` + `["nfkc_cf", "fold", "kstem"]`, the same chain as `_t`, with kstem's default `possessive=true` |
 
 Plugins can register more (a language bundle, for example). The schema stores
 the name, and expands it through the registry each time the collection loads,

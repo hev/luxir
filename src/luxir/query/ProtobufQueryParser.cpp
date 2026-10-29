@@ -28,6 +28,7 @@
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/QueryRegistry.h"
+#include "luxir/query/PluginQueryBase.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/query/MinScoreQuery.h"
@@ -591,11 +592,22 @@ luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& qu
 }
 
 luxir::Query* ProtobufQueryParser::parsePlugin(const luxir::api::PluginQuery& query) {
-  const auto& def = globalQueryRegistry().require(query.name);
-  PluginQueryContext ctx(context, query.name, PluginParams(std::string(query.name), query.params),
+  const auto& [name, def] = QueryRegistry::global().require(query.name);
+  PluginQueryContext ctx(context, name, ParamReader(name, query.params),
                          [this](const luxir::api::Query& nested) { return parse(nested); });
-  luxir::Query* result = def.maker(ctx);
+  luxir::Query* result;
+  try {
+    result = def.maker(ctx);
+  } catch (const ParamError& e) {
+    throw RequestError(e.what());
+  }
   if (result == nullptr) throw std::logic_error("query type '" + std::string(query.name) + "' made no query");
+  if (result->getKind() == QueryKind::PLUGIN) {
+    const auto* plugin = dynamic_cast<const PluginQueryBase*>(result);
+    if (plugin == nullptr) {
+      throw std::logic_error("query type '" + name + "' returned a PLUGIN query that must derive from PluginQueryBase");
+    }
+  }
   return result;
 }
 
