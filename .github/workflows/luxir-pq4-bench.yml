@@ -60,6 +60,18 @@ jobs:
           echo "sha=$(git -C candidate rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           lscpu > evidence/lscpu.txt
           echo "jobs=$(cd candidate && ./tools/build-jobs 3000)" >> "$GITHUB_OUTPUT"
+      - name: Work around upstream dockerignore excluding test/blas_lapack_test.cpp
+        # Luxir 7d1194f9 copies test/blas_lapack_test.cpp in .devcontainer/Dockerfile,
+        # but .devcontainer/Dockerfile.dockerignore excludes test/. Re-include only that file
+        # in this benchmark's local checkout when a tree needs it.
+        run: |
+          for tree in base candidate; do
+            if grep -q 'COPY test/blas_lapack_test.cpp' "$tree/.devcontainer/Dockerfile" \
+               && ! grep -qx '!test/blas_lapack_test.cpp' "$tree/.devcontainer/Dockerfile.dockerignore"; then
+              printf '!test/\n!test/blas_lapack_test.cpp\n' >> "$tree/.devcontainer/Dockerfile.dockerignore"
+              echo "patched $tree dockerignore"
+            fi
+          done
       - uses: docker/setup-buildx-action@v3
       - name: Cache dataset shards
         uses: actions/cache@v4
