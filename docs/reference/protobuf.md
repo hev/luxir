@@ -2979,7 +2979,7 @@ Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COS
 
 ### google.protobuf.NullValue
 
-Represents a JSON \`null\`.<br><br>\`NullValue\` is a sentinel, using an enum with only one value to represent the null value for the \`Value\` type union.<br><br>A field of type \`NullValue\` with any value other than \`0\` is considered invalid. Most ProtoJSON serializers will emit a \`Value\` with a \`null\_value\` set as a JSON \`null\` regardless of the integer value, and so will round trip to a \`0\` value.
+\`NullValue\` is a singleton enumeration to represent the null value for the \`Value\` type union.<br><br>The JSON representation for \`NullValue\` is JSON \`null\`.
 
 | Value | Number | Description |
 |---|---|---|
