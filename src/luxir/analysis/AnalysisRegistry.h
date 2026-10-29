@@ -17,10 +17,11 @@ namespace luxir {
 
 // The analysis component registry: name -> maker for tokenizers, token filters
 // and char filters, plus named analyzers (presets). The process-wide instance is
-// globalAnalysisRegistry() (Registries::global().analysis). Built-ins register through
-// registerBuiltinAnalysis() and plugins through Plugin::registerComponents;
-// both run during initPlugins(), which then freezes the registry. After the
-// freeze, lookups only read immutable tables (no locking).
+// AnalysisRegistry::global(). Construction seeds built-ins without initializing
+// or freezing plugins. initPlugins() adds plugin components and freezes it.
+// Concurrent reads are safe even while unfrozen, provided no thread registers
+// components or freezes the registry during reads. Makers must support
+// concurrent calls; built-in makers create independent factories.
 //
 // A maker receives the authored component (name + typed params), validates the
 // params, and returns an immutable factory that creates one stage per chain.
@@ -31,6 +32,20 @@ public:
   // Filter factories are mutable until Analyzer::compile has run their prepare().
   using FilterMaker = std::function<std::unique_ptr<TokenFilterFactory>(const api::AnalyzerComponent&)>;
   using CharFilterMaker = std::function<std::unique_ptr<const CharFilterFactory>(const api::AnalyzerComponent&)>;
+
+private:
+  struct Preset;
+  std::map<std::string, TokenizerMaker, std::less<>> tokenizers;
+  std::map<std::string, FilterMaker, std::less<>> filters;
+  std::map<std::string, CharFilterMaker, std::less<>> charFilters;
+  std::map<std::string, std::unique_ptr<Preset>, std::less<>> analyzers;
+  bool isFrozen = false;
+
+  void registerBuiltins();
+  void registerBuiltinCharFilters();
+
+public:
+  static AnalysisRegistry& global();
 
   AnalysisRegistry();
   ~AnalysisRegistry();
@@ -67,24 +82,9 @@ public:
   // std::invalid_argument naming the analyzer), then rejects further adds.
   void freeze();
   bool frozen() const { return isFrozen; }
-
-private:
-  struct Preset;
-  std::map<std::string, TokenizerMaker, std::less<>> tokenizers;
-  std::map<std::string, FilterMaker, std::less<>> filters;
-  std::map<std::string, CharFilterMaker, std::less<>> charFilters;
-  std::map<std::string, std::unique_ptr<Preset>, std::less<>> analyzers;
-  bool isFrozen = false;
 };
 
-// Registers the built-in components and presets (whitespace, keyword,
-// unicode_word, lowercase, nfkc_cf, fold, english_possessive, kstem, stop; the
-// char filters; the analyzers "standard" and "english"). Called by initPlugins() before plugins.
-void registerBuiltinAnalysis(AnalysisRegistry&);
-// The built-in char filters (nfkc_cf, mapping, html_strip; CharFilter.cpp).
-void registerBuiltinCharFilters(AnalysisRegistry&);
-
-// Registries::global().analysis, for code that needs no other registry.
+// Read-only access to the area-owned global registry.
 const AnalysisRegistry& globalAnalysisRegistry();
 
 }  // namespace luxir

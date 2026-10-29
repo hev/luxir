@@ -3,10 +3,10 @@
 
 #include "luxir/plugin/Plugin.h"
 
-#include <mutex>
 #include <stdexcept>
 
 #include "luxir/api/PluginArms.h"
+#include "luxir/plugin/PluginInit.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/util/log.h"
 
@@ -32,18 +32,17 @@ const Plugin* PluginRegistry::find(std::string_view name) const {
   return nullptr;
 }
 
-Registries& Registries::global() {
-  static Registries instance;
+PluginRegistry::PluginRegistry() = default;
+
+PluginRegistry& PluginRegistry::global() {
+  static PluginRegistry instance;
   return instance;
 }
 
-const AnalysisRegistry& globalAnalysisRegistry() { return Registries::global().analysis; }
-
-const QueryRegistry& globalQueryRegistry() { return Registries::global().query; }
-
-const SearchOpRegistry& globalSearchOpRegistry() { return Registries::global().searchOps; }
-
-const StorageRegistry& globalStorageRegistry() { return Registries::global().storage; }
+Registries Registries::global() {
+  return {PluginRegistry::global(), AnalysisRegistry::global(), StorageRegistry::global(), QueryRegistry::global(),
+          SearchOpRegistry::global(), HttpRouteRegistry::global()};
+}
 
 void Registries::freeze() {
   plugins.freeze();
@@ -54,21 +53,10 @@ void Registries::freeze() {
   http.freeze();
 }
 
-void notifyNodeStarted(LuxirNode& node) {
-  for (const auto& p : Registries::global().plugins.plugins()) p->nodeStarted(node);
-}
-
-void notifyNodeStopping(LuxirNode& node) noexcept {
-  const auto& list = Registries::global().plugins.plugins();
-  for (auto it = list.rbegin(); it != list.rend(); ++it) (*it)->nodeStopping(node);
-}
-
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {
-  static std::once_flag once;
-  std::call_once(once, [addPlugins] {
-    Registries& r = Registries::global();
-    registerBuiltinAnalysis(r.analysis);
-    registerBuiltinStorage(r.storage);  // storage: ram, fs
+  static detail::PluginInit state;
+  state.run(addPlugins, [](auto addPlugins) {
+    Registries r = Registries::global();
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {
@@ -80,10 +68,10 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
     LOG_INFO("plugins: {}", names.empty() ? "none" : names);
     // The JSON dialect reads registered names as plugin arms (api/PluginArms.h).
     api::pluginArmNames.isQuery = [](std::string_view name) {
-      return Registries::global().query.find(name) != nullptr;
+      return QueryRegistry::global().find(name) != nullptr;
     };
     api::pluginArmNames.isOp = [](std::string_view name) {
-      return Registries::global().searchOps.find(name) != nullptr;
+      return SearchOpRegistry::global().find(name) != nullptr;
     };
     r.freeze();
   });

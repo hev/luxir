@@ -52,6 +52,9 @@ private:
   bool isFrozen = false;
 
 public:
+  // The node-wide registry, seeded with the built-in backends (ram, fs).
+  static StorageRegistry& global();
+
   // Throw std::invalid_argument on a bad or duplicate name, std::logic_error after freeze.
   void addBackend(std::string name, BackendMaker maker);
   void addLayer(std::string name, LayerMaker maker);
@@ -69,10 +72,10 @@ public:
   void freeze() { isFrozen = true; }
 };
 
-// Registers the built-in backends: ram and fs. Called by initPlugins.
+// Registers the built-in backends: ram and fs. Called when the global registry is built.
 void registerBuiltinStorage(StorageRegistry& registry);
 
-// The node-wide registry (Registries::global().storage).
+// Read-only access to the node-wide registry.
 const StorageRegistry& globalStorageRegistry();
 
 }  // namespace luxir

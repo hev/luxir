@@ -112,4 +112,15 @@ void registerBuiltinStorage(StorageRegistry& registry) {
   });
 }
 
+StorageRegistry& StorageRegistry::global() {
+  static StorageRegistry instance = [] {
+    StorageRegistry registry;
+    registerBuiltinStorage(registry);
+    return registry;
+  }();
+  return instance;
+}
+
+const StorageRegistry& globalStorageRegistry() { return StorageRegistry::global(); }
+
 }  // namespace luxir
