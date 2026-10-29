@@ -159,7 +159,7 @@ locations, browse `src/luxir/<area>/`.
      the resolved view; `SchemaInfo` persists authored definitions and introductions
    - Analysis (`src/luxir/analysis/`): `AnalysisRegistry` (name -> maker for tokenizers,
      token filters, char filters, plus named analyzers) is the only path from an authored
-     `AnalyzerDef` to stages; built-ins register in `registerBuiltinAnalysis`, plugins add
+     `AnalyzerDef` to stages; its constructor seeds built-ins, plugins add
      more before the registry freezes. `Analyzer::compile` expands a named analyzer into
      its definition (the canonical JSON, and so segment metadata, never names the preset)
      and builds an immutable plan; `createChain` instantiates a per-thread `TokenChain`
@@ -185,7 +185,7 @@ locations, browse `src/luxir/<area>/`.
    - Extension registries: `QueryRegistry` (`src/luxir/query/`, the `plugin` Query arm),
      `SearchOpRegistry` (`src/luxir/search/`, the `plugin` SearchOp arm),
      `FieldTypeRegistry` (`src/luxir/schema/`, `FieldDef.plugin_type`) and
-     `HttpRouteRegistry` (`src/luxir/server/`); `PluginParams` reads plugin arm params.
+     `HttpRouteRegistry` (`src/luxir/server/`); `ParamReader` reads plugin arm params.
    - See [plugins.md](plugins.md).
 
 ## Data Organization
