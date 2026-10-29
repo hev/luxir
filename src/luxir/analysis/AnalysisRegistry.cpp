@@ -16,8 +16,15 @@ struct AnalysisRegistry::Preset {
   api::AnalyzerDef def;
 };
 
-AnalysisRegistry::AnalysisRegistry() = default;
+AnalysisRegistry::AnalysisRegistry() { registerBuiltins(); }
 AnalysisRegistry::~AnalysisRegistry() = default;
+
+AnalysisRegistry& AnalysisRegistry::global() {
+  static AnalysisRegistry instance;
+  return instance;
+}
+
+const AnalysisRegistry& globalAnalysisRegistry() { return AnalysisRegistry::global(); }
 
 namespace {
 
