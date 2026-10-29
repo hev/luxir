@@ -13,6 +13,15 @@
 
 namespace luxir {
 
+QueryRegistry::QueryRegistry() = default;
+
+QueryRegistry& QueryRegistry::global() {
+  static QueryRegistry instance;
+  return instance;
+}
+
+LuxirNode* PluginQueryContext::node() const { return parse.node; }
+
 Query* PluginQueryContext::parseQuery(const api::Val& value) {
   // The parser reads api::Query views; a param holds the same JSON as a Val,
   // so round-trip it. The text and the views it yields live in the pool.
@@ -57,8 +66,9 @@ const PluginQueryDef* QueryRegistry::find(std::string_view name) const {
   return it == defs.end() ? nullptr : &it->second;
 }
 
-const PluginQueryDef& QueryRegistry::require(std::string_view name) const {
-  if (const auto* def = find(name)) return *def;
+const QueryRegistry::Entry& QueryRegistry::require(std::string_view name) const {
+  auto it = defs.find(name);
+  if (it != defs.end()) return *it;
   std::string valid;
   for (const auto& [key, def] : defs) {
     if (!valid.empty()) valid += ", ";

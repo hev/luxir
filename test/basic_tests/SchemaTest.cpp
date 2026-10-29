@@ -2220,7 +2220,7 @@ TEST_F(SchemaTest, namedAnalyzerResolvedView) {
   ASSERT_TRUE(api::read_json(def, R"({"fields":{
     "named":{"type":"text","analyzer":"english"},
     "ex":{"type":"text","analyzer":{"name":"example"}},
-    "authored":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold","english_possessive",{"name":"kstem","params":{"possessive":false}}]}}
+    "authored":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold","kstem"]}}
   }})", arena, &error)) << error;
   auto schema = helper.collection().updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
 
@@ -2230,7 +2230,7 @@ TEST_F(SchemaTest, namedAnalyzerResolvedView) {
     return glz::write_json(json["fields"][field]["representations"]["self"][property]).value();
   };
   constexpr std::string_view english =
-      R"({"char_filters":[],"filters":["nfkc_cf","fold","english_possessive",{"name":"kstem","params":{"possessive":false}}],"tokenizer":"unicode_word"})";
+      R"({"char_filters":[],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})";
   EXPECT_EQ(english, self("named", "analyzer"));
   EXPECT_EQ(R"("english")", self("named", "analyzer_preset"));
   EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
@@ -2238,6 +2238,11 @@ TEST_F(SchemaTest, namedAnalyzerResolvedView) {
   EXPECT_EQ(R"("example")", self("ex", "analyzer_preset"));
   // an authored equivalent shows the same expansion and no preset
   EXPECT_EQ(english, self("authored", "analyzer"));
+  auto* namedAnalyzer = ((TextFieldType*)schema->getFieldTypePtr("named"))->analyzer_.get();
+  auto* authoredAnalyzer = ((TextFieldType*)schema->getFieldTypePtr("authored"))->analyzer_.get();
+  EXPECT_EQ(namedAnalyzer->canonical, authoredAnalyzer->canonical);
+  auto signatures = schema->signatures();
+  EXPECT_EQ(signatures.at("named").properties, signatures.at("authored").properties);
   EXPECT_FALSE(json["fields"]["authored"]["representations"]["self"].get<glz::generic_sorted_u64::object_t>()
                    .contains("analyzer_preset"));
 

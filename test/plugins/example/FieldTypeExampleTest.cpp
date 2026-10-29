@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <filesystem>
@@ -92,6 +93,19 @@ std::vector<std::string> values(const std::string& body, std::string_view key) {
 
 using Strings = std::vector<std::string>;
 
+// "plugin types: ..." as the registry lists them (other configured plugins
+// may add their own).
+std::string pluginTypes() {
+  std::string out = "plugin types: ";
+  bool first = true;
+  for (const auto& name : Registries::global().fieldTypes.names()) {
+    if (!first) out += ", ";
+    out += name;
+    first = false;
+  }
+  return out;
+}
+
 class FieldTypeExampleTest : public LuxirTest {
 protected:
   CollectionHelper helper;
@@ -135,7 +149,10 @@ protected:
 TEST_F(FieldTypeExampleTest, registeredAndFrozen) {
   auto& types = Registries::global().fieldTypes;
   EXPECT_TRUE(types.frozen());
-  EXPECT_EQ((Strings{"pair", "spot"}), types.names());
+  // Other configured plugins may register types too.
+  auto names = types.names();
+  EXPECT_NE(names.end(), std::ranges::find(names, std::string("pair")));
+  EXPECT_NE(names.end(), std::ranges::find(names, std::string("spot")));
   auto maker = [](const PluginParams&) -> std::unique_ptr<const PluginFieldType> { return nullptr; };
   EXPECT_THROW(types.add("late", maker), std::logic_error);
   FieldTypeRegistry fresh;
@@ -148,7 +165,7 @@ TEST_F(FieldTypeExampleTest, registeredAndFrozen) {
 
 TEST_F(FieldTypeExampleTest, schemaValidationTeaches) {
   EXPECT_EQ("unknown field type 'piar'; valid types: date, double, float, geo_point, id, int, string, text, "
-            "vector; plugin types: pair, spot (field: pt)",
+            "vector; " + pluginTypes() + " (field: pt)",
             schemaError(R"({"fields":{"pt":"piar"}})"));
   EXPECT_EQ("field type 'pair': unknown parameter 'sep'; valid: separator, multi (field: pt)",
             schemaError(R"({"fields":{"pt":{"type":"pair","params":{"sep":"/"}}}})"));
@@ -539,6 +556,6 @@ TEST_F(FieldTypePersistenceTest, reopensAndAMissingTypeFailsTheCollectionOnly) {
     EXPECT_NE(std::string::npos, message.find("failed to load")) << message;
     EXPECT_NE(std::string::npos, message.find("unknown field type 'from_a_missing_plugin'; valid types: "
                                               "date, double, float, geo_point, id, int, string, text, vector; "
-                                              "plugin types: pair, spot")) << message;
+                                              + pluginTypes())) << message;
   }
 }
