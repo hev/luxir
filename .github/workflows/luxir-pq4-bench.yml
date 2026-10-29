@@ -3,6 +3,11 @@ name: Luxir MAIN vs CANDIDATE
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: Runner (Oven uses persistent local caches)
+        type: choice
+        options: [ubuntu-24.04, oven-luxir]
+        default: ubuntu-24.04
       base_repo:
         description: Public base repository
         default: luxir-search/luxir
@@ -30,26 +35,42 @@ on:
         type: string
 permissions:
   contents: read
+  packages: read
 jobs:
   x86:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner == 'oven-luxir' && fromJSON('["self-hosted","linux","x64","oven-luxir"]') || fromJSON('["ubuntu-24.04"]') }}
+    env:
+      DOCKER_CONFIG: /tmp/luxir-bench-docker-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 180
     outputs:
       source-sha: ${{ steps.source.outputs.sha }}
     steps:
+      - name: Select Oven rootless Docker endpoint
+        if: inputs.runner == 'oven-luxir'
+        run: |
+          if [[ -z ${DOCKER_HOST:-} && -S /run/user/$(id -u)/docker.sock ]]; then
+            echo "DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock" >> "$GITHUB_ENV"
+          fi
+      - name: Require public sources
+        env:
+          BASE_REPO: ${{ inputs.base_repo }}
+          CANDIDATE_REPO: ${{ inputs.candidate_repo }}
+        run: |
+          set -euo pipefail
+          for repo in "$BASE_REPO" "$CANDIDATE_REPO"; do
+            curl --fail --silent --show-error "https://api.github.com/repos/$repo" | python3 -c 'import json,sys; assert json.load(sys.stdin)["private"] is False'
+          done
       - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.base_repo }}
           ref: ${{ inputs.base_ref }}
           path: base
-          submodules: recursive
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.candidate_repo }}
           ref: ${{ inputs.candidate_ref }}
           path: candidate
-          submodules: recursive
           persist-credentials: false
       - name: Record sources
         id: source
@@ -60,68 +81,137 @@ jobs:
           echo "sha=$(git -C candidate rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           lscpu > evidence/lscpu.txt
           echo "jobs=$(cd candidate && ./tools/build-jobs 3000)" >> "$GITHUB_OUTPUT"
-      - name: Work around upstream dockerignore excluding test/blas_lapack_test.cpp
-        # Luxir 7d1194f9 copies test/blas_lapack_test.cpp in .devcontainer/Dockerfile,
-        # but .devcontainer/Dockerfile.dockerignore excludes test/. Re-include only that file
-        # in this benchmark's local checkout when a tree needs it.
+      - name: Write reviewed dependency key helper
         run: |
-          for tree in base candidate; do
-            if grep -q 'COPY test/blas_lapack_test.cpp' "$tree/.devcontainer/Dockerfile" \
-               && ! grep -qx '!test/blas_lapack_test.cpp' "$tree/.devcontainer/Dockerfile.dockerignore"; then
-              printf '!test/\n!test/blas_lapack_test.cpp\n' >> "$tree/.devcontainer/Dockerfile.dockerignore"
-              echo "patched $tree dockerignore"
+          cat > "$RUNNER_TEMP/luxir-deps-key.py" <<'DEPS_KEY'
+          #!/usr/bin/env python3
+          """Hash the effective normal-dependencies build inputs; emit one SHA-256 tag."""
+          import hashlib
+          import re
+          import sys
+          from pathlib import Path
+
+
+          def deps_key(root):
+              root = Path(root)
+              dockerfile = (root / '.devcontainer/Dockerfile').read_text()
+              stage = dockerfile.split('FROM normal-dependencies AS dependencies\n')[0]
+              if stage == dockerfile:
+                  raise ValueError('Dockerfile stage boundary changed; review deps-key.py')
+              copies = re.findall(r'^COPY (.+)$', stage, re.M)
+              expected = [
+                  '.devcontainer/check-toolchain.cpp .devcontainer/check-toolchain.sh /opt/luxir-checks/',
+                  'deps/vcpkg.json deps/vcpkg-configuration.json /opt/luxir-deps/',
+                  'deps/ports /opt/luxir-deps/ports',
+                  'deps/triplets /opt/luxir-deps/triplets',
+                  'test/blas_lapack_test.cpp /opt/luxir-checks/check-lapack.cpp',
+              ]
+              if 'COPY .devcontainer/check-lapack.cpp /opt/luxir-checks/' in stage:
+                  expected[-1] = '.devcontainer/check-lapack.cpp /opt/luxir-checks/'
+              if copies != expected or re.search(r'^(ADD|ONBUILD) ', stage, re.M):
+                  raise ValueError('Dependency COPY/ADD contract changed; review deps-key.py')
+              # BUILD_JOBS controls concurrency, not dependency identity.
+              stage = re.sub(r'^ARG BUILD_JOBS=.*$', 'ARG BUILD_JOBS=<concurrency>', stage, flags=re.M)
+              ignore = root / '.devcontainer/Dockerfile.dockerignore'
+              text = ignore.read_text()
+              # hev/luxir@4a27bd8: permit the LAPACK check excluded by upstream test/.
+              if 'COPY test/blas_lapack_test.cpp ' in stage and '!test/blas_lapack_test.cpp' not in text.splitlines():
+                  text = text.rstrip('\n') + '\n!test/\n!test/blas_lapack_test.cpp\n'
+                  ignore.write_text(text)
+              files = {'.devcontainer/Dockerfile': stage.encode(),
+                       '.devcontainer/Dockerfile.dockerignore': text.encode()}
+              for copy in expected:
+                  for source in copy.split()[:-1]:
+                      path = root / source
+                      paths = sorted(path.rglob('*')) if path.is_dir() else [path]
+                      for item in paths:
+                          if item.is_symlink():
+                              raise ValueError(f'Symlink input requires review: {item}')
+                          if item.is_file():
+                              files[item.relative_to(root).as_posix()] = item.read_bytes()
+              digest = hashlib.sha256()
+              for name, data in sorted(files.items()):
+                  for value in (name.encode(), data):
+                      digest.update(len(value).to_bytes(8, 'big'))
+                      digest.update(value)
+              return digest.hexdigest()
+
+
+          if __name__ == '__main__':
+              print(deps_key(sys.argv[1]))
+          DEPS_KEY
+      - name: Check prebuilt dependency images (never build vcpkg here)
+        timeout-minutes: 4
+        env:
+          RUNNER_CHOICE: ${{ inputs.runner }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          for variant in base candidate; do
+            key=$(python3 "$RUNNER_TEMP/luxir-deps-key.py" "$variant")
+            echo "$key" > "evidence/$variant-deps-key.txt"
+            image="ghcr.io/hev/luxir-deps:$key"
+            # Check both manifests before downloading any large layers.
+            if ! timeout 60 docker manifest inspect "$image" >/dev/null; then
+              echo "::error::Missing $image. Run workflow luxir-deps-image.yml for $variant repo/ref (key $key), then rerun luxir-pq4-bench.yml."
+              exit 1
             fi
           done
-      - uses: docker/setup-buildx-action@v3
+          if [[ "$RUNNER_CHOICE" == oven-luxir ]]; then
+            cache="$HOME/.cache/luxir-pq4"
+            mkdir -p "$cache/dataset"
+            if [[ ! -e .pq4-dataset && ! -L .pq4-dataset ]]; then
+              ln -s "$cache/dataset" .pq4-dataset
+            fi
+            [[ $(readlink -f .pq4-dataset) == "$cache/dataset" ]] || { echo "Unexpected existing dataset path" >&2; exit 1; }
+          fi
+      - name: Pull unique dependency images
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          sort -u evidence/*-deps-key.txt | while read -r key; do
+            image="ghcr.io/hev/luxir-deps:$key"
+            # On Oven the Docker image store persists outside the workspace.
+            docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+          done
       - name: Cache dataset shards
+        if: inputs.runner != 'oven-luxir'
         uses: actions/cache@v4
         with:
           path: |
             .pq4-dataset/*.parquet
             .pq4-dataset/dataset.json
           key: pq4-dbpedia-openai3-1536-100k-v1
-      - name: Cache compiler objects
-        uses: actions/cache@v4
+      - name: Restore compiler objects
+        id: ccache
+        if: inputs.runner != 'oven-luxir'
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/luxir/container-ccache
-          key: pq4-ccache-${{ runner.arch }}-${{ hashFiles('*/deps/vcpkg.json', '*/deps/ports/**', '*/deps/triplets/**') }}-${{ steps.source.outputs.sha }}
+          key: pq4-ccache-${{ runner.arch }}-${{ hashFiles('evidence/*-deps-key.txt') }}-${{ steps.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            pq4-ccache-${{ runner.arch }}-${{ hashFiles('*/deps/vcpkg.json', '*/deps/ports/**', '*/deps/triplets/**') }}-
-      - name: Build base toolchain and normal vcpkg dependencies
-        uses: docker/build-push-action@v6
-        with:
-          context: base
-          file: base/.devcontainer/Dockerfile
-          target: normal-dependencies
-          tags: luxir-base-toolchain:local
-          load: true
-          push: false
-          build-args: BUILD_JOBS=${{ steps.source.outputs.jobs }}
-          cache-from: type=gha,scope=pq4-vcpkg-x86-base
-          cache-to: type=gha,mode=max,scope=pq4-vcpkg-x86-base
-      - name: Build candidate toolchain and normal vcpkg dependencies
-        uses: docker/build-push-action@v6
-        with:
-          context: candidate
-          file: candidate/.devcontainer/Dockerfile
-          target: normal-dependencies
-          tags: luxir-candidate-toolchain:local
-          load: true
-          push: false
-          build-args: BUILD_JOBS=${{ steps.source.outputs.jobs }}
-          cache-from: |
-            type=gha,scope=pq4-vcpkg-x86-candidate
-            type=gha,scope=pq4-vcpkg-x86-base
-          cache-to: type=gha,mode=max,scope=pq4-vcpkg-x86-candidate
+            pq4-ccache-${{ runner.arch }}-${{ hashFiles('evidence/*-deps-key.txt') }}-
       - name: Build both revisions with shared ccache and record cold/warm durations
         env:
           LUXIR_BUILD_JOBS: ${{ steps.source.outputs.jobs }}
         run: |
           for variant in base candidate; do
-            export LUXIR_DEV_IMAGE="luxir-$variant-toolchain:local"
+            cd "$GITHUB_WORKSPACE"
+            LUXIR_DEV_IMAGE="ghcr.io/hev/luxir-deps:$(cat "evidence/$variant-deps-key.txt")"
+            export LUXIR_DEV_IMAGE
             cd "$GITHUB_WORKSPACE/$variant"
             git submodule update --init
             ./deps/fetch_sources.sh
+            # Rootless container UID 0 maps to the owning host user, not host root.
+            if docker info --format '{{json .SecurityOptions}}' | grep -q rootless; then
+              # shellcheck disable=SC2016
+              sed -i 's/--user "$(id -u):$(id -g)"/--user 0:0/' tools/dev-container
+              grep -q -- '--user 0:0' tools/dev-container
+              git diff -- tools/dev-container > "../evidence/$variant-rootless-helper.patch"
+            fi
             ./tools/dev-container ccache --max-size 2G
             # shellcheck disable=SC2016
             /usr/bin/time -v -o "../evidence/$variant-cold-build-time.txt" bash -e -c '
@@ -137,7 +227,7 @@ jobs:
           .bench-venv/bin/pip install numpy==2.5.4 pyarrow==26.0.0 requests==2.34.2
       - name: Write self-contained harness
         run: |
-          cat > /tmp/pq4-bench.py <<'PYTHON_HARNESS'
+          cat > "$RUNNER_TEMP/pq4-bench.py" <<'PYTHON_HARNESS'
           #!/usr/bin/env python3
           """Local-only interleaved MAIN/CANDIDATE comparison. Requires numpy, pyarrow, requests."""
           import argparse
@@ -480,7 +570,16 @@ jobs:
         env:
           CANDIDATE_FIELD_SETTINGS: ${{ inputs.candidate_field_settings || '{}' }}
         run: |
-          .bench-venv/bin/python /tmp/pq4-bench.py --base-binary base/build/container-release/bin/luxir --candidate-binary candidate/build/container-release/bin/luxir --base-revision "$(git -C base rev-parse HEAD)" --candidate-revision "$(git -C candidate rev-parse HEAD)" --candidate-field-settings "$CANDIDATE_FIELD_SETTINGS" --label "GitHub Actions x86 $RUNNER_NAME" --output evidence/benchmark
+          .bench-venv/bin/python "$RUNNER_TEMP/pq4-bench.py" --base-binary base/build/container-release/bin/luxir --candidate-binary candidate/build/container-release/bin/luxir --base-revision "$(git -C base rev-parse HEAD)" --candidate-revision "$(git -C candidate rev-parse HEAD)" --candidate-field-settings "$CANDIDATE_FIELD_SETTINGS" --label "${{ inputs.runner == 'oven-luxir' && 'Oven' || 'GitHub Actions x86' }} $RUNNER_NAME" --output evidence/benchmark
+      - name: Remove registry credentials
+        if: always()
+        run: rm -rf -- "$DOCKER_CONFIG"
+      - name: Save compiler objects even after failure
+        if: always() && inputs.runner != 'oven-luxir' && steps.ccache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/luxir/container-ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
       - name: Upload evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4
