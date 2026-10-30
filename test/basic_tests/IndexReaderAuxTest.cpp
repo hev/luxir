@@ -149,6 +149,44 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
 }
 
+TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
+  IvfTestGuard guard;
+  for (int bits : {1, 4}) {
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection(), rabitqAnn(2, bits), 4);
+    for (int i = 0; i < 32; i++) {
+      h.index(flatdoc("id", std::to_string(i), "embedding_v",
+          std::vector<float>{(float)i, 1, 2, 3}));
+    }
+    h.commit({"*"});
+    auto& dir = h.getIndexWriter()->dir;
+    auto durable = readDurableIndexInfo(dir);
+    auto info = onlyVectorOverlay(durable.info);
+    auto file = dir.openFile(info.files[0].name, true);
+    auto stream = file->getInputStream();
+    std::string payload(stream.ptr(), (size_t)stream.left());
+    auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), info.name);
+    EXPECT_EQ(footer.amplitudeCount, 1);
+    EXPECT_THROW(VectorAuxListsFooter::fromFileTail(payload.data(), payload.size() - 4, info.name),
+                 std::runtime_error);
+    auto copied = info.files[0];
+    copied.name = "invalid-amplitude";
+    info.files = std::span(&copied, 1);
+    for (float bad : {-1.0f, INFINITY, NAN}) {
+      std::memcpy(payload.data() + footer.amplitudesOffset(), &bad, sizeof(bad));
+      auto out = dir.createFile("invalid-amplitude");
+      OutputStream os;
+      os.setFile(&*out);
+      os.write(payload.data(), payload.size());
+      os.close();
+      dir.finishFile(*out);
+      EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
+      dir.deleteFile("invalid-amplitude");
+    }
+  }
+}
+
 TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
   IvfTestGuard guard;
   for (const auto& ann : {pqAnn(2, 1, 1), rabitqAnn(2), rabitqAnn(2, 4)}) {

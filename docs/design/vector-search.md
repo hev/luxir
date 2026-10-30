@@ -283,6 +283,22 @@ the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process
 RAM.
 
+RaBitQ overlays also store upward-rounded float32 error amplitudes after the
+codes in inverted-list order: sigma1 for 1-bit, sigmaB for multi-bit
+(4 bytes/vector for every width). The multi-bit gate reads sigma1 from the
+code's own f_error; the side amplitude is read only after that gate. PQ has
+no amplitude section.
+The builder computes these in the encoding row pipeline from the rotated
+original, assigned centroid and actual code. SigmaB is the residual
+reconstruction error norm divided by sqrt(max(1, D-1)), with a factor of two
+for squared L2. Sigma1 removes FAISS's fixed 1.9 confidence multiplier from
+its error factor. These amplitudes support empirical confidence intervals;
+they are not deterministic error bounds. The reader exposes a mmap view.
+The reader validates finite, non-negative amplitudes once at open and exposes
+per-list spans for sequential, unchecked scan loads. Metadata and footer
+version 3 validate the component count and file size;
+older formats fail on open and must be rebuilt.
+
 Before taking apart a RaBitQ wrapper, the reader checks the header's bit
 count against the overlay metadata. Both codecs also check the header's list
 count against that metadata, in addition to checking the list footer against

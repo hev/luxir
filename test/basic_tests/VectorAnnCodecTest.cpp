@@ -239,6 +239,107 @@ TEST_F(VectorAnnCodecTest, eachCodecAndMetricBuildsFromSchemaAndRecalls) {
   }
 }
 
+TEST_F(VectorAnnCodecTest, amplitudesFollowListOffsetsAcrossListsAndMerge) {
+  IvfTestGuard guard;
+  for (int32_t dims : {1, 7, 32}) for (int32_t bits : {1, 4, 9}) {
+    for (auto metric : {api::VectorMetric::IP, api::VectorMetric::L2, api::VectorMetric::COSINE}) {
+      SCOPED_TRACE(std::format("dims={} bits={} metric={}", dims, bits, (int)metric));
+      CollectionHelper h("main");
+      h.clear();
+      SchemaBuilder schema;
+      auto& f = schema.field("emb_v");
+      f.type = api::FieldDef_::FieldClass::VECTOR;
+      f.dims = dims;
+      f.metric = metric;
+      f.ann = rabitqAnn(2, bits);
+      schema.set(h.collection());
+      for (int32_t part = 0; part < 2; part++) {
+        std::vector<Doc> docs;
+        for (int32_t i = 0; i < 16; i++) {
+          auto v = clustered(i + part * 16, i % 4);
+          v.resize((size_t)dims);
+          if (i == 0) std::fill(v.begin(), v.end(), 0);
+          docs.push_back(flatdoc("id", std::to_string(i + part * 16), "emb_v", v));
+        }
+        h.indexAll(docs);
+        h.commit({"*"});
+      }
+      for (bool merge : {false, true}) {
+        if (merge) h.getIndexWriter()->mergeSegments();
+        std::shared_ptr<IndexReader> reader;
+        auto aux = overlays(h, reader);
+        for (size_t seg = 0; seg < aux.size(); seg++) {
+          ASSERT_NE(aux[seg], nullptr);
+          auto* ivf = dynamic_cast<faiss::IndexIVFRaBitQ*>(aux[seg]->getFaissIndex());
+          ASSERT_NE(ivf, nullptr);
+          const auto& amplitudes = aux[seg]->getAmplitudes();
+          EXPECT_EQ(amplitudes.offsets.back(), (size_t)ivf->ntotal);
+          auto& segment = reader->segments()[seg];
+          VectorReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("emb_v"));
+          std::vector<float> x((size_t)dims), rotated((size_t)dims), centroid((size_t)dims);
+          for (size_t list = 0; list < ivf->nlist; list++) {
+            ivf->quantizer->reconstruct((faiss::idx_t)list, centroid.data());
+            auto span = amplitudes.list(list);
+            ASSERT_EQ(span.size(), ivf->invlists->list_size(list));
+            std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(
+                ivf->rabitq.get_distance_computer(0, centroid.data()));
+            auto* dc = dynamic_cast<faiss::RaBitQDistanceComputer*>(computer.get());
+            ASSERT_NE(dc, nullptr);
+            faiss::InvertedLists::ScopedIds ids(ivf->invlists, list);
+            faiss::InvertedLists::ScopedCodes codes(ivf->invlists, list);
+            for (size_t row = 0; row < ivf->invlists->list_size(list); row++) {
+              int64_t rank = ids.get()[row];
+              std::memcpy(x.data(), column.vectorAtRank(rank).data(), x.size() * sizeof(float));
+              if (metric == api::VectorMetric::COSINE) faiss::fvec_renorm_L2(x.size(), 1, x.data());
+              aux[seg]->getRotation()->apply_noalloc(1, x.data(), rotated.data());
+              EXPECT_TRUE(std::isfinite(span[row]));
+              EXPECT_GE(span[row], 0);
+              if (bits == 1) {
+                auto factors = faiss::rabitq_utils::compute_vector_factors(
+                    rotated.data(), (size_t)dims, centroid.data(), ivf->metric_type, true);
+                EXPECT_NEAR(span[row], factors.f_error / 1.9f, 0.0001f);
+              } else {
+                // decode() only decodes sign bits. Recover the full reconstruction
+                // from FAISS's distance kernel, without unpacking any code bits.
+                const uint8_t* code = codes.get() + row * ivf->code_size;
+                float step = std::max(1.0f, 2 * std::sqrt(faiss::fvec_L2sqr(
+                    rotated.data(), centroid.data(), (size_t)dims)));
+                double error2 = 0;
+                for (int32_t j = 0; j < dims; j++) {
+                  x = centroid;
+                  x[j] += step;
+                  dc->set_query(x.data());
+                  float plus = dc->distance_to_code_full(code);
+                  x[j] = centroid[j] - step;
+                  dc->set_query(x.data());
+                  float minus = dc->distance_to_code_full(code);
+                  double slope = ((double)plus - minus) / (2 * step);
+                  double residual = metric == api::VectorMetric::L2 ? slope / -2 : slope - centroid[j];
+                  double error = residual - ((double)rotated[j] - centroid[j]);
+                  error2 += error * error;
+                }
+                double expected = std::sqrt(error2 / std::max(1, dims - 1))
+                    * (metric == api::VectorMetric::L2 ? 2 : 1);
+                EXPECT_NEAR(span[row], expected, 0.00001);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(VectorAnnCodecTest, rejectsOldAmplitudeMetadata) {
+  VectorAuxMeta meta;
+  meta.engine = VectorAuxMeta::ENGINE_IVFRABITQ;
+  meta.version--;
+  EXPECT_THROW(VectorAuxMeta::fromBytes(meta.toBytes(), "test"), std::runtime_error);
+  auto bytes = meta.toBytes();
+  bytes.resize(bytes.size() - sizeof(int32_t));
+  EXPECT_THROW(VectorAuxMeta::fromBytes(bytes, "test"), std::runtime_error);
+}
+
 TEST_F(VectorAnnCodecTest, mergeRebuildsWithFieldCodecAndSharesRotation) {
   IvfTestGuard guard;
   CollectionHelper h("main");

@@ -15,9 +15,11 @@
 #include <faiss/VectorTransform.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
+#include <faiss/impl/RaBitQUtils.h>
 #include <faiss/utils/distances.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <unordered_set>
@@ -38,6 +40,45 @@ namespace luxir {
 namespace {
 
 constexpr int64_t MIN_TRAINING_POINTS_PER_CENTROID = 39;
+
+float amplitudeUp(double value) {
+  if (!std::isfinite(value) || value < 0 || value > std::numeric_limits<float>::max()) {
+    throw std::runtime_error("VectorIndexBuilder: invalid RaBitQ amplitude");
+  }
+  float result = (float)value;
+  return result < value ? std::nextafter(result, INFINITY) : result;
+}
+
+float computeAmplitude(const float* x, const float* centroid,
+                       const uint8_t* code, int32_t dims, int32_t bits,
+                       faiss::MetricType metric) {
+  using namespace faiss::rabitq_utils;
+  if (bits == 1) {
+    auto factors = compute_vector_factors(x, (size_t)dims, centroid, metric, true);
+    // FAISS folds its confidence constant and the L2 factor of two into f_error.
+    return amplitudeUp((double)factors.f_error / 1.9f);
+  }
+
+  int32_t extraBits = bits - 1;
+  const uint8_t* extra = code + (dims + 7) / 8 + sizeof(SignBitFactorsWithError);
+  ExtraBitsFactors full;
+  std::memcpy(&full, extra + ((size_t)dims * extraBits + 7) / 8, sizeof(full));
+  double scale = metric == faiss::METRIC_L2 ? -0.5 * full.f_rescale_ex : full.f_rescale_ex;
+  double error2 = 0;
+  for (int32_t i = 0; i < dims; i++) {
+    unsigned magnitude = 0;
+    for (int32_t b = 0; b < extraBits; b++) {
+      size_t pos = (size_t)i * extraBits + b;
+      magnitude |= ((extra[pos / 8] >> (pos % 8)) & 1) << b;
+    }
+    unsigned sign = (code[i / 8] >> (i % 8)) & 1;
+    double quantized = magnitude + (sign << extraBits) - ((1 << extraBits) - 0.5);
+    double error = scale * quantized - ((double)x[i] - centroid[i]);
+    error2 += error * error;
+  }
+  return amplitudeUp((metric == faiss::METRIC_L2 ? 2 : 1)
+                      * std::sqrt(error2 / std::max(1, dims - 1)));
+}
 
 // Adapter from faiss::IOWriter to luxir::OutputStream.
 class FaissOutAdapter : public faiss::IOWriter {
@@ -520,6 +561,12 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   size_t codeBytes = index->code_size + index->coarse_code_size();
   std::vector<uint8_t> codes;
   std::vector<float> scratch, rotated;
+  int32_t amplitudeCount = rabitq ? 1 : 0;
+  if ((uint64_t)ntotal > std::numeric_limits<size_t>::max() / sizeof(float)
+                          / std::max(1, amplitudeCount)) {
+    throw std::runtime_error("VectorIndexBuilder: amplitude array size overflow");
+  }
+  std::vector<float> amplitudes((size_t)ntotal * amplitudeCount);
   bool normalize = shouldNormalizeForFaiss(ft);
   auto* flat = static_cast<faiss::IndexFlat*>(index->quantizer);
   forEachVectorSegment(segments_, fieldName, dims,
@@ -552,6 +599,14 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
         assert(std::none_of(listNos.begin(), listNos.end(), [](faiss::idx_t l) { return l < 0; }));
         index->encode_vectors(count, x, listNos.data(),
                               codes.data() + (size_t)begin * codeBytes, /*include_listnos=*/true);
+        if (rabitq) {
+          for (int64_t row = 0; row < count; row++) {
+            amplitudes[(size_t)(index->ntotal + begin + row)] = computeAmplitude(
+                x + row * dims, flat->get_xb() + listNos[row] * dims,
+                codes.data() + (size_t)(begin + row) * codeBytes + index->coarse_code_size(),
+                dims, ann.rabitqBits, metric);
+          }
+        }
       });
       index->add_sa_codes(n, codes.data(), nullptr);
     }
@@ -595,7 +650,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     }
 
     // List payloads in the layout VectorAuxListsFooter documents: sizes, ids,
-    // codes, footer.  The ids section must land 8-aligned in the file so the
+    // codes, amplitudes, footer. The ids section must land 8-aligned in the file so the
     // reader's in-memory view can be indexed as idx_t directly.
     os.align(8);
     const faiss::InvertedLists& lists = *index->invlists;
@@ -615,11 +670,25 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
       os.write(codes.get(), sz * lists.code_size);
     }
     os.align(8);
+    if (!amplitudes.empty()) {
+      // Encode in value-rank order, serialize beside each code's list position.
+      std::array<float, 4096> buffer;
+      for (size_t i = 0; i < lists.nlist; i++) {
+        faiss::InvertedLists::ScopedIds ids(&lists, i);
+        for (size_t off = 0; off < lists.list_size(i); off += buffer.size()) {
+          size_t count = std::min(buffer.size(), lists.list_size(i) - off);
+          for (size_t row = 0; row < count; row++) buffer[row] = amplitudes[ids[off + row]];
+          os.write(buffer.data(), count * sizeof(float));
+        }
+      }
+    }
+    os.align(8);
     VectorAuxListsFooter footer;
     footer.faissHeaderBytes = faissHeaderBytes;
     footer.nlist = (int64_t)lists.nlist;
     footer.codeSize = (int64_t)lists.code_size;
     footer.ntotal = ntotal;
+    footer.amplitudeCount = amplitudeCount;
     footer.version = VectorAuxListsFooter::VERSION;
     footer.magic = VectorAuxListsFooter::MAGIC;
     os.write(&footer, sizeof(footer));
