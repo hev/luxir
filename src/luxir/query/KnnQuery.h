@@ -188,25 +188,19 @@ public:
   // fold inline on the calling thread.  Mutable for tests.
   static inline int64_t rescoreTaskGrainCandidates = 256;
 
-  // Approximate ANN engines over-fetch vector candidates before exact
-  // full-precision rescore.  Default sizing is affine with a DECAYING ratio:
-  //   kReq = count + k * max(REFINE_MIN_RATIO, log2(REFINE_UNITY_K / k))
-  // (same shape as Solr's distributed-faceting overrequest, count +
-  // ratio*limit, with the ratio shrinking as k grows).  Rationale: PQ
-  // mis-ranking displaces a true neighbor by an absolute number of impostors
-  // that does not scale with k, so small k needs the fixed headroom - while
-  // large k is shotgun retrieval whose near-tied tail nobody can rank
-  // meaningfully (and no benchmark measures recall that deep), so the
-  // multiplier decays to REFINE_MIN_RATIO by k = REFINE_UNITY_K instead of
-  // inflating the rescore pool and the engine's result heap.  An explicit
-  // request refine_candidates pins the pool size directly (clamped up to k -
-  // an absolute count like nprobe, not a multiplier).  defaultAnnRefineRatio:
-  // 0 = the adaptive decay; > 0 pins a fixed default ratio (tests use this
-  // to emulate a pure multiplier).  Mutable for tests / benches.
-  static inline int32_t defaultAnnRefineCount = 128;
-  static inline int32_t defaultAnnRefineRatio = 0;
-  static constexpr double REFINE_UNITY_K = 1000.0;
-  static constexpr double REFINE_MIN_RATIO = 1.1;
+  // Cover the vectors whose estimate error can swap them with the k-th
+  // neighbor; that band holds sublinearly more vectors as k grows. Constants
+  // measured on 1024-d IP, PQ M=128 x 8 bits: within 0.001 recall of the
+  // scanned-list ceiling for k=1..1000 at default effort and nprobe=256.
+  // An explicit refine_candidates replaces this default (clamped up to k).
+  static int64_t boundedDefaultCandidates(int64_t k, int64_t cap) {
+    assert(k > 0 && cap >= 0);
+    if (k >= cap) return cap;
+    double headroom = 24.0 + std::ceil(15.0 * std::pow((double)k, 0.8));
+    // Check before conversion/addition, including when cap is INT64_MAX.
+    if (headroom >= (double)(cap - k)) return cap;
+    return k + (int64_t)headroom;
+  }
 
   // Dimension-aware default IVF effort.  The nprobe=0 scan fraction
   // (1/sqrt(referenceBreadth), see defaultBudget) is scaled by
@@ -557,8 +551,6 @@ public:
     // selection is visible here and key equality remains self-contained.
     out.appendInt64(std::max((int64_t)1, maxKnnCandidates));
     out.appendInt32(std::max(0, maxKnnBreadth));
-    out.appendInt32(defaultAnnRefineCount);
-    out.appendInt32(defaultAnnRefineRatio);
     out.appendInt32(defaultAnnBreadthReferenceDims);
     // Test wrappers may alter candidate selection without a keyable semantic
     // contract. Production engines are deterministic for a pinned reader.
@@ -934,17 +926,10 @@ public:
         : 1;
       int64_t baseReq = kDocs;
       if (approximateEngine) {
-        // Explicit refine_candidates pins the candidate pool size (an
-        // absolute count, clamped up to k); the absent-knob default is
-        // affine with a k-decaying ratio (see defaultAnnRefineCount above).
         if (query.getRefineCandidates() > 0) {
           baseReq = std::min(cap, std::max(kDocs, (int64_t)query.getRefineCandidates()));
         } else {
-          double ratio = defaultAnnRefineRatio > 0
-            ? (double)defaultAnnRefineRatio
-            : std::max(REFINE_MIN_RATIO, std::log2(REFINE_UNITY_K / (double)kDocs));
-          baseReq = std::min(cap, (int64_t)defaultAnnRefineCount
-                                    + (int64_t)((double)kDocs * ratio));
+          baseReq = boundedDefaultCandidates(kDocs, cap);
         }
         baseReq = std::max(baseReq, kDocs);
       }

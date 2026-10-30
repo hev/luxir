@@ -778,19 +778,20 @@ every index type.
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
 | `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
-| `refine_candidates` | Candidate documents collected before the full-precision rescore, in both units. Unset: sized from `k` (see below). Explicit: exactly that many, clamped up to `k`. |
+| `refine_candidates` | Candidate documents collected before the full-precision rescore, in both units. Unset: sized from `k` (see below). Explicit: bounded budget, clamped up to `k`. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
 | `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
 
-`refine_candidates` sizes the candidate-document pool in both units, whichever
-index produced the candidates. When unset, the pool is affine
-in `k`, with a multiplier that decays from about 10 at `k=1` to a small floor
-by `k=1000`: quantization mis-ranks a true neighbor by a roughly constant
-number of positions regardless of `k`, so small `k` needs fixed headroom, while
-large-`k` requests are recall-oriented retrieval whose near-tied tail does not
-benefit from extra overfetch. The final pool is always rescored from the
-full-precision column, sorted by exact score, and collapsed to one hit per
-document (or per group with `unit: "groups"`).
+`refine_candidates` sets the bounded candidate-document budget before exact
+rescoring, clamped up to `k`. When unset, the default is
+`k + 24 + ceil(15 * k^0.8)`: 40 candidates at `k=1`, 129 at `k=10`,
+722 at `k=100`, and 4792 at `k=1000`. Multi-valued fields may collect more
+vector values to reach the document budget; group selection also limits members
+per group. The available eligible candidates and execution limits can reduce
+the pool. Exact column-scan results are retained independently of this
+approximate budget. The final pool is rescored from the full-precision column,
+sorted by exact score, and collapsed to one hit per document (or per group
+with `unit: "groups"`).
 
 `ivf.nprobe` is interpreted as the number of lists
 Luxir would probe if the field were a single IVF index built with
