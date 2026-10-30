@@ -228,6 +228,20 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
     }
     auto healthy = VectorAuxReader::open(dir, original, false);
     EXPECT_NE(healthy->getFaissIndex(), nullptr);
+    auto file = dir.openFile(original.files[0].name, true);
+    auto stream = file->getInputStream();
+    std::string payload(stream.ptr(), (size_t)stream.left());
+    auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), original.name);
+    EXPECT_EQ(footer.expectedFileBytes(), payload.size());
+    for (int corrupt = 0; corrupt < 4; corrupt++) {
+      auto bad = footer;
+      if (corrupt == 0) bad.version--;
+      if (corrupt == 1) bad.amplitudeCount = 3;
+      if (corrupt == 2) bad.ntotal = INT64_MAX;
+      if (corrupt == 3) bad.codeSize = INT64_MAX;
+      std::memcpy(payload.data() + payload.size() - sizeof(bad), &bad, sizeof(bad));
+      EXPECT_THROW(VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), original.name), std::runtime_error);
+    }
   }
 }
 

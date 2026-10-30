@@ -240,7 +240,7 @@ public:
           Query::PlanningContext::Limits{}, &req.warnings,
           FilterKeyContext{.schemaGen = req.schema->gen_,
                            .timeZone = req.proto.time_zone},
-          req.filterUses);
+          req.filterUses, &req.memoryTracker);
       validateDomainQueries(domains, *rootOp.planning);
       rootOp.domainVariants.begin(0);
       addDomainVariants(
@@ -352,7 +352,7 @@ public:
         bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
         bucketPlan->planning = luxir::arenaCreate<Query::PlanningContext>(
             req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker);
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
@@ -1302,7 +1302,7 @@ public:
         Query::PlanningContext::Limits{}, &req.warnings,
         FilterKeyContext{.schemaGen = req.schema->gen_,
                          .timeZone = req.proto.time_zone},
-        req.filterUses);
+        req.filterUses, &req.memoryTracker);
     for (Query* query : plan.bucketQueries) {
       query->validateLogical(*plan.planning);
     }
@@ -1695,7 +1695,7 @@ public:
       &req.warnings,
       FilterKeyContext{.schemaGen = req.schema->gen_,
                        .timeZone = req.proto.time_zone},
-      req.filterUses);
+      req.filterUses, &req.memoryTracker);
     // One unconditional serial pass validates the complete effective query,
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
@@ -2201,7 +2201,7 @@ public:
       if (planningContext == nullptr) {
         planningContext = luxir::arenaCreate<Query::PlanningContext>(
             req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{}, &req.warnings,
-            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses);
+            FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone}, req.filterUses, &req.memoryTracker);
       }
       return *planningContext;
     }

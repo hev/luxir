@@ -75,7 +75,8 @@ search time.
 **IVF+RaBitQ** (opt-in, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
 RaBitQ (Gao and Long, SIGMOD 2024) stores, per vector, the sign bits of its
 residual from the list centroid plus two float factors, and estimates
-distances from the code with a proven error bound; extended RaBitQ adds
+distances with probabilistic error bounds under its random-rotation model;
+extended RaBitQ adds
 magnitude bits per dimension. There is no codebook to train: building trains
 only the IVF centroids, unlike PQ, which retrains per-subspace k-means
 codebooks on every segment build and merge.
@@ -97,8 +98,8 @@ orthonormal, so L2, inner product, and cosine (unit vectors stay unit) are
 preserved, and centroid distances stay comparable across rotated and
 unrotated segments in the global list ranking. On one real embedding corpus
 the rotation made no measurable recall difference (the embeddings are close to
-isotropic already); it is kept because the guarantee, not that corpus, is what
-the codec is chosen for.
+isotropic already). The rotation remains part of the estimator; production
+confidence intervals are empirical rather than a deterministic guarantee.
 
 Each IVF engine slot binds an immutable prepared query: the canonical query
 for PQ, or the cached rotated query for RaBitQ (a Luxir matvec over the
@@ -175,13 +176,15 @@ i7-14700KF, shared with other builds). Two corpora:
   (768 dims, cosine).
 - SIFT1M (1,000,000 x 128, L2).
 
-At 768 dims, recall with 1-bit RaBitQ is set by the probed lists alone: 1, 2,
+In this historical 768-dimension campaign, the tested 1-bit pools reached the
+same recall as the higher-bit codecs: 1, 2,
 and 4 bits all give 0.893 / 0.911 / 0.960 / 0.986 at nprobe default / 32 / 64
-/ 128, at any rescore pool. PQ at its then-automatic `m=32` (32 code bytes) never
+/ 128, at the tested rescore pools. PQ at its then-automatic `m=32` (32 code bytes) never
 passed 0.88, even with 500 rescored candidates; PQ with `m=96` (96 bytes,
-close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. FAISS's plain
-RaBitQ scanner is slower than its PQ scanner (default nprobe: 1.2 ms vs 0.66
-ms for `m=96`), which FastScan should largely close. At 128 dims (SIFT) the
+close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. The then-current bounded scans measured 1.2 ms for RaBitQ versus 0.66 ms for
+PQ `m=96` at default nprobe. Those measurements predate shared floors,
+interval selection and amplitude storage; they do not establish a universal
+codec ranking or that 1-bit recall is generally list-limited. At 128 dims (SIFT) the
 defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
 0.999 at nprobe 128, where 2-bit RaBitQ or 500 candidates reach 0.9985 and
 0.9965) and PQ is again faster. Overlay builds, including training and
@@ -351,20 +354,62 @@ auto-deepening recovers.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
-arbitrary candidates; `nprobe` (which selects lists by relevance) is the only
-work limiter.
+arbitrary candidates. `nprobe` selects lists; codec gates and terminal
+selection determine the work performed on their values.
 
-Candidates are unioned across deepen rounds using approximate scores for the
-widen decision. From the first deepen round on, already-pooled vectors are
-excluded from every engine's scan: the pooled set is folded into per-query
-copies of the segments' liveness bitmaps (all-ones where a segment has no
-deletions) and handed to the scanners as an eligibility filter, so each
-round's result heap is spent entirely on new candidates and each round
-requests only the projected shortfall rather than re-requesting the whole
-pool. The shared per-segment liveness cache itself is never modified by
-queries. Once widening finishes, the final candidate pool is rescanned from
-the full-precision column, sorted by exact score, and collapsed to one hit per
-document.
+Candidate selection has independent bounded, interval and exact channels.
+PQ defaults to `k + 24 + ceil(15 * k^0.8)`; explicit `refine_candidates`
+selects the bounded policy for every approximate codec. Default RaBitQ uses
+intervals for every bit width. Exact column slots supply distinct-unit top-k
+results outside the approximate quota.
+
+The bounded channel uses a shared R-th estimate floor. Its fresh DEPTH epochs
+exclude banked ranks and reset that floor. Its document budget, multiplicity
+inflation and group member caps apply only to bounded candidates. Interval
+selection is complete after traversing the selected lists, independent of
+retained count, and never requests DEPTH. BREADTH visits only newly allocated
+lists and preserves interval witnesses and retained identities. A mixed query
+must satisfy the bounded channel's own obligation; interval hits cannot fill
+its quota. The result contract reports bounded completion separately from
+remaining breadth. Insufficient distinct units can trigger more breadth:
+bounded Groups continue BREADTH when the document pool is full but holds
+fewer than k groups.
+
+For RaBitQ, the query-owned collector tracks each unit's best lower endpoint
+and the k-th highest of those endpoints. A unit is a (segment, document) pair
+or a canonical CollapsePlan group key, including missing-key policy. A value
+is retained only while its upper endpoint reaches both the global witness
+floor and its own unit's lower endpoint. Multiple values of one unit can
+remain competitive. PQ point estimates never witness the true k-th score.
+Exact column scores may witness it. Document units use a flat hash map from
+packed (segment, document) to reusable stable slots; only Groups copy and hash
+canonical CollapsePlan keys. Map, slot and key storage are request-accounted.
+
+One-bit uses its single estimate with `sigma1 * g_error * 1.9`. Multi-bit first
+tests the optimistic 1-bit endpoint with gate epsilon 1.9, then constructs the
+full-bit interval with `sigmaB * g_error * 1.9`. The gate uses the witness floor
+for intervals and the R-th estimate floor for bounded collection. For L2 the
+raw distance endpoints are mapped in reverse order through the score transform,
+with outward rounding and upper scores clamped to 1. Scans reject in distance
+space against a cached outward threshold, converting only when the floor
+changes. Only admitted records pay for score mapping and outward endpoints. Both constants are empirical confidence choices,
+validated on IP at 128 and 1024 dimensions; they are not containment guarantees.
+
+Terminal scoring starts with the best estimated value per unit, choosing k
+distinct units. All bounded candidates are mandatory in this stage too (bounded
+Groups nominations expand to their whole document). Exact scores are reused.
+Then `T = max(k-th exact seed score, pessimistic witness floor)` selects the
+remaining interval values by `upper >= T`. A value whose upper score is below
+its unit's best known exact score is also skipped. Both stages read in segment
+and value-rank order, with disjoint column reads and a shared exact-score cache.
+Final unit collapse and similarity filtering use exact scores.
+
+There is no interval retention cap. `RequestMemResource` charges records,
+canonical unit keys, witness heaps, pending batches and terminal selection
+storage to the request's existing opt-in byte ceiling. Exceeding it throws
+`request_memory_exceeded`, including from scan tasks; cancellation and joining
+precede destruction of shared state. Old bounded candidate and breadth limits
+remain separate existing policies.
 
 ## Parallel Execution
 
@@ -376,15 +421,14 @@ full-precision rescore runs one task per segment whose candidate bucket
 exceeds a small grain (smaller buckets, including the common small-`k`
 single-segment pool, fold inline on the calling thread).
 
-All IVF chunks and segments share one bounded approximate cut per round.
-Task-local handlers batch competitive hits and resolved group keys into it;
-group handlers retain local capped admission to reject excess members before
-publication. Serialized updates publish a monotone scalar floor. Scanners refresh that floor
-between blocks and on batch publication. Exact hits bypass the approximate
-budget. Each fresh DEPTH round resets the cut and floor because its eligibility
-mask excludes previously pooled hits. Work counters distinguish selector-passing
-codes from extra-bit evaluations; the older vector counter also includes exact
-rescoring.
+All IVF chunks and segments share a bounded cut per fresh epoch and persistent
+interval witness state for the query. Task-local handlers batch admissions and
+canonical keys; group bounded handlers keep their local capped admission.
+Serialized updates publish monotone scalar floors. PQ uses its optimized
+kernel with floor refreshes between 256-code blocks. RaBitQ uses its distance
+computer in the common traversal. Peak and terminal retained counts, seed and
+remaining reads, gate rejections and extra-bit evaluations accompany the
+selector-passing scan count in the benchmark stats seam.
 
 Task boundaries do not depend on execution mode, and bounded cuts use a total
 identity order. RaBitQ confidence pruning can nevertheless change work and rare
