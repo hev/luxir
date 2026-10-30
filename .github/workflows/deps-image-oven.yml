@@ -1,4 +1,4 @@
-# Fork-only (hev/luxir): publish a dependency image from the Oven self-hosted
+# Fork-only (hev/luxir): publish a development image from the Oven self-hosted
 # runner using its warm local Docker build cache. Same key script, Dockerfile
 # target and registry as the upstream Dependency image workflow. Not upstream.
 name: Dependency image (Oven, fork only)
@@ -21,7 +21,7 @@ jobs:
       contents: read
       packages: write
     env:
-      REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-deps
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
       DOCKER_CONFIG: /tmp/deps-docker-oven-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -53,14 +53,14 @@ jobs:
             echo 'exists=true' >> "$GITHUB_OUTPUT"
           fi
           printf 'Runner: Oven (fork only)\nSource: %s\nDependency image: %s\n' "$(git rev-parse HEAD)" "$image" >> "$GITHUB_STEP_SUMMARY"
-      - name: Build and publish normal dependencies
+      - name: Build and publish development image
         if: steps.image.outputs.exists != 'true'
         env:
           IMAGE: ${{ steps.image.outputs.image }}
         run: |
           set -euo pipefail
           docker build --progress=plain -f .devcontainer/Dockerfile \
-            --target normal-dependencies --build-arg "BUILD_JOBS=$(./tools/build-jobs 3000)" \
+            --target dev --build-arg "BUILD_JOBS=$(./tools/build-jobs 3000)" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             -t "$IMAGE" .
           docker push "$IMAGE"
