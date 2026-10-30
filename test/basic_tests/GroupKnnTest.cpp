@@ -294,6 +294,33 @@ TEST_F(GroupKnnTest, rabitqPreparedQueryFindsGroupsAndRepresentatives) {
   }
 }
 
+TEST_F(GroupKnnTest, sharedFloorRespectsMemberCapsAcrossSegments) {
+  IvfTestGuard ivf;
+  SearchOverridesGuard grain(KnnQuery::scanTaskGrainVectors);
+  KnnQuery::scanTaskGrainVectors = 1;
+  CollectionHelper helper;
+  schema(helper, api::VectorMetric::L2, rabitqAnn(4, 4));
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 32; i++) {
+      float x = (float)(segment * 100 + i + 1);
+      docs.push_back(flatdoc("id", std::to_string(segment * 32 + i),
+          "key_s", segment == 0 ? "near" : "far", "vec_vs",
+          std::vector<std::vector<float>>{{x, 0, 0, 0}, {x + 0.25f, 0, 0, 0}}));
+    }
+    helper.indexAll(docs);
+    helper.commit({"*"});
+  }
+  std::string collapse = R"(,"collapse":{"field":"key_s"})";
+  auto expected = rows(*run("main", R"("limit":2,"query":)" + knn(2, true) + collapse));
+  ASSERT_EQ(expected.size(), 2u);
+  for (int32_t parallel : {1, -1}) {
+    auto actual = run("main", R"("limit":2,"query":)"
+        + knn(2, true, false, R"(,"refine_candidates":8,"ivf":{"nprobe":1000})") + collapse, parallel);
+    EXPECT_EQ(rows(*actual), expected);
+  }
+}
+
 TEST_F(GroupKnnTest, rabitqQueryBitsChangeBoundedGroupedSelection) {
   IvfTestGuard ivf;
   CollectionHelper helper;

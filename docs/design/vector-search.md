@@ -105,17 +105,20 @@ for PQ, or the cached rotated query for RaBitQ (a Luxir matvec over the
 rotation's rows rather than FAISS's one-column SGEMM, which on x86 OpenBLAS
 takes the full packed GEMM path), plus the current schema's
 query quantization bits. Coarse assignment and both document and group scans
-use that same index-space query. Each scan call owns its selector and FAISS
-search parameters, including `query_bits`, so filtering, deeper rounds, and
-parallel list chunks share the same preparation policy without sharing
-mutable scanner state. Exact column scans and terminal rescoring retain the
-canonical query.
+use that same index-space query. Each scan call owns its selector and distance
+computer, with query quantization taken from the prepared query, so filtering,
+deeper rounds, and parallel list chunks share the same preparation policy
+without sharing mutable distance-computer state. Document and group scans share one traversal
+and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
+its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
+terminal rescoring retain the canonical query.
 
 RaBitQ's estimated squared L2 distance can be negative. Internal ordering
 scores use `1 / (1 + d)` for `d >= 0` and `1 - d` for `d < 0`, preserving
 ordering across segments and bounded cuts instead of tying negative estimates
-at 1. Group scanners invert this same map when setting their competitive
-distance threshold. These approximate scores may exceed the public L2 range
+at 1. The common bounded handler inverts this map outward when setting its
+competitive distance threshold, admitting equal scores for identity ties.
+These approximate scores may exceed the public L2 range
 `[0, 1]`; terminal rescoring from column vectors restores exact scores before
 the final cut, similarity filtering, and returning results. Exact column
 witnesses bypass the bounded approximate heap, so an inflated estimate cannot
@@ -125,11 +128,9 @@ FAISS also ships `IndexIVFRaBitQFastScan`, which block-packs codes 32 vectors
 at a time for SIMD lookups and measured about 1.5 to 2 times faster list scans
 in a standalone FAISS test. It is not used yet: its lists are
 `BlockInvertedLists` (padded 32-vector blocks with per-block factor regions),
-which needs a second mmapped list layout; its `search_preassigned` rejects
-the per-call stats sink the parallel scan uses; and the vendored FAISS 1.14.3
-install omits `faiss/utils/popcount.h`, which its header includes, so it does
-not compile against the installed headers without patching the port. The
-codec is recorded per overlay, so FastScan can arrive as another engine id.
+which needs a second mmapped list layout, and its `search_preassigned` rejects
+the per-call stats sink the parallel scan uses. The codec is recorded per
+overlay, so FastScan can arrive as another engine id.
 
 **IVF+PQ** (default, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
 sub-quantizers of `pq.bits` bits each, unrotated. PQ's automatic `m` is the
@@ -357,10 +358,22 @@ chunks sized by their actual vector counts, and each chunk (plus each
 column-scanned segment) is scanned as an independent task; the terminal
 full-precision rescore runs one task per segment whose candidate bucket
 exceeds a small grain (smaller buckets, including the common small-`k`
-single-segment pool, fold inline on the calling thread). Task boundaries do
-not depend on the execution mode, and every bounded candidate cut uses a total
-order, so a parallel run returns bit-identical results to a serial run of the
-same query.
+single-segment pool, fold inline on the calling thread).
+
+All IVF chunks and segments share one bounded approximate cut per round.
+Task-local handlers batch competitive hits and resolved group keys into it;
+group handlers retain local capped admission to reject excess members before
+publication. Serialized updates publish a monotone scalar floor. Scanners refresh that floor
+between blocks and on batch publication. Exact hits bypass the approximate
+budget. Each fresh DEPTH round resets the cut and floor because its eligibility
+mask excludes previously pooled hits. Work counters distinguish selector-passing
+codes from extra-bit evaluations; the older vector counter also includes exact
+rescoring.
+
+Task boundaries do not depend on execution mode, and bounded cuts use a total
+identity order. RaBitQ confidence pruning can nevertheless change work and rare
+approximate misses with scheduling, since the floor seen during a scan depends
+on which tasks have published results.
 
 ## What This Means for Users
 
@@ -371,5 +384,6 @@ same query.
 - Segments below the training threshold, and segments whose build failed,
   are searched exactly from the column. A failed build leaves no partial
   state.
-- Parallelism is purely a speed knob: results are bit-identical to serial
-  execution.
+- Exact results retain deterministic ordering across execution modes.
+  Approximate confidence pruning can produce different candidates as task
+  scheduling changes the shared floor.

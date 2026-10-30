@@ -18,6 +18,7 @@
 #include <faiss/utils/distances.h>
 
 #include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/query/KnnQuery.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/server/LuxirNode.h"
@@ -80,11 +81,18 @@ void indexSegment(CollectionHelper& h, int64_t first, int64_t count) {
 }
 
 std::vector<std::string> knnIds(CollectionHelper& h, const std::vector<float>& q, bool exact,
-                                int32_t refine) {
+                                int32_t refine, bool groups = false, int32_t parallel = 1) {
   auto req = localReq(h.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q").limit(10).fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), "emb_v", q, 10, ALL_LISTS, exact, refine);
-  req->execute();
+  api::Collapse collapse;
+  std::array<std::string_view, 1> fields{"id"};
+  if (groups) {
+    std::get<api::KnnQuery>(cur.rawQuery().kind).unit = "groups";
+    collapse.field = fields;
+    std::get<api::TopDocs>(cur.rawOp().kind).collapse = &collapse;
+  }
+  req->execute(parallel);
   EXPECT_OK(req);
   std::vector<std::string> ids;
   if (const auto* dl = req->docList("q")) {
@@ -279,6 +287,44 @@ TEST_F(VectorAnnCodecTest, codecChangeLeavesMixedSegmentsQueryable) {
   EXPECT_EQ(aux[1]->getEngine(), VectorAuxMeta::ENGINE_IVFRABITQ);
   // 4-bit PQ on 4-dim subspaces is coarse: give it a deeper rescore pool.
   EXPECT_GE(recallVsExact(h, /*refine=*/300), 0.9);
+}
+
+TEST_F(VectorAnnCodecTest, boundedFloorSpansChunksAndCodecs) {
+  IvfTestGuard guard;
+  SearchOverridesGuard overrides(KnnQuery::statsForTests, KnnQuery::scanTaskGrainVectors);
+  CollectionHelper h("main");
+  std::vector<float> query(DIMS, 0);
+  for (const auto& first : {pqAnn(4, 8, 2), rabitqAnn(4), rabitqAnn(4, 4)}) {
+    h.clear();
+    installAnn(h.collection(), api::VectorMetric::L2, first);
+    indexSegment(h, 0, 256);
+    installAnn(h.collection(), api::VectorMetric::L2, rabitqAnn(4, 4));
+    std::vector<Doc> far;
+    for (int i = 0; i < 256; i++) {
+      auto vector = clustered(i, i % CLUSTERS);
+      for (auto& x : vector) x += 100;
+      far.push_back(flatdoc("id", "far" + std::to_string(i), "emb_v", vector));
+    }
+    h.indexAll(far);
+    h.commit({"*"});
+    auto expected = knnIds(h, query, true, 256);
+    int64_t firstExtra = first.rabitq && first.rabitq->bits == 4 ? 256 : 0;
+    for (bool groups : {false, true}) for (int64_t grain : {1, 1000000}) {
+      KnnQuery::scanTaskGrainVectors = grain;
+      for (int32_t parallel : {1, -1}) {
+        KnnQuery::Stats stats;
+        KnnQuery::statsForTests = &stats;
+        EXPECT_EQ(knnIds(h, query, false, 256, groups, parallel), expected);
+        EXPECT_EQ(stats.rounds.load(), 1);
+        EXPECT_EQ(stats.scanned.load(), 512);
+        // Serial scans fill R from the first segment. The far segment must
+        // inherit that floor even when its chunks or codec differ.
+        if (parallel == 1) EXPECT_EQ(stats.extraBitEvaluations.load(), firstExtra);
+        else EXPECT_LE(stats.extraBitEvaluations.load(), firstExtra + 256);
+        KnnQuery::statsForTests = nullptr;
+      }
+    }
+  }
 }
 
 TEST_F(VectorAnnCodecTest, negativeEstimatesRemainOrderedAcrossSegments) {

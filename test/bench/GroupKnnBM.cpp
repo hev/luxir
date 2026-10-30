@@ -160,6 +160,8 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
   state.counters["probes_requested"] = probes;
   state.counters["lists"] = (double)stats.lists.load() / (double)queryCount;
   state.counters["vectors"] = (double)stats.vectors.load() / (double)queryCount;
+  state.counters["scanned"] = (double)stats.scanned.load() / (double)queryCount;
+  state.counters["extra_bits"] = (double)stats.extraBitEvaluations.load() / (double)queryCount;
   state.counters["bytes_read"] = (double)stats.bytes.load() / (double)queryCount;
   state.counters["rounds"] = (double)stats.rounds.load() / (double)queryCount;
   state.counters["underfill"] = underfill / (double)queryCount;

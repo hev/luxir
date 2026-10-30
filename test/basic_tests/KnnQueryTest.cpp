@@ -2502,7 +2502,7 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
 TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
   IvfTestGuard guard(/*minTraining=*/16);
   CollectionHelper h("main");
-  for (const auto& ann : {pqAnn(4, 2, 2), rabitqAnn(4)}) {
+  for (const auto& ann : {pqAnn(4, 2, 2), rabitqAnn(4), rabitqAnn(4, 4)}) {
     h.clear();
     installMultiVecSchema(h.collection(), api::VectorMetric::L2, ann, 4);
 

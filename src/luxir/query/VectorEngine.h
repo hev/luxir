@@ -29,9 +29,11 @@ struct VectorSearchRequest {
   const float* query = nullptr;
   int32_t dims = 0;
   // Document/vector budget; group approximate cuts count documents.
+  // IVF applies one shared approximate cut across all segments and chunks
+  // for this round. A fresh-only depth request starts a new cut/floor.
   int64_t candidates = 0;
-  // Domain filtering is supplied by engine construction today.  Flat FAISS
-  // receives it through SearchParameters::sel instead of per request state.
+  // Domain filtering is supplied by engine construction. IVF scanners
+  // apply it through task-local selectors instead of per-request state.
   int32_t breadth = 0;
   // Floor on the fraction of live vectors the engine examines, in [0,1];
   // raises the effective breadth when breadth maps below it.  1.0 forces a
