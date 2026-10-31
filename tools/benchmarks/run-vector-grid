@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Build the pinned engine once per dedicated cache, then run one dataset grid.
+set -euo pipefail
+harness=$(cd "$(dirname "$0")" && pwd)
+: "${DATASET:?dataset required}"
+: "${GRID_ROOT:?dedicated cache root required}"
+: "${GRID_OUTPUT:?fresh output required}"
+: "${GRID_EVIDENCE:?evidence directory required}"
+python=${BENCH_PYTHON:-python3}
+source_sha=a7ba8db063060f25d9c34f31c9d98899fc26ed11
+image=ghcr.io/hev/luxir-dev@sha256:e6fd4747b2a258944abcf8548e05f3cce0b36a37a956bbd0a6d1d18631b27aeb
+mkdir -p "$GRID_ROOT" "$GRID_EVIDENCE"
+"$python" -c 'import shutil,sys; f=shutil.disk_usage(sys.argv[1]).free; print("free_disk_bytes",f); sys.exit(0 if f >= 60*10**9 else "Free disk below 60 GB")' "$GRID_ROOT"
+# Serialize this cache even across separate dispatches. Do not lock other work.
+exec 9>"$GRID_ROOT/engine.lock"
+flock 9
+engine="$GRID_ROOT/engine-$source_sha"
+if [[ -z ${DOCKER_HOST:-} && -S /run/user/$(id -u)/docker.sock ]]; then
+  DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+  export DOCKER_HOST
+fi
+docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+docker image inspect "$image" > "$GRID_EVIDENCE/image.json"
+if [[ ! -d $engine/.git ]]; then
+  git init -q "$engine"
+  git -C "$engine" remote add origin https://github.com/synhershko/luxir.git
+  git -C "$engine" fetch --depth 1 origin "$source_sha"
+  git -C "$engine" checkout -q --detach FETCH_HEAD
+fi
+[[ $(git -C "$engine" rev-parse HEAD) == "$source_sha" ]]
+git -C "$engine" diff --exit-code
+if [[ ! -f $engine/grid-build.json ]]; then
+  cd "$engine"
+  git submodule update --init
+  ./deps/fetch_sources.sh
+  export LUXIR_DEV_IMAGE="$image"
+  export LUXIR_CACHE_DIR="$GRID_ROOT/compiler-cache"
+  # Rootless user mapping stays in this invocation; no daemon configuration.
+  if docker info --format '{{json .SecurityOptions}}' | grep -q rootless; then
+    export CONTAINER_ENGINE="$harness/grid-container-engine"
+  fi
+  /usr/bin/time -v -o "$GRID_EVIDENCE/engine-build-time.txt" \
+    ./tools/dev-container bash -e -c \
+    'cmake --preset container-release -DLUXIR_COMPILE_JOBS=6 && cmake --build --preset container-release --target luxir' \
+    > "$GRID_EVIDENCE/engine-build.log" 2>&1
+  "$python" - "$engine" "$source_sha" "$image" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+sha=hashlib.file_digest((root/'build/container-release/bin/luxir').open('rb'),'sha256').hexdigest()
+(root/'grid-build.json').write_text(json.dumps({'source':sys.argv[2], 'image':sys.argv[3], 'binary_sha256':sha},indent=2)+'\n')
+PY
+fi
+cp "$engine/grid-build.json" "$GRID_EVIDENCE/engine.json"
+"$python" - "$engine" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); meta=json.loads((root/'grid-build.json').read_text())
+assert hashlib.file_digest((root/'build/container-release/bin/luxir').open('rb'),'sha256').hexdigest()==meta['binary_sha256']
+PY
+flock -u 9
+lscpu > "$GRID_EVIDENCE/lscpu.txt"
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2
+extra=()
+if [[ ${SMOKE:-0} == 1 ]]; then
+  extra+=(--smoke)
+fi
+exec "$python" "$harness/vector-grid.py" --binary "$engine/build/container-release/bin/luxir" \
+  --dataset "$DATASET" --cache "$GRID_ROOT/datasets" --output "$GRID_OUTPUT" --stage "${STAGE:-1}" "${extra[@]}"

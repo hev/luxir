@@ -2,7 +2,7 @@
 """Interleaved base/candidate HTTP vector comparison. Requires numpy, pyarrow, requests."""
 import argparse
 import copy
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 import hashlib
 import json
@@ -74,13 +74,15 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
 """
 
 
-def download(url, path, sha=None):
+def download(url, path, sha=None, guard=None):
     if not path.exists():
         tmp = path.with_suffix('.partial')
         with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with tmp.open('wb') as f:
                 for chunk in r.iter_content(1024 * 1024):
+                    if guard:
+                        guard()
                     f.write(chunk)
         tmp.replace(path)
     with path.open('rb') as f:
@@ -163,7 +165,25 @@ def checked(body):
     return body
 
 
-def variant(args, queries, stream, metric, meta):
+def search(codec, v, nprobe=0, exact=False, refine=0):
+    knn = {'field': 'embedding_v', 'query': v, 'k': 10, 'exact': exact,
+           'ivf': {'nprobe': nprobe}, 'refine_candidates': refine}
+    return {'query': {'knn': knn}, 'limit': 10, 'fields': ['id']}
+
+
+def exact_truth(call, codec, vectors):
+    truth = []
+    for v in vectors:
+        docs = call(f'/collections/{codec}/_search', search(codec, v, exact=True))['docs']
+        ids = {d['id'] for d in docs}
+        if len(ids) != 10:
+            raise RuntimeError('Exact top ten underfilled')
+        truth.append(ids)
+    return truth
+
+
+@contextmanager
+def server(args, metric, meta):
     args.output.mkdir(parents=True, exist_ok=True)
     data = args.output.resolve() / 'data'
     if data.exists():
@@ -186,13 +206,9 @@ def variant(args, queries, stream, metric, meta):
         r.raise_for_status()
         return checked(r.json())
 
-    def search(codec, v, nprobe=0, exact=False):
-        knn = {'field': 'embedding_v', 'query': v, 'k': 10, 'exact': exact, 'ivf': {'nprobe': nprobe}}
-        return {'query': {'knn': knn}, 'limit': 10, 'fields': ['id']}
-
     cpu = Path('/proc/cpuinfo').read_text()
     (args.output / 'cpuinfo.txt').write_text(cpu)
-    result = {'label': args.label, 'source_revision': args.source_revision, 'binary_sha256': hashlib.file_digest(Path(args.binary).open('rb'), 'sha256').hexdigest(), 'harness_sha256': hashlib.file_digest(Path(__file__).open('rb'), 'sha256').hexdigest(), 'dataset': meta, 'metric': metric, 'index_count': 99000, 'query_count': 1000, 'k': 10, 'workers': args.workers, 'runner': {k: os.getenv(k) for k in ['RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_RUN_ID']}, 'host': platform.uname()._asdict(), 'cpu_model': next((x.split(':', 1)[1].strip() for x in cpu.splitlines() if x.startswith('model name')), platform.machine()), 'simd': {x: x in cpu.lower() for x in ['avx2', 'avx512f', 'neon', 'asimd']}, 'command': cmd, 'rows': []}
+    result = {'label': args.label, 'source_revision': args.source_revision, 'binary_sha256': hashlib.file_digest(Path(args.binary).open('rb'), 'sha256').hexdigest(), 'harness_sha256': hashlib.file_digest(Path(__file__).open('rb'), 'sha256').hexdigest(), 'dataset': meta, 'metric': metric, 'index_count': meta['index_count'], 'query_count': meta['query_count'], 'k': 10, 'workers': args.workers, 'runner': {k: os.getenv(k) for k in ['RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_RUN_ID']}, 'host': platform.uname()._asdict(), 'cpu_model': next((x.split(':', 1)[1].strip() for x in cpu.splitlines() if x.startswith('model name')), platform.machine()), 'simd': {x: x in cpu.lower() for x in ['avx2', 'avx512f', 'neon', 'asimd']}, 'command': cmd, 'rows': []}
     log = (args.output / 'server.log').open('w')
     shim_source = args.output.resolve() / 'loopback-bind.c'
     shim = args.output.resolve() / 'loopback-bind.so'
@@ -212,6 +228,26 @@ def variant(args, queries, stream, metric, meta):
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(0.2)
+        yield call, session, base, data, result
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log.close()
+        session.close()
+        listeners_closed = {}
+        for listener in [port, grpc]:
+            with socket.socket() as probe:
+                probe.settimeout(1)
+                listeners_closed[str(listener)] = probe.connect_ex(('127.0.0.1', listener)) != 0
+        (args.output / 'shutdown.json').write_text(json.dumps({'exit_code': proc.returncode, 'listeners_closed': listeners_closed}, indent=2))
+
+
+def variant(args, queries, stream, metric, meta):
+    with server(args, metric, meta) as (call, session, base, data, result):
         for codec in [args.variant]:
             print(f'{codec}: schema/ingest', flush=True)
             schema = {'fields': {'embedding_v': {'type': 'vector', 'dims': meta['dims'], 'metric': metric, **copy.deepcopy(args.settings)}}}
@@ -252,13 +288,7 @@ def variant(args, queries, stream, metric, meta):
             (args.output / f'{codec}-files.json').write_text(json.dumps({str(x.relative_to(directory)): x.stat().st_size for x in files}, indent=2))
             print(f'{codec}: exact ground truth', flush=True)
             vectors = queries.tolist()
-            truth = []
-            for v in vectors:
-                docs = call(f'/collections/{codec}/_search', search(codec, v, exact=True))['docs']
-                ids = {d['id'] for d in docs}
-                if len(ids) != 10:
-                    raise RuntimeError('Exact top ten underfilled')
-                truth.append(ids)
+            truth = exact_truth(call, codec, vectors)
             (args.output / f'{codec}-truth.json').write_text(json.dumps([sorted(x) for x in truth]))
             # Yield after preparation, then one full pass at a time. The caller
             # rotates variant order on every pass; all three processes stay alive.
@@ -287,21 +317,6 @@ def variant(args, queries, stream, metric, meta):
                         result['rows'].append(row)
                         (args.output / 'results.json').write_text(json.dumps(result, indent=2))
                     yield {'variant': codec, 'nprobe': nprobe, 'pass': pass_no}
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        log.close()
-        session.close()
-        listeners_closed = {}
-        for listener in [port, grpc]:
-            with socket.socket() as probe:
-                probe.settimeout(1)
-                listeners_closed[str(listener)] = probe.connect_ex(('127.0.0.1', listener)) != 0
-        (args.output / 'shutdown.json').write_text(json.dumps({'exit_code': proc.returncode, 'listeners_closed': listeners_closed}, indent=2))
 
 
 def main():

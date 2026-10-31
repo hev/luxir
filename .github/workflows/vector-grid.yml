@@ -1,0 +1,73 @@
+name: Vector defaults grid (Oven)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Pinned dataset, or all in dimension order
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - sift-128-l2
+          - gist-960-l2
+          - cohere-768-cos
+          - cohere-v3-1024
+          - dbpedia-openai3-1536
+          - dbpedia-openai3-3072
+      stage:
+        description: Parameter grid stage
+        type: choice
+        required: true
+        default: '1'
+        options: ['1']
+
+permissions:
+  contents: read
+
+jobs:
+  grid:
+    if: github.repository == 'hev/luxir'
+    runs-on: [self-hosted, linux, x64, oven-luxir]
+    timeout-minutes: ${{ fromJSON('{"sift-128-l2":720,"gist-960-l2":1440,"cohere-768-cos":1440,"cohere-v3-1024":1440,"dbpedia-openai3-1536":1440,"dbpedia-openai3-3072":1440}')[matrix.dataset] }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        dataset: ${{ fromJSON(inputs.dataset == 'all' && '["sift-128-l2","gist-960-l2","cohere-768-cos","cohere-v3-1024","dbpedia-openai3-1536","dbpedia-openai3-3072"]' || format('["{0}"]', inputs.dataset)) }}
+    env:
+      GRID_ROOT: ${{ github.workspace }}/../luxir-vector-grid-cache
+      GRID_OUTPUT: ${{ github.workspace }}/.vector-grid-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.dataset }}/results
+      GRID_EVIDENCE: ${{ github.workspace }}/.vector-grid-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.dataset }}/evidence
+      DATASET: ${{ matrix.dataset }}
+      STAGE: ${{ inputs.stage }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check disk and install harness dependencies
+        run: |
+          python3 -c 'import shutil,sys; sys.exit(0 if shutil.disk_usage(".").free >= 60*10**9 else "Free disk below 60 GB")'
+          python3 -m venv "$RUNNER_TEMP/vector-grid-venv"
+          "$RUNNER_TEMP/vector-grid-venv/bin/pip" install -r tools/benchmarks/requirements.txt
+          "$RUNNER_TEMP/vector-grid-venv/bin/python" -m unittest discover -s tools/benchmarks -p 'test_*.py'
+      - name: Build pinned engine and run grid
+        env:
+          BENCH_PYTHON: ${{ runner.temp }}/vector-grid-venv/bin/python
+        run: tools/benchmarks/run-vector-grid
+      - name: Preserve partial summary on failure
+        if: failure()
+        run: |
+          if [[ -f "$GRID_OUTPUT/summary.md" ]]; then
+            cat "$GRID_OUTPUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: vector-grid-${{ matrix.dataset }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.GRID_EVIDENCE }}/
+            ${{ env.GRID_OUTPUT }}/
+            !${{ env.GRID_OUTPUT }}/*/data/**
+          retention-days: 30
