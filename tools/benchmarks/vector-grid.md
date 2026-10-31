@@ -69,9 +69,13 @@ Parquet order is sorted shard name, then row order. The Qdrant 1M sources
 have exactly 1M total rows, so the final 1k are held out per the fallback rule.
 Cohere v3 needs the first eleven English shards, not only en/0000.parquet.
 The 768d mirror card attributes its source to the now-deprecated
-Cohere/wikipedia-22-12-en-embeddings. It provides separate normalized train/test
+Cohere/wikipedia-22-12-en-embeddings. It provides separate train/test
 raw float32 files; that provenance is recorded without resolving the card's
-ambiguous model naming. Source cards are the authority for those declarations.
+ambiguous model naming. The card claims L2-normalized vectors, but direct
+inspection of all pinned training rows found norms 12.258187..17.474176 (queries
+12.342849..16.224667). The claim is not true of the pinned bytes. The grid uses
+cosine and records the actual norms; it never substitutes IP based on the card.
+Source cards are retained as declarations, not proof of data properties.
 
 At runtime every loaded vector is checked for dimensions, finiteness and nonzero
 norm for cosine/IP. L2 permits zero vectors (present in GIST); their count is recorded.
