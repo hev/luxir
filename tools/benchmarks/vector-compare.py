@@ -92,17 +92,18 @@ def download(url, path, sha=None, guard=None):
     return digest
 
 
-def validate_vectors(a, dims):
+def validate_vectors(a, dims, allow_zero=False):
     if a.ndim != 2 or a.shape[1] != dims:
         raise RuntimeError('Wrong vector dimensions')
     if not np.isfinite(a).all():
         raise RuntimeError('Nonfinite vector')
     norms = np.linalg.norm(a, axis=1)
-    if np.any(norms == 0):
+    if not allow_zero and np.any(norms == 0):
         raise RuntimeError('Zero vector')
     metric = 'ip' if np.allclose(norms, 1, rtol=0, atol=0.001) else 'cosine'
     return metric, {'min': float(norms.min()), 'max': float(norms.max()),
-                    'max_unit_error': float(np.abs(norms - 1).max()), 'unit_tolerance': 0.001}
+                    'max_unit_error': float(np.abs(norms - 1).max()), 'unit_tolerance': 0.001,
+                    'zero_vectors': int(np.sum(norms == 0))}
 
 
 def dataset(cache, name=DEFAULT_DATASET):

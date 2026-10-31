@@ -74,7 +74,8 @@ raw float32 files; that provenance is recorded without resolving the card's
 ambiguous model naming. Source cards are the authority for those declarations.
 
 At runtime every loaded vector is checked for dimensions, finiteness and nonzero
-norm. Norm bounds and actual row counts are persisted. SIFT/GIST use L2;
+norm for cosine/IP. L2 permits zero vectors (present in GIST); their count is recorded.
+Norm bounds and actual row counts are persisted. SIFT/GIST use L2;
 Cohere 768 uses cosine; other sources use IP if every norm is within 0.001
 of one, otherwise cosine. Values are converted to float32 as stored by Luxir.
 

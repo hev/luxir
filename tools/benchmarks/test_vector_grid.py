@@ -17,6 +17,14 @@ spec.loader.exec_module(g)
 
 
 class GridTests(unittest.TestCase):
+    def test_zero_vectors_are_valid_for_l2_only(self):
+        a = np.array([[0, 0], [1, 0]], dtype='float32')
+        with self.assertRaisesRegex(RuntimeError, 'Zero vector'):
+            g.compare.validate_vectors(a, 2)
+        _, stats = g.compare.validate_vectors(a, 2, allow_zero=True)
+        self.assertEqual(stats['zero_vectors'], 1)
+        self.assertEqual(stats['min'], 0)
+
     def test_full_query_grid(self):
         points = g.query_grid()
         self.assertEqual(len(points), 49)

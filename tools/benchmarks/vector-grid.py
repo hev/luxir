@@ -191,10 +191,11 @@ def prepare(cache, name):
     a.flush()
     norms = []
     for start in range(0, count, 4096):
-        _, stats = compare.validate_vectors(a[start:start + 4096], dims)
+        _, stats = compare.validate_vectors(a[start:start + 4096], dims, allow_zero=p['metric'] == 'l2')
         norms.append(stats)
     stats = {'min': min(x['min'] for x in norms), 'max': max(x['max'] for x in norms),
-             'max_unit_error': max(x['max_unit_error'] for x in norms), 'unit_tolerance': 0.001}
+             'max_unit_error': max(x['max_unit_error'] for x in norms), 'unit_tolerance': 0.001,
+             'zero_vectors': sum(x['zero_vectors'] for x in norms)}
     metric = p['metric']
     if metric == 'auto':
         metric = 'ip' if stats['max_unit_error'] <= 0.001 else 'cosine'
