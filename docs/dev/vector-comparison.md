@@ -25,8 +25,6 @@ source and build concurrency do not. Unknown COPY/ADD contracts fail so the help
 the Dockerfile layout changes. Ignore rules are validated by Docker at build
 time, rather than included in dependency identity.
 
-The Docker context must include `test/blas_lapack_test.cpp` when the Dockerfile
-copies it. Use a tree with the corresponding Docker ignore fix before building.
 The image includes normal and ASan dependencies and the development environment.
 Use it directly with the wrapper:
 
@@ -65,10 +63,10 @@ that moving ref is resolved to a SHA and recorded in the artifact.
 
 The candidate field settings input is a JSON object merged into its vector
 field. The base and candidate-default control receive no extra settings.
-For a candidate implementing the opt-in PQ4 codec, use:
+To compare product quantization against the default RaBitQ codec, use:
 
 ```json
-{"ann":{"codec":"pq4"}}
+{"ann":{"codec":"pq"}}
 ```
 
 An empty object compares defaults only. Overrides of `type`, `dims`, and
@@ -91,7 +89,7 @@ export DEPS_REGISTRY=ghcr.io/owner/luxir-dev
 export WORK_DIR="$PWD/vector-work"  # Must not exist yet; use an absolute path.
 export BENCH_PYTHON="$PWD/.bench-venv/bin/python"
 export DATASET=cohere-wikipedia-en-v3-1024-100k
-export CANDIDATE_FIELD_SETTINGS='{"ann":{"codec":"pq4"}}'
+export CANDIDATE_FIELD_SETTINGS='{"ann":{"codec":"pq"}}'
 tools/benchmarks/compare-refs
 ```
 
@@ -148,11 +146,12 @@ pooled latency distribution. All three servers stay alive during these passes.
 Requests are serial, with two server workers by default; this is not concurrent
 throughput or a codec kernel timing.
 
-Ingest time, ANN build time, and index size are single measurements, prepared
-in base, candidate-feature, candidate-default order. Index size includes all
-collection files, not just compressed vectors. Percent changes are relative
-to the base at the same nprobe; recall changes are relative percentages, not
-percentage-point differences. Always read latency and recall together.
+Ingest time, merge plus ANN build time, and index size are single
+measurements, prepared in base, candidate-feature, candidate-default order, and
+have their own table. Index size includes all collection files, not just
+compressed vectors. Latency changes are percentages relative to the base at the
+same nprobe; recall changes are percentage points. Always read latency and
+recall together.
 
 `results.json` records source and binary hashes, schemas, dataset provenance,
 CPU/SIMD details, individual pass latencies, and the schedule. Build timing,
@@ -161,7 +160,12 @@ the artifact. Collection data directories are excluded. Keep the artifact when
 a run matters; it expires after 14 days.
 
 Hosted runners vary in load, CPU, and frequency. Interleaving reduces drift but
-does not establish a statistically significant speedup. The full development
+does not establish a statistically significant speedup. In three hosted runs
+of the same two refs, absolute base p50 moved by up to 37% between runs, the
+feature arm's single-shot ingest change ranged from -4% to +40%, and base
+recall@10 at nprobe 16 ranged from 0.897 to 0.906. Compare only within a run,
+and treat latency differences under about 10% and recall differences under
+about one point as noise. The full development
 image, two source builds, and dataset need substantial disk space;
 hosted pull/build duration has to be measured on the actual runner. A selected
 dataset, single segment, fixed settings, and serial requests do not represent
