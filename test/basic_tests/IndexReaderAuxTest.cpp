@@ -355,6 +355,16 @@ TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
     EXPECT_EQ(opened.ivfpq->metric_type, faiss::METRIC_L2);
     EXPECT_GT(opened.ivfpq->precomputed_table.size(), 0u);
   }
+  for (int lists : {40, 41}) {
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection(), pqAnn(lists, 4, 1), 4);
+    indexDocs(h);
+    auto opened = openIvfPq(h);
+    ASSERT_NE(opened.ivfpq, nullptr);
+    EXPECT_EQ(opened.ivfpq->use_precomputed_table, lists == 40 ? 1 : -1);
+    EXPECT_EQ(opened.ivfpq->precomputed_table.size(), lists == 40 ? 320u : 0u);
+  }
 }
 
 TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {

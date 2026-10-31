@@ -629,8 +629,8 @@ after changing source limits.
 
 Exact search costs one pass over the column per query. For large collections,
 a commit can build approximate nearest-neighbor indexes as segment overlays:
-an inverted-file (IVF) index whose lists hold product-quantization (PQ) codes
-by default, or opt-in RaBitQ codes, built with FAISS. An overlay is built
+an inverted-file (IVF) index whose lists hold RaBitQ codes by default, or
+explicit product-quantization (PQ) codes, built with FAISS. An overlay is built
 from the vector column, follows its segment through later commits and
 merges, and its candidates are always rescored from the full-precision column
 before they are returned. Building an overlay does not reindex documents.
@@ -690,17 +690,17 @@ POST /collections/books/_schema
 
 | Field | Meaning |
 |---|---|
-| `codec` | `pq` (default) or opt-in `rabitq`. |
+| `codec` | `rabitq` (default) or explicit `pq`. |
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
-| `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
+| `rabitq.bits` | Bits per dimension, `0` to `9`. Absent or `0` (default): automatic from the stored dimension, 2 below 384 dims and 1 at or above. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
-| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for every metric. If none does, use the largest divisor under the same cap. |
 | `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
 
-`rabitq` settings require an explicit `"codec":"rabitq"`, for example
-`"ann":{"codec":"rabitq","rabitq":{"bits":1,"query_bits":4}}`.
-Omitting the codec selects PQ, including for `ann:{}`, `nlist` alone, or
-`pq` settings alone; a `rabitq` object does not infer the codec. A field
+`pq` settings require an explicit `"codec":"pq"`, for example
+`"ann":{"codec":"pq","pq":{"m":96}}`.
+Omitting the codec selects RaBitQ, including for `ann:{}`, `nlist` alone, or
+`rabitq` settings alone; a `pq` object does not infer the codec. A field
 without `ann` inherits its parent's, and an `ann` object replaces the
 parent's whole definition rather than merging with it.
 
@@ -708,7 +708,7 @@ These rules also apply to inherited ANN settings and vector variants. Use
 automatic `m` when dimensions are inferred from indexed values; an explicit
 positive `m` requires dimensions pinned in the schema.
 
-**RaBitQ** (opt-in) stores sign bits of randomly rotated residuals from IVF
+**RaBitQ** (default) stores sign bits of randomly rotated residuals from IVF
 centroids, plus correction factors. A 768-dimension 1-bit vector uses 104 code
 bytes plus a 4-byte error amplitude (108 bytes, excluding its id). Multi-bit
 codes use `ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32
@@ -723,17 +723,17 @@ are empirical choices, not recall guarantees. `query_bits: 4` is the default;
 query quantization also affects estimation error and should be checked on the
 intended corpus when changed.
 
-**PQ** (the default) splits each vector into `m` sub-vectors and stores one learned
-codebook entry per sub-vector. PQ's automatic `m` scales with IP/cosine
+**PQ** (explicit) splits each vector into `m` sub-vectors and stores one learned
+codebook entry per sub-vector. PQ's automatic `m` scales with stored
 dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
 bytes at 8 bits, close to 1-bit RaBitQ's 108 including its amplitude. This improves high-dimensional recall
 over `m=32` at the cost of larger codes and more scan work; see the
 [codec measurements](../design/vector-search.md#codec-measurements).
-L2 keeps the cap of 32 because FAISS retains an `nlist * m * 256`-float
-precomputed table at 8 bits; IP/cosine builds its lookup table per query and
-has no such resident table. Fields of up to 256 dimensions and explicit `m`
-settings keep their existing choices. PQ codebooks are retrained for every
-segment build and merge; automatic `m` depends only on dimensions and metric.
+For L2, the reader retains the `nlist * m * 2^bits`-float precomputed table
+only if it fits within the overlay's raw vector bytes (`ntotal * dims * 4`);
+otherwise FAISS computes tables per list. IP/cosine has no resident L2 table.
+PQ codebooks are retrained for every segment build and merge; automatic `m`
+depends only on stored dimensions.
 
 Scan and rescore costs depend on codec, dimension, candidate policy and query.
 Higher RaBitQ bit counts generally narrow the intervals and reduce exact reads,
@@ -754,8 +754,9 @@ the field's identity: existing values stay searchable.
 
 The [resolved schema view](schema.md#resolved-view) exposes each vector
 representation's effective `ann` settings, including defaults and inherited
-values. It includes only the selected codec's settings. `nlist:0` and `m:0`
-remain automatic policies, rather than sizes chosen for any one segment.
+values. It includes only the selected codec's settings. `nlist:0`, `pq.m:0`
+and `rabitq.bits:0` remain automatic policies, rather than sizes chosen for
+any one segment.
 
 ### Query knobs
 

@@ -59,7 +59,7 @@ future work.
 
 Every overlay is an IVF index: k-means centroids route a query to inverted
 lists, and the lists hold one compact code per vector. The field's schema
-`ann` settings pick the code (PQ by default, or opt-in RaBitQ; see
+`ann` settings pick the code (RaBitQ by default, or explicit PQ; see
 [guide/vector-search.md](../guide/vector-search.md#index-settings)); the
 builder reads them when it builds an overlay and records the codec and its
 build parameters in the overlay's `VectorAuxMeta`, so the reader and query
@@ -72,7 +72,7 @@ metric space for both (see rotation below). RaBitQ query quantization
 (`query_bits`) is not an index property; it is read from the current schema at
 search time.
 
-**IVF+RaBitQ** (opt-in, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
+**IVF+RaBitQ** (default, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
 RaBitQ (Gao and Long, SIGMOD 2024) stores, per vector, the sign bits of its
 residual from the list centroid plus two float factors, and estimates
 distances with probabilistic error bounds under its random-rotation model;
@@ -143,22 +143,24 @@ which needs a second mmapped list layout, and its `search_preassigned` rejects
 the per-call stats sink the parallel scan uses. The codec is recorded per
 overlay, so FastScan can arrive as another engine id.
 
-**IVF+PQ** (default, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
+**IVF+PQ** (explicit, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
 sub-quantizers of `pq.bits` bits each, unrotated. PQ's automatic `m` is the
-largest divisor of dims under a metric-dependent cap that leaves at least
-four dimensions per sub-quantizer. The cap is `max(32, dims / 8)` for the
-FAISS inner-product metric (IP and cosine), and 32 for L2. If no divisor
-leaves four dimensions, use the largest divisor under the same cap. Explicit
-`m` is unchanged. Automatic `m` depends only on dims and metric, so it is
-stable across merges. Up to 256 dims the choices are unchanged; IP/cosine
-selects 48 / 96 / 120 / 192 / 384 at 384 / 768 / 960 / 1536 / 3072 dims.
+largest divisor of dims under `max(32, dims / 8)` that leaves at least four
+dimensions per sub-quantizer, for every metric. If none does, use the largest
+divisor under the same cap. Explicit `m` is unchanged. Automatic `m` depends
+only on stored dims, including inferred dims, so it is stable across merges
+of the same dimension. It selects 48 / 96 / 120 / 192 / 384 at
+384 / 768 / 960 / 1536 / 3072 dims.
 
-L2 retains the cap because FAISS's L2 + `by_residual` path recomputes a
-precomputed table at open and keeps it resident: `nlist * m * 256` floats
-at 8 bits. At about 121k vectors (`nlist=348`), `m=96` would mean about
-34 MB of resident table against 11.6 MB of codes. IP/cosine instead builds
-its lookup table per query, with no such index-resident table.
-`IndexReaderAuxTest.cosineSkipsL2PrecomputedTable` pins that distinction.
+The reader skips FAISS precomputation during deserialization. For L2 with
+`by_residual`, it explicitly enables the `nlist * m * 2^bits`-float table
+only when its bytes are at most `ntotal * dims * 4`, the raw vector bytes.
+Otherwise it disables the table and FAISS computes tables per list. This
+bypasses FAISS's global 2 GB cap. With default sqrt(N) lists and m near d/8,
+the table is about 32/sqrt(N) of raw bytes; the bound primarily constrains
+explicit large nlist. IP/cosine has no resident L2 table.
+`IndexReaderAuxTest.cosineSkipsL2PrecomputedTable` pins both metric behavior
+and the size boundary.
 
 The basis is the Cohere-768 cosine [measurement below](#codec-measurements):
 `m=96` improves recall over `m=32`, with code bytes and per-code scan work
@@ -167,6 +169,31 @@ work per training vector per iteration, and encode work per vector, remain
 `256 * dims` at 8 bits: splitting the dimensions into more sub-quantizers
 does not multiply that arithmetic. This does not establish unchanged
 wall-clock build time; the build measurement below used `m=32`.
+
+### Default codec
+
+RaBitQ is the default, chosen on one-segment indexes at default probes plus
+16 to 256 lists, single client: SIFT-128 L2, MIRACL-768 cosine, GIST-960 L2,
+Cohere-1024 IP, NQ-1536 cosine, Jina v5-small MS MARCO embeddings truncated
+to 256 / 384 / 512 / 1024 dims (cosine), all at 1M vectors, and OpenAI
+text-embedding-3-large 3072 IP at 500k.
+
+From 384 dims up, 1-bit RaBitQ ran at about 0.5-0.8x PQ latency at equal or
+higher recall and built with equal or less CPU (0.39x at 3072 dims). Its
+intervals size the candidate pool per query, while PQ's bounded count,
+fitted on one 1024-d IP corpus, left recall behind elsewhere: at 256 lists
+PQ reached .872 recall@10 on MIRACL (.975 with 1000 candidates), .710 on
+GIST at m=32 (.954), .949 on Jina-384 and .960 on OpenAI-3072, against
+.981-.997 for 1-bit RaBitQ. At 128 dims 1-bit RaBitQ took 1.16x / 1.30x PQ
+latency at k=10 / k=100, and 2-bit 1.03x / 1.02x at 0.55x PQ's build CPU.
+
+Automatic bits (`0`) resolve to 2 below 384 stored dims and 1 at or above.
+On the same model truncated to 256 / 384 / 512 / 1024 dims, 2 bits cut k=100
+latency by 23% / 13% / 9% / 1% (21% on SIFT-128) but k=10 latency only
+below 384, while costing 1.5-1.8x the build CPU. 4 bits never beat 2.
+
+GIST L2 with PQ m=32 topped out at .71 recall@10 at 256 of 1000 lists;
+m=120, now the automatic choice, reaches .94-.98.
 
 ### Codec measurements
 

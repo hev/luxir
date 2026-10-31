@@ -5,6 +5,7 @@
 
 #include <faiss/Index.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFRaBitQ.h>
 #include <faiss/impl/io.h>
 #include <faiss/index_io.h>
@@ -390,7 +391,7 @@ public:
       const char* base = is.ptr();
 
       BufferIOReader io(base, (size_t)footer.faissHeaderBytes);
-      std::unique_ptr<faiss::Index> idx(faiss::read_index(&io));
+      std::unique_ptr<faiss::Index> idx(faiss::read_index(&io, faiss::IO_FLAG_SKIP_PRECOMPUTE_TABLE));
       if (!idx) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: read_index returned null for {}", name));
@@ -437,6 +438,20 @@ public:
           "does not match index header (nlist={} codeSize={} ntotal={})",
           name, (int64_t)footer.nlist, (int64_t)footer.codeSize, (int64_t)footer.ntotal,
           ivf->nlist, ivf->code_size, ivf->ntotal));
+      }
+
+      if (auto* pq = dynamic_cast<faiss::IndexIVFPQ*>(idx.get())) {
+        // L2 by_residual keeps FAISS's nlist * M * 2^bits precomputed table
+        // only while it is no larger than the raw vectors it indexes (true
+        // under the default sqrt(N) lists); otherwise FAISS builds per-list
+        // tables at query time. Float counts avoid byte-size overflow.
+        double tableFloats = (double)pq->nlist * pq->pq.M * pq->pq.ksub;
+        double rawFloats = (double)pq->ntotal * pq->d;
+        pq->use_precomputed_table = -1;
+        if (pq->metric_type == faiss::METRIC_L2 && pq->by_residual && tableFloats <= rawFloats) {
+          pq->use_precomputed_table = 1;
+          pq->precompute_table();
+        }
       }
 
       const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());

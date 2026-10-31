@@ -199,6 +199,9 @@ public:
   // measured on 1024-d IP, PQ M=128 x 8 bits: within 0.001 recall of the
   // scanned-list ceiling for k=1..1000 at default effort and nprobe=256.
   // An explicit refine_candidates replaces this default (clamped up to k).
+  // Fitted on one corpus. Larger estimate error relative to neighbor gaps
+  // (960-d L2 descriptors, 768/1536-d text with real queries) leaves recall
+  // that larger counts recover. RaBitQ interval selection does not use this.
   static int64_t boundedDefaultCandidates(int64_t k, int64_t cap) {
     assert(k > 0 && cap >= 0);
     if (k >= cap) return cap;

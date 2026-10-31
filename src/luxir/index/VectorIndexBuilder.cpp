@@ -125,7 +125,7 @@ int32_t chooseIvfNList(int32_t configured, int64_t ntotal) {
   return defaultIvfNList(ntotal);
 }
 
-int32_t choosePqM(int32_t configured, int32_t dims, faiss::MetricType metric) {
+int32_t choosePqM(int32_t configured, int32_t dims) {
   if (configured > 0) {
     // The schema validates authored settings; keep this check for
     // programmatically constructed field types too.
@@ -136,10 +136,9 @@ int32_t choosePqM(int32_t configured, int32_t dims, faiss::MetricType metric) {
     return configured;
   }
 
-  // IP (including cosine) builds lookup tables per query, so grow code bytes
-  // with dims. L2 + by_residual recomputes nlist * M * 256 floats at open
-  // and keeps them resident at 8 bits; retain its cap to bound that table.
-  int32_t cap = metric == faiss::METRIC_INNER_PRODUCT ? std::max(32, dims / 8) : 32;
+  // One code byte per 8 dims above 256 dims, for every metric. L2's resident
+  // precomputed table is bounded when the overlay is opened, not by capping m.
+  int32_t cap = std::max(32, dims / 8);
   int32_t maxM = std::min(cap, dims);
   for (int32_t m = maxM; m >= 1; m--) {
     if (dims % m == 0 && dims / m >= 4) return m;
@@ -455,7 +454,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
               fieldName, scanCost, ivfBuildThresholdScanCost);
     return std::nullopt;
   }
-  if (!rabitq) pqM = choosePqM(ann.pqM, dims, metric);
+  if (!rabitq) pqM = choosePqM(ann.pqM, dims);
 
   size_t bytesPerVec = (size_t)dims * sizeof(float);
   int64_t byteCap = bytesPerVec == 0 ? 0 : (int64_t)(ivfTrainingSampleBytes / bytesPerVec);
@@ -490,7 +489,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // rotation is orthonormal, so L2, inner product and cosine (unit vectors
   // stay unit) are preserved and centroid distances stay comparable across
   // segments of either codec.
-  int32_t rabitqBits = std::clamp(ann.rabitqBits, 1, 9);
+  int32_t rabitqBits = ann.resolvedRabitqBits(dims);
   std::unique_ptr<VectorRotation> rotation;
   int64_t minRows = buildMinRowsPerTask(dims);
   auto quantizer = std::make_unique<PartitionedFlatQuantizer>(dims, metric, minRows);

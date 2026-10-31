@@ -2237,14 +2237,15 @@ message VectorAnnDef {
     RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
     PQ = 1;      // IVF + product quantization
   }
-  optional Codec codec = 1;  // absent: pq; rabitq is opt-in
+  optional Codec codec = 1;  // absent: rabitq; pq requires explicit selection
 
   // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
   // capped at 4096. Clamped to the segment's vector count.
   optional int32 nlist = 2;
 
   message RaBitQ {
-    // Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a
+    // Bits per dimension, 0..9. Absent or 0: 2 below 384 stored dims,
+    // 1 at or above. Above 1 (extended RaBitQ) a
     // 1-bit pass prunes with the error bound and survivors are re-estimated
     // with the extra bits.
     optional int32 bits = 1;
@@ -2253,18 +2254,18 @@ message VectorAnnDef {
     // overlays.
     optional int32 query_bits = 2;
   }
-  RaBitQ rabitq = 3;  // requires explicit codec rabitq
+  RaBitQ rabitq = 3;  // codec rabitq (the default) only
 
   message Pq {
     // Sub-quantizers. Positive m requires positive effective (inherited)
     // dims and must divide it. Absent or 0: automatic, including inferred
     // dims. Choose the largest divisor leaving at least 4 dimensions per
-    // sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2.
+    // sub-quantizer, capped at max(32, dims / 8) for every metric.
     // If none does, choose the largest divisor under the same cap.
     optional int32 m = 1;
     optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
   }
-  Pq pq = 4;  // codec pq only
+  Pq pq = 4;  // requires explicit codec pq
 }
 
 // A field, template, or variant definition, named by its enclosing map key.
