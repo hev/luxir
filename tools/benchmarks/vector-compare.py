@@ -176,8 +176,6 @@ def variant(args, queries, stream, metric, meta):
         sockets.append(s)
     port, grpc = [s.getsockname()[1] for s in sockets]
     cmd = [str(Path(args.binary).resolve()), '--store.backend=fs', f'--store.data-dir={data}', f'--server.http.port={port}', f'--server.grpc.port={grpc}', f'--server.workers={args.workers}', '--max-ram-mb=4096']
-    for s in sockets:
-        s.close()
     session = requests.Session()
     base = f'http://127.0.0.1:{port}'
 
@@ -186,19 +184,21 @@ def variant(args, queries, stream, metric, meta):
         r.raise_for_status()
         return checked(r.json())
 
-    def search(codec, v, nprobe=0, exact=False):
+    def search(v, nprobe=0, exact=False):
         knn = {'field': 'embedding_v', 'query': v, 'k': 10, 'exact': exact, 'ivf': {'nprobe': nprobe}}
         return {'query': {'knn': knn}, 'limit': 10, 'fields': ['id']}
 
     cpu = Path('/proc/cpuinfo').read_text()
     (args.output / 'cpuinfo.txt').write_text(cpu)
-    result = {'label': args.label, 'source_revision': args.source_revision, 'binary_sha256': hashlib.file_digest(Path(args.binary).open('rb'), 'sha256').hexdigest(), 'harness_sha256': hashlib.file_digest(Path(__file__).open('rb'), 'sha256').hexdigest(), 'dataset': meta, 'metric': metric, 'index_count': 99000, 'query_count': 1000, 'k': 10, 'workers': args.workers, 'runner': {k: os.getenv(k) for k in ['RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_RUN_ID']}, 'host': platform.uname()._asdict(), 'cpu_model': next((x.split(':', 1)[1].strip() for x in cpu.splitlines() if x.startswith('model name')), platform.machine()), 'simd': {x: x in cpu.lower() for x in ['avx2', 'avx512f', 'neon', 'asimd']}, 'command': cmd, 'rows': []}
+    result = {'label': args.label, 'source_revision': args.source_revision, 'binary_sha256': hashlib.file_digest(Path(args.binary).open('rb'), 'sha256').hexdigest(), 'harness_sha256': hashlib.file_digest(Path(__file__).open('rb'), 'sha256').hexdigest(), 'dataset': meta, 'metric': metric, 'index_count': meta['index_count'], 'query_count': meta['query_count'], 'k': 10, 'workers': args.workers, 'runner': {k: os.getenv(k) for k in ['RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_RUN_ID']}, 'host': platform.uname()._asdict(), 'cpu_model': next((x.split(':', 1)[1].strip() for x in cpu.splitlines() if x.startswith('model name')), platform.machine()), 'simd': {x: x in cpu.lower() for x in ['avx2', 'avx512f', 'neon', 'asimd']}, 'command': cmd, 'rows': []}
     log = (args.output / 'server.log').open('w')
     shim_source = args.output.resolve() / 'loopback-bind.c'
     shim = args.output.resolve() / 'loopback-bind.so'
     shim_source.write_text(LOOPBACK_BIND)
     subprocess.run(['cc', '-shared', '-fPIC', '-O2', str(shim_source), '-ldl', '-o', str(shim)], check=True)
     result['loopback_bind_sha256'] = hashlib.file_digest(shim.open('rb'), 'sha256').hexdigest()
+    for s in sockets:
+        s.close()
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, 'OMP_NUM_THREADS': str(args.workers), 'OPENBLAS_NUM_THREADS': '1', 'LD_PRELOAD': str(shim)})
     try:
         deadline = time.monotonic() + 120
@@ -212,81 +212,81 @@ def variant(args, queries, stream, metric, meta):
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(0.2)
-        for codec in [args.variant]:
-            print(f'{codec}: schema/ingest', flush=True)
-            schema = {'fields': {'embedding_v': {'type': 'vector', 'dims': meta['dims'], 'metric': metric, **copy.deepcopy(args.settings)}}}
-            (args.output / f'{codec}-schema.json').write_text(json.dumps(schema, indent=2))
-            call(f'/collections/{codec}/_schema', schema)
-            start = time.perf_counter()
-            with stream.open('rb') as f:
-                r = session.post(base + f'/collections/{codec}/_update', data=f, headers={'Content-Type': 'application/x-ndjson'}, timeout=7200)
-                r.raise_for_status()
-                updates = [checked(json.loads(line)) for line in r.text.splitlines() if line]
-            if not updates:
-                raise RuntimeError('Empty ingest response')
-            visible = call(f'/collections/{codec}/_search', {'query': '*:*', 'limit': 0, 'count_limit': -1})
-            (args.output / f'{codec}-ingest.json').write_text(json.dumps({'updates': updates, 'visible': visible}, indent=2))
-            if visible.get('found') != 99000:
-                raise RuntimeError(f'Expected 99000 visible docs: {visible}')
-            ingest = time.perf_counter() - start
-            print(f'{codec}: ANN build', flush=True)
-            start = time.perf_counter()
-            build = call(f'/collections/{codec}/_update', {'commit': {'build_aux_indexes': ['*'], 'max_segments': 1, 'wait_for_merges': True}})
-            build_s = time.perf_counter() - start
-            stats = call(f'/collections/{codec}/_stats?files=true&segments=true')
-            (args.output / f'{codec}-build.json').write_text(json.dumps({'response': build, 'stats': stats}, indent=2))
-            collections = stats['collections']
-            index = collections[0]['shards'][0]['index']
-            segments = index.get('segments', [])
-            if len(segments) != 1 or int(index['totals']['live_docs']) != 99000:
-                raise RuntimeError(f'Expected one 99k segment: {stats}')
-            overlays = segments[0].get('overlays', [])
-            if not any(x.get('field') == 'embedding_v' and x.get('files') for x in overlays):
-                raise RuntimeError(f'ANN overlay missing; refusing to benchmark exact fallback: {stats}')
-            committed_bytes = int(index['totals']['committed_bytes'])
-            # Persist the entire stats response for independent audit.
-            directory = data / 't' / 't0' / codec
-            files = [x for x in directory.rglob('*') if x.is_file()]
-            size = sum(x.stat().st_size for x in files)
-            allocated = sum(x.stat().st_blocks * 512 for x in files)
-            (args.output / f'{codec}-files.json').write_text(json.dumps({str(x.relative_to(directory)): x.stat().st_size for x in files}, indent=2))
-            print(f'{codec}: exact ground truth', flush=True)
-            vectors = queries.tolist()
-            truth = []
-            for v in vectors:
-                docs = call(f'/collections/{codec}/_search', search(codec, v, exact=True))['docs']
-                ids = {d['id'] for d in docs}
-                if len(ids) != 10:
-                    raise RuntimeError('Exact top ten underfilled')
-                truth.append(ids)
-            (args.output / f'{codec}-truth.json').write_text(json.dumps([sorted(x) for x in truth]))
-            # Yield after preparation, then one full pass at a time. The caller
-            # rotates variant order on every pass; all three processes stay alive.
-            yield None
-            all_passes = {n: [] for n in [0, 16, 64]}
-            for nprobe in [0, 16, 64]:
-                payloads = [json.dumps(search(codec, v, nprobe), separators=(',', ':')).encode() for v in vectors]
-                passes = all_passes[nprobe]
-                for pass_no in range(4):
-                    times, recalls = [], []
-                    for payload, expected in zip(payloads, truth):
-                        start = time.perf_counter_ns()
-                        r = session.post(base + f'/collections/{codec}/_search', data=payload, headers={'Content-Type': 'application/json'}, timeout=120)
-                        elapsed = (time.perf_counter_ns() - start) / 1e6
-                        r.raise_for_status()
-                        ids = {d['id'] for d in checked(r.json())['docs']}
-                        if len(ids) != 10:
-                            raise RuntimeError('ANN top ten underfilled')
-                        times.append(elapsed)
-                        recalls.append(len(ids & expected) / 10)
-                    if pass_no:
-                        passes.append({'p50_ms': float(np.percentile(times, 50)), 'p99_ms': float(np.percentile(times, 99)), 'recall_at_10': statistics.mean(recalls), 'latencies_ms': times})
-                    print(f'{codec} nprobe={nprobe} pass={pass_no} done', flush=True)
-                    if pass_no == 3:
-                        row = {'variant': codec, 'field_settings': args.settings, 'nprobe': 'adaptive' if nprobe == 0 else nprobe, 'ingest_s': ingest, 'ann_build_s': build_s, 'index_bytes': size, 'committed_bytes': committed_bytes, 'allocated_bytes': allocated, **{k: statistics.median(x[k] for x in passes) for k in ['p50_ms', 'p99_ms', 'recall_at_10']}, 'passes': passes}
-                        result['rows'].append(row)
-                        (args.output / 'results.json').write_text(json.dumps(result, indent=2))
-                    yield {'variant': codec, 'nprobe': nprobe, 'pass': pass_no}
+        name = args.variant
+        print(f'{name}: schema/ingest', flush=True)
+        schema = {'fields': {'embedding_v': {'type': 'vector', 'dims': meta['dims'], 'metric': metric, **copy.deepcopy(args.settings)}}}
+        (args.output / f'{name}-schema.json').write_text(json.dumps(schema, indent=2))
+        call(f'/collections/{name}/_schema', schema)
+        start = time.perf_counter()
+        with stream.open('rb') as f:
+            r = session.post(base + f'/collections/{name}/_update', data=f, headers={'Content-Type': 'application/x-ndjson'}, timeout=7200)
+            r.raise_for_status()
+            updates = [checked(json.loads(line)) for line in r.text.splitlines() if line]
+        if not updates:
+            raise RuntimeError('Empty ingest response')
+        visible = call(f'/collections/{name}/_search', {'query': '*:*', 'limit': 0, 'count_limit': -1})
+        (args.output / f'{name}-ingest.json').write_text(json.dumps({'updates': updates, 'visible': visible}, indent=2))
+        if visible.get('found') != meta['index_count']:
+            raise RuntimeError(f'Expected {meta["index_count"]} visible docs: {visible}')
+        ingest = time.perf_counter() - start
+        print(f'{name}: ANN build', flush=True)
+        start = time.perf_counter()
+        build = call(f'/collections/{name}/_update', {'commit': {'build_aux_indexes': ['*'], 'max_segments': 1, 'wait_for_merges': True}})
+        build_s = time.perf_counter() - start
+        stats = call(f'/collections/{name}/_stats?files=true&segments=true')
+        (args.output / f'{name}-build.json').write_text(json.dumps({'response': build, 'stats': stats}, indent=2))
+        collections = stats['collections']
+        index = collections[0]['shards'][0]['index']
+        segments = index.get('segments', [])
+        if len(segments) != 1 or int(index['totals']['live_docs']) != meta['index_count']:
+            raise RuntimeError(f'Expected one {meta["index_count"]}-document segment: {stats}')
+        overlays = segments[0].get('overlays', [])
+        if not any(x.get('field') == 'embedding_v' and x.get('files') for x in overlays):
+            raise RuntimeError(f'ANN overlay missing; refusing to benchmark exact fallback: {stats}')
+        committed_bytes = int(index['totals']['committed_bytes'])
+        # Persist the entire stats response for independent audit.
+        directory = data / 't' / 't0' / name
+        files = [x for x in directory.rglob('*') if x.is_file()]
+        size = sum(x.stat().st_size for x in files)
+        allocated = sum(x.stat().st_blocks * 512 for x in files)
+        (args.output / f'{name}-files.json').write_text(json.dumps({str(x.relative_to(directory)): x.stat().st_size for x in files}, indent=2))
+        print(f'{name}: exact ground truth', flush=True)
+        vectors = queries.tolist()
+        truth = []
+        for v in vectors:
+            docs = call(f'/collections/{name}/_search', search(v, exact=True))['docs']
+            ids = {d['id'] for d in docs}
+            if len(ids) != 10:
+                raise RuntimeError('Exact top ten underfilled')
+            truth.append(ids)
+        (args.output / f'{name}-truth.json').write_text(json.dumps([sorted(x) for x in truth]))
+        # Yield after preparation, then one full pass at a time. The caller
+        # rotates variant order on every pass; all three processes stay alive.
+        yield None
+        all_passes = {n: [] for n in [0, 16, 64]}
+        for nprobe in [0, 16, 64]:
+            payloads = [json.dumps(search(v, nprobe), separators=(',', ':')).encode() for v in vectors]
+            passes = all_passes[nprobe]
+            for pass_no in range(4):
+                times, recalls = [], []
+                for payload, expected in zip(payloads, truth):
+                    start = time.perf_counter_ns()
+                    r = session.post(base + f'/collections/{name}/_search', data=payload, headers={'Content-Type': 'application/json'}, timeout=120)
+                    elapsed = (time.perf_counter_ns() - start) / 1e6
+                    r.raise_for_status()
+                    ids = {d['id'] for d in checked(r.json())['docs']}
+                    if len(ids) != 10:
+                        raise RuntimeError('ANN top ten underfilled')
+                    times.append(elapsed)
+                    recalls.append(len(ids & expected) / 10)
+                if pass_no:
+                    passes.append({'p50_ms': float(np.percentile(times, 50)), 'p99_ms': float(np.percentile(times, 99)), 'recall_at_10': statistics.mean(recalls), 'latencies_ms': times})
+                print(f'{name} nprobe={nprobe} pass={pass_no} done', flush=True)
+                if pass_no == 3:
+                    row = {'variant': name, 'field_settings': args.settings, 'nprobe': 'adaptive' if nprobe == 0 else nprobe, 'ingest_s': ingest, 'ann_build_s': build_s, 'index_bytes': size, 'committed_bytes': committed_bytes, 'allocated_bytes': allocated, **{k: statistics.median(x[k] for x in passes) for k in ['p50_ms', 'p99_ms', 'recall_at_10']}, 'passes': passes}
+                    result['rows'].append(row)
+                    (args.output / 'results.json').write_text(json.dumps(result, indent=2))
+                yield {'variant': name, 'nprobe': nprobe, 'pass': pass_no}
     finally:
         proc.terminate()
         try:
@@ -316,8 +316,8 @@ def main():
     p.add_argument('--candidate-revision', required=True)
     p.add_argument('--candidate-field-settings', default='{}', help='JSON merged into candidate vector field; base/default receive none')
     p.add_argument('--dataset', choices=PRESETS, default=DEFAULT_DATASET)
-    p.add_argument('--cache', type=Path, default=Path('.pq4-dataset'))
-    p.add_argument('--output', type=Path, default=Path('pq4-results'))
+    p.add_argument('--cache', type=Path, default=Path('.vector-dataset'))
+    p.add_argument('--output', type=Path, default=Path('vector-results'))
     p.add_argument('--label', default='local')
     p.add_argument('--workers', type=int, default=2)
     args = p.parse_args()
@@ -345,23 +345,25 @@ def main():
     truths = [json.loads((args.output / name / f'{name}-truth.json').read_text()) for name, *_ in specs]
     if any(t != truths[0] for t in truths):
         raise RuntimeError('Exact ground truth differs between revisions/variants')
-    metrics = ['ingest_s', 'ann_build_s', 'index_bytes', 'p50_ms', 'p99_ms', 'recall_at_10']
     rows = []
     for result in results:
         for row in result['rows']:
             base = next(r for r in results[0]['rows'] if r['nprobe'] == row['nprobe'])
-            row['delta_percent_vs_base'] = {k: 100 * (row[k] / base[k] - 1) for k in metrics}
+            row['delta_percent_vs_base'] = {k: 100 * (row[k] / base[k] - 1) for k in ['ingest_s', 'ann_build_s', 'index_bytes', 'p50_ms', 'p99_ms']}
+            row['recall_delta_points_vs_base'] = 100 * (row['recall_at_10'] - base['recall_at_10'])
             rows.append(row)
     output = {'label': args.label, 'variants': results, 'rows': rows, 'pass_schedule': schedule, 'exact_truth_equal': True}
     (args.output / 'results.json').write_text(json.dumps(output, indent=2))
-    lines = [f'## {args.label}: base vs candidate', '', f'Base `{args.base_revision}`; candidate `{args.candidate_revision}`.', f'{results[0]["cpu_model"]}; SIMD `{results[0]["simd"]}`; 99k indexed / 1k queries, {meta["dims"]}d, {metric}; dataset `{args.dataset}`.', '', 'Each value is followed by percent change vs base; recall delta is relative percent, not percentage points.', '', '| Variant | nprobe | Ingest s (change %) | ANN build s (change %) | Index MiB (change %) | p50 ms (change %) | p99 ms (change %) | Recall@10 (change %) |', '|---|---|---:|---:|---:|---:|---:|---:|']
+    lines = [f'## {args.label}: base vs candidate', '', f'Base `{args.base_revision}`; candidate `{args.candidate_revision}`.', f'{results[0]["cpu_model"]}; SIMD `{results[0]["simd"]}`; {meta["index_count"]} indexed / {meta["query_count"]} queries, {meta["dims"]}d, {metric}; dataset `{args.dataset}`.', '', 'Single measurements in base, feature, default order; percent change vs base.', '', '| Variant | Ingest s | Merge + ANN build s | Index MiB |', '|---|---:|---:|---:|']
+    for result in results:
+        row = result['rows'][0]
+        d = row['delta_percent_vs_base']
+        lines.append(f'| {row["variant"]} | {row["ingest_s"]:.2f} ({d["ingest_s"]:+.1f}%) | {row["ann_build_s"]:.2f} ({d["ann_build_s"]:+.1f}%) | {row["index_bytes"] / 2**20:.1f} ({d["index_bytes"]:+.2f}%) |')
+    lines += ['', 'Median of three timed passes per nprobe after one warm-up; variant order rotates every pass. Latency change is percent vs base; recall change is in percentage points.', '', '| Variant | nprobe | p50 ms | p99 ms | Recall@10 |', '|---|---|---:|---:|---:|']
     for row in rows:
-        values = []
-        for k, digits in zip(metrics, [2, 2, 2, 3, 3, 4]):
-            v = row[k] / 2**20 if k == 'index_bytes' else row[k]
-            values.append(f'{v:.{digits}f} ({row["delta_percent_vs_base"][k]:+.2f}%)')
-        lines.append('| ' + ' | '.join([row['variant'], str(row['nprobe']), *values]) + ' |')
-    lines += ['', 'One warm-up and three timed passes per nprobe; variant order rotates every pass. Median of per-pass p50/p99/recall. Ingest/build/size are single measurements in base, feature, default order. Shared-runner ratios carry noise; recall uses identical exact:true ground truth.']
+        d = row['delta_percent_vs_base']
+        lines.append(f'| {row["variant"]} | {row["nprobe"]} | {row["p50_ms"]:.3f} ({d["p50_ms"]:+.1f}%) | {row["p99_ms"]:.3f} ({d["p99_ms"]:+.1f}%) | {row["recall_at_10"]:.4f} ({row["recall_delta_points_vs_base"]:+.2f} pp) |')
+    lines += ['', 'Shared-runner ratios carry noise; recall uses identical exact:true ground truth.']
     markdown = '\n'.join(lines) + '\n'
     (args.output / 'summary.md').write_text(markdown)
     if os.getenv('GITHUB_STEP_SUMMARY'):

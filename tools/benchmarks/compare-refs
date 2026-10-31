@@ -19,8 +19,8 @@ for variant in base candidate; do
   else
     repo=$CANDIDATE_REPO ref=$CANDIDATE_REF
   fi
-  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-  [[ $ref =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]
+  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "Invalid $variant repository: $repo" >&2; exit 2; }
+  [[ $ref =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { echo "Invalid $variant ref: $ref" >&2; exit 2; }
   git init -q "$variant"
   git -C "$variant" remote add origin "https://github.com/$repo.git"
   git -C "$variant" fetch --depth 1 origin "$ref"

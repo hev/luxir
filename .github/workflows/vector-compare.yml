@@ -41,10 +41,10 @@ jobs:
       LUXIR_CACHE_DIR: ${{ github.workspace }}/.vector-ccache
       DEPS_REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Install harness dependencies and run tests
@@ -62,8 +62,9 @@ jobs:
           CANDIDATE_FIELD_SETTINGS: ${{ inputs.candidate_field_settings || '{}' }}
           BENCH_PYTHON: ${{ runner.temp }}/bench-venv/bin/python
           BENCH_LABEL: GitHub Actions x86
-        run: tools/benchmarks/compare-refs
-      - uses: actions/upload-artifact@v4
+        # Hosted runners count two cores; compile with every CPU.
+        run: BUILD_JOBS=$(nproc) tools/benchmarks/compare-refs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: vector-compare-${{ github.run_id }}
