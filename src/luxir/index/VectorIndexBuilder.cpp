@@ -10,9 +10,7 @@
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFRaBitQ.h>
-#include <faiss/IndexPreTransform.h>
 #include <faiss/MetricType.h>
-#include <faiss/VectorTransform.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
 #include <faiss/impl/RaBitQUtils.h>
@@ -238,20 +236,6 @@ public:
     if (by_residual) precompute_table();
   }
 };
-
-// Rotate the owned training sample through separate storage; GEMM cannot alias.
-void rotateTrainingSample(std::vector<float>& training, int32_t dims,
-                          const faiss::VectorTransform& rotation) {
-  int64_t n = (int64_t)(training.size() / (size_t)dims);
-  if (n <= 0) return;
-  int64_t minRows = buildMinRowsPerTask(dims);
-  std::vector<float> rotated(training.size());
-  forRowPartitions(n, minRows, [&](int64_t begin, int64_t end) {
-    rotation.apply_noalloc(end - begin, training.data() + begin * dims,
-                           rotated.data() + begin * dims);
-  });
-  training.swap(rotated);
-}
 
 void appendTrainingVectors(std::vector<float>& sample, int64_t sampleCap,
                            int64_t& nextSampleOrd,
@@ -506,16 +490,16 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // rotation is orthonormal, so L2, inner product and cosine (unit vectors
   // stay unit) are preserved and centroid distances stay comparable across
   // segments of either codec.
-  std::unique_ptr<faiss::RandomRotationMatrix> rotation;
+  int32_t rabitqBits = std::clamp(ann.rabitqBits, 1, 9);
+  std::unique_ptr<VectorRotation> rotation;
   int64_t minRows = buildMinRowsPerTask(dims);
   auto quantizer = std::make_unique<PartitionedFlatQuantizer>(dims, metric, minRows);
   std::unique_ptr<faiss::IndexIVF> index;
   if (rabitq) {
-    rotation = std::make_unique<faiss::RandomRotationMatrix>(dims, dims);
-    rotation->init(RABITQ_ROTATION_SEED);
+    rotation = std::make_unique<VectorRotation>(VectorRotation::FHT_KAC, dims, RABITQ_ROTATION_SEED);
     auto rq = std::make_unique<faiss::IndexIVFRaBitQ>(
         quantizer.get(), (size_t)dims, (size_t)nlist, metric,
-        /*own_invlists=*/true, (uint8_t)std::clamp(ann.rabitqBits, 1, 9));
+        /*own_invlists=*/true, (uint8_t)rabitqBits);
     rq->qb = (uint8_t)std::clamp(ann.rabitqQueryBits, 0, 8);
     index = std::move(rq);
   } else {
@@ -530,13 +514,16 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   index->own_fields = true;
 
   if (rotation != nullptr) {
-    rotateTrainingSample(training, dims, *rotation);
+    forRowPartitions(ntrain, minRows, [&](int64_t begin, int64_t end) {
+      float* rows = training.data() + begin * dims;
+      rotation->applyBatch(end - begin, rows, rows);
+    });
   }
 
   LOG_TRACE("VectorIndexBuilder: training {} {} ntotal={} ntrain={} dims={} "
             "nlist={} M={} pqBits={} rabitqBits={}",
             codecName, fieldName, ntotal, ntrain, dims, nlist, pqM, pqBits,
-            rabitq ? ann.rabitqBits : 0);
+            rabitq ? rabitqBits : 0);
   if (buildSite == BuildSite::MERGE) {
     ivfMergeBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
   } else {
@@ -589,7 +576,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
         }
         if (rotation) {
           float* dest = rotated.data() + begin * dims;
-          rotation->apply_noalloc(count, x, dest);
+          rotation->applyBatch(count, x, dest);
           x = dest;
         }
         std::vector<faiss::idx_t> listNos((size_t)count);
@@ -604,7 +591,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
             amplitudes[(size_t)(index->ntotal + begin + row)] = computeAmplitude(
                 x + row * dims, flat->get_xb() + listNos[row] * dims,
                 codes.data() + (size_t)(begin + row) * codeBytes + index->coarse_code_size(),
-                dims, ann.rabitqBits, metric);
+                dims, rabitqBits, metric);
           }
         }
       });
@@ -638,14 +625,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     int64_t faissHeaderBytes;
     {
       EmptyInvlistsSwap swap(*index);
-      if (rotation != nullptr) {
-        // Serialized as the standard FAISS wrapper (own_fields false: the
-        // stack object borrows both); the reader takes it apart again.
-        faiss::IndexPreTransform wrapped(rotation.get(), index.get());
-        faiss::write_index(&wrapped, &adapter);
-      } else {
-        faiss::write_index(index.get(), &adapter);
-      }
+      faiss::write_index(index.get(), &adapter);
       faissHeaderBytes = (int64_t)os.size();
     }
 
@@ -712,7 +692,9 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     meta.nlist = nlist;
     meta.pqM = pqM;
     meta.pqBits = pqBits;
-    meta.rabitqBits = rabitq ? std::clamp(ann.rabitqBits, 1, 9) : 0;
+    meta.rabitqBits = rabitq ? rabitqBits : 0;
+    meta.rotationKind = rabitq ? VectorRotation::FHT_KAC : 0;
+    meta.rotationSeed = rabitq ? RABITQ_ROTATION_SEED : 0;
     std::string bytes = meta.toBytes();
     info.opaque_meta.assign((const std::byte*)bytes.data(),
                             (const std::byte*)bytes.data() + bytes.size());

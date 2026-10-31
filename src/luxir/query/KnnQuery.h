@@ -958,15 +958,15 @@ public:
       bool intervalEngine = false;
       // RaBitQ overlays index the rotated space: the query is rotated once
       // per distinct rotation (overlays of one dims share one interned
-      // matrix) and outlives every engine built below.  Each inner buffer
+      // transform) and outlives every engine built below.  Each inner buffer
       // keeps its address when the outer vector grows.
-      std::vector<std::pair<const faiss::LinearTransform*, std::vector<float>>> rotatedQueries;
-      auto rotatedQuery = [&](const faiss::LinearTransform* rotation) -> const float* {
+      std::vector<std::pair<const VectorRotation*, std::vector<float>>> rotatedQueries;
+      auto rotatedQuery = [&](const VectorRotation* rotation) -> const float* {
         for (const auto& [rot, buf] : rotatedQueries) {
           if (rot == rotation) return buf.data();
         }
         auto& entry = rotatedQueries.emplace_back(rotation, std::vector<float>((size_t)dims));
-        rotateVector(*rotation, queryPtr, entry.second.data());
+        rotation->apply(queryPtr, entry.second.data());
         return entry.second.data();
       };
       // RaBitQ query quantization is a search-time knob: the current

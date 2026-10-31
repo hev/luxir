@@ -1348,7 +1348,7 @@ TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
     ASSERT_EQ(index->ntotal, 80);
     ASSERT_NE(aux->getRotation(), nullptr);
     std::vector<float> query(4, 0.5f), rotated(4);
-    aux->getRotation()->apply_noalloc(1, query.data(), rotated.data());
+    aux->getRotation()->apply(query.data(), rotated.data());
     faiss::IVFRaBitQSearchParameters params;
     params.nprobe = aux->getNList();
     params.qb = 0;

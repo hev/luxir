@@ -83,28 +83,38 @@ codebooks on every segment build and merge.
 
 The error bound and unbiasedness assume the codes are taken in a randomly
 rotated space. FAISS does not rotate internally: `RaBitQuantizer.h` states "It
-is assumed that the Random Matrix Rotation is performed externally", and the
-FAISS RaBitQ benchmark and tests wrap the index in
-`IndexPreTransform(RandomRotationMatrix, ...)` themselves. Luxir therefore
-builds a `RandomRotationMatrix` (orthonormal, d x d, fixed seed), rotates the
-training sample and every added vector, and serializes the header as the
-standard `IndexPreTransform(rotation, IndexIVFRaBitQ)`. The reader takes the
-wrapper apart: it keeps the IVF index (whose lists it serves from the mmapped
-file as usual) and interns the rotation in a process-wide table keyed by
-content. Because every overlay of a given dims uses the same seed, all of them
-share one matrix in RAM (d^2 floats, 2.25 MiB at 768 dims), and a query is
-rotated once per distinct matrix rather than once per segment. The rotation is
-orthonormal, so L2, inner product, and cosine (unit vectors stay unit) are
-preserved, and centroid distances stay comparable across rotated and
-unrotated segments in the global list ranking. On one real embedding corpus
-the rotation made no measurable recall difference (the embeddings are close to
-isotropic already). The rotation remains part of the estimator; production
-confidence intervals are empirical rather than a deterministic guarantee.
+is assumed that the Random Matrix Rotation is performed externally". Luxir
+rotates with a seeded FHT-Kac transform (the rotator of the RaBitQ authors'
+library) in `util/VectorRotation.h`, shared by the builder and the
+reader/query code. It uses exactly d coordinates, with no padding. Four
+rounds each apply random signs, then a normalized Walsh-Hadamard transform
+on the largest power-of-two block fitting in d, alternating head and tail.
+For non-power-of-two d, each round then pairs the first floor(d/2)
+coordinates with the last floor(d/2) coordinates in orthogonal
+sum/difference Kac steps. For odd d, the middle coordinate is covered by both
+Hadamard blocks. Power-of-two d skips Kac.
+
+The signs use SplitMix64 from the recorded seed, consuming each word low bit
+first continuously across rounds; a set bit negates the coordinate. The
+rotation kind fixes this algorithm and bit ordering. Every step is orthogonal,
+so norms, inner products, cosine and centroid distances remain comparable
+with unrotated PQ segments. Application costs O(d log d), with O(d) cached
+signs, replacing the dense d x d matrix and its quadratic work. FAISS's
+HadamardRotation pads to the next power of two, adding 33% code bytes at
+768, 1536 and 3072 dimensions; avoiding that padding preserves code density.
+
+Training samples and added vectors use the same transform. Headers are bare
+`IndexIVFRaBitQ`; metadata stores rotation kind and seed, with no matrix.
+Readers intern by (kind, dims, seed), and queries rotate once per distinct
+transform. A fixed seed shares the transform across overlays of one dimension.
+Confidence intervals remain empirical, rather than a deterministic guarantee.
+On five 1M corpora (128 to 1536 dims, L2, IP and cosine) it matched the dense
+rotation's recall and latency at 1 and 2 bits, within the run-to-run
+variation of the k-means partition, and cut 1-bit build CPU by up to 23% (NQ
+1536: vector build 12.0 to 8.2 s).
 
 Each IVF engine slot binds an immutable prepared query: the canonical query
-for PQ, or the cached rotated query for RaBitQ (a Luxir matvec over the
-rotation's rows rather than FAISS's one-column SGEMM, which on x86 OpenBLAS
-takes the full packed GEMM path), plus the current schema's
+for PQ, or the cached rotated query for RaBitQ, plus the current schema's
 query quantization bits. Coarse assignment and both document and group scans
 use that same index-space query. Each scan call owns its selector and distance
 computer, with query quantization taken from the prepared query, so filtering,
@@ -228,14 +238,10 @@ inside a segment is time ordered. The builder normalizes vectors for FAISS
 when the field uses cosine and the stored column is raw.
 
 Raw-cosine training samples are normalized in place in their owned buffer.
-RaBitQ training then uses the chunked transform helper for rotation only,
-copying each rotated chunk back into the sample; PQ needs no training
-transform call. There is no second full-size training allocation or swap.
-Each scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
-capped by the available vectors with a minimum of one vector. Training
-rotation needs one buffer, released before FAISS training. Add uses the same
-helper with up to two buffers for raw cosine plus rotation, keeping matrix
-multiply input and output disjoint. Untransformed PQ add passes column bytes
+RaBitQ rotates the sample in place in row partitions; PQ needs no transform.
+Each add scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
+capped by available vectors with a minimum of one vector. Add uses up to two
+buffers for raw cosine plus rotation. Untransformed PQ add passes column bytes
 directly to FAISS. The serialized header's `nprobe` is unused by Luxir:
 searches supply explicit probe parameters or selected lists.
 
@@ -262,7 +268,7 @@ so it cannot pick up an unrelated merge or flush while waiting:
   for RaBitQ, coarse-assigns with the base `IndexFlat::search`, and calls
   `encode_vectors` with list numbers. One serial `add_sa_codes` per chunk
   preserves input order within each inverted list.
-- RaBitQ training-sample rotation, into disjoint row slices of a separate buffer.
+- RaBitQ training-sample rotation, in disjoint row slices in place.
 - PQ codebook training, one task per sub-quantizer with its own sub-vector
   buffer, clustering instance and flat L2 index. This mirrors FAISS's default
   training path; residual precomputation follows after all tasks finish.
@@ -278,9 +284,8 @@ plain `IndexFlat` and `IndexIVFPQ`; readers need no build-specific types.
 ## Memory-Mapped Index Layout
 
 Index data stays memory-mapped at query time. The aux file holds a small FAISS
-header (index parameters, IVF centroids, and the PQ codebooks or RaBitQ
-rotation) followed by the inverted-list payloads (codes and vector ids) in
-Luxir's own layout; the
+header (index parameters, IVF centroids, and the PQ codebooks) followed by
+the inverted-list payloads (codes and vector ids) in Luxir's own layout; the
 reader decodes only the header into memory and serves list scans directly from
 the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process

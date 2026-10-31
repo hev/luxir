@@ -212,7 +212,7 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
       auto copied = original;
       copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
       auto aux = VectorAuxReader::open(dir, copied, false);
-      // callOnce retries must leave both the wrapper and its children safe.
+      // callOnce retries must leave the partially loaded index safe.
       for (int attempt = 0; attempt < 2; attempt++) {
         try {
           aux->getFaissIndex();
@@ -225,6 +225,15 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
           EXPECT_NE(message.find("opaque_meta says " + std::to_string(bits ? changed.rabitqBits : changed.nlist)), std::string::npos);
         }
       }
+    }
+    if (ann.codec == api::VectorAnnDef::Codec::RABITQ) {
+      auto changed = meta;
+      changed.rotationKind = 99;
+      std::string bytes = changed.toBytes();
+      auto copied = original;
+      copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
+      auto aux = VectorAuxReader::open(dir, copied, false);
+      EXPECT_THROW(aux->getFaissIndex(), std::runtime_error);
     }
     auto healthy = VectorAuxReader::open(dir, original, false);
     EXPECT_NE(healthy->getFaissIndex(), nullptr);

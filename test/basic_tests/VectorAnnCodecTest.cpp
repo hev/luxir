@@ -137,12 +137,15 @@ std::vector<const VectorAuxReader*> overlays(CollectionHelper& h,
 // Sparse rotated coordinates give negative estimates with a wide margin.
 // Symmetric pairs keep the single IVF centroid at zero after real training.
 std::vector<float> unrotate(float x, float y) {
-  faiss::RandomRotationMatrix rotation(DIMS, DIMS);
-  rotation.init(VectorIndexBuilder::RABITQ_ROTATION_SEED);
-  std::vector<float> rotated(DIMS), canonical(DIMS);
-  rotated[0] = x;
-  rotated[1] = y;
-  rotation.reverse_transform(1, rotated.data(), canonical.data());
+  VectorRotation rotation(VectorRotation::FHT_KAC, DIMS, VectorIndexBuilder::RABITQ_ROTATION_SEED);
+  std::vector<float> basis(DIMS), column(DIMS), canonical(DIMS);
+  // Transpose by rotating basis vectors; inverse is only needed by this fixture.
+  for (int i = 0; i < DIMS; ++i) {
+    basis[i] = 1;
+    rotation.apply(basis.data(), column.data());
+    canonical[i] = column[0] * x + column[1] * y;
+    basis[i] = 0;
+  }
   return canonical;
 }
 
@@ -162,7 +165,7 @@ std::vector<float> rabitqDistances(const VectorAuxReader& aux, const std::vector
   EXPECT_NE(index, nullptr);
   EXPECT_EQ(index->nlist, 1u);
   std::vector<float> rotated(DIMS), centroid(DIMS), result((size_t)index->ntotal);
-  aux.getRotation()->apply_noalloc(1, query.data(), rotated.data());
+  aux.getRotation()->apply(query.data(), rotated.data());
   faiss::IVFRaBitQSearchParameters params;
   params.qb = 0;
   std::unique_ptr<faiss::InvertedListScanner> scanner(index->get_InvertedListScanner(false, nullptr, &params));
@@ -233,7 +236,7 @@ TEST_F(VectorAnnCodecTest, eachCodecAndMetricBuildsFromSchemaAndRecalls) {
         EXPECT_TRUE(aux[0]->isRaBitQ());
         EXPECT_EQ(aux[0]->getRaBitQBits(), bits);
         ASSERT_NE(aux[0]->getRotation(), nullptr);
-        EXPECT_TRUE(aux[0]->getRotation()->is_orthonormal);
+        EXPECT_EQ(aux[0]->getRotation()->kind, VectorRotation::FHT_KAC);
       }
       EXPECT_GE(recallVsExact(h), 0.9);
     }
@@ -292,7 +295,7 @@ TEST_F(VectorAnnCodecTest, amplitudesFollowListOffsetsAcrossListsAndMerge) {
               int64_t rank = ids.get()[row];
               std::memcpy(x.data(), column.vectorAtRank(rank).data(), x.size() * sizeof(float));
               if (metric == api::VectorMetric::COSINE) faiss::fvec_renorm_L2(x.size(), 1, x.data());
-              aux[seg]->getRotation()->apply_noalloc(1, x.data(), rotated.data());
+              aux[seg]->getRotation()->apply(x.data(), rotated.data());
               EXPECT_TRUE(std::isfinite(span[row]));
               EXPECT_GE(span[row], 0);
               if (bits == 1) {
@@ -484,20 +487,47 @@ TEST_F(VectorAnnCodecTest, groupedNegativeDistanceFloor) {
   }
 }
 
-// The query-side matvec reproduces FAISS's one-column SGEMM rotation.
-TEST_F(VectorAnnCodecTest, rotateVectorMatchesFaissTransform) {
-  faiss::RandomRotationMatrix rotation(DIMS, DIMS);
-  rotation.init(VectorIndexBuilder::RABITQ_ROTATION_SEED);
-  std::vector<float> expected(DIMS), actual(DIMS);
-  for (int32_t q = 0; q < 4; q++) {
-    auto x = clustered(500 + q, q);
-    rotation.apply_noalloc(1, x.data(), expected.data());
-    rotateVector(rotation, x.data(), actual.data());
-    for (int32_t i = 0; i < DIMS; i++) EXPECT_NEAR(actual[i], expected[i], 1e-5f) << i;
+TEST_F(VectorAnnCodecTest, structuredRotationPreservesGeometry) {
+  for (int d : {1, 2, 3, 5, 64, 100, 127, 128, 384, 768, 960, 1024, 1536, 3072}) {
+    SCOPED_TRACE(d);
+    VectorRotation r(VectorRotation::FHT_KAC, d, 42), same(VectorRotation::FHT_KAC, d, 42);
+    std::vector<float> x(d), y(d), rx(d), ry(d), batch(2 * d);
+    for (int i = 0; i < d; ++i) { x[i] = std::sin((float)i + 1); y[i] = std::cos((float)i * 3); }
+    r.apply(x.data(), rx.data());
+    r.apply(y.data(), ry.data());
+    std::copy(x.begin(), x.end(), batch.begin());
+    std::copy(y.begin(), y.end(), batch.begin() + d);
+    same.applyBatch(2, batch.data(), batch.data());
+    double xx = 0, rr = 0, xy = 0, rxy = 0;
+    for (int i = 0; i < d; ++i) {
+      EXPECT_EQ(rx[i], batch[i]); EXPECT_EQ(ry[i], batch[d + i]);
+      xx += (double)x[i] * x[i]; rr += (double)rx[i] * rx[i];
+      xy += (double)x[i] * y[i]; rxy += (double)rx[i] * ry[i];
+    }
+    EXPECT_NEAR(xx, rr, 2e-6 * d);
+    EXPECT_NEAR(xy, rxy, 2e-6 * d);
   }
+  auto shared = internVectorRotation(VectorRotation::FHT_KAC, 17, 42);
+  EXPECT_EQ(shared, internVectorRotation(VectorRotation::FHT_KAC, 17, 42));
+  EXPECT_NE(shared, internVectorRotation(VectorRotation::FHT_KAC, 17, 43));
+  EXPECT_NE(shared, internVectorRotation(VectorRotation::FHT_KAC, 18, 42));
+  // Seed 0, low bits of the first SplitMix64 word, four rounds.
+  VectorRotation golden(VectorRotation::FHT_KAC, 2, 0);
+  float value[] = {1, 2};
+  golden.apply(value, value);
+  EXPECT_NEAR(value[0], -2, 1e-6);
+  EXPECT_NEAR(value[1], 1, 1e-6);
+  // Cross a sign-word boundary and exercise the odd-dimension Kac layout.
+  VectorRotation odd(VectorRotation::FHT_KAC, 17, 0);
+  float sequence[17];
+  for (int i = 0; i < 17; ++i) sequence[i] = (float)(i + 1);
+  odd.apply(sequence, sequence);
+  EXPECT_NEAR(sequence[0], -3.53748822f, 1e-5);
+  EXPECT_NEAR(sequence[8], -18.0413551f, 1e-5);
+  EXPECT_NEAR(sequence[16], -0.602243066f, 1e-5);
 }
 
-// Compare list payloads rather than files: RaBitQ's sliced rotation GEMMs
+// Compare list payloads rather than files: partitioned builds
 // can differ in the last bits, so only PQ codes must match exactly.
 TEST_F(VectorAnnCodecTest, partitionedBuildMatchesSingleTask) {
   IvfTestGuard guard;

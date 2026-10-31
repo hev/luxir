@@ -71,7 +71,7 @@ public:
   static int64_t ivfBuildMinRowsPerTask;
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
-  // dims shares one matrix (deduplicated in RAM by internVectorRotation).
+  // dims shares one transform (deduplicated in RAM by internVectorRotation).
   static constexpr int RABITQ_ROTATION_SEED = 0x5ab17;
 
 
