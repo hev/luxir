@@ -24,6 +24,8 @@ docker image inspect "$image" > "$GRID_EVIDENCE/image.json"
 if [[ ! -d $engine/.git ]]; then
   git init -q "$engine"
   git -C "$engine" remote add origin https://github.com/synhershko/luxir.git
+fi
+if ! git -C "$engine" rev-parse --verify HEAD >/dev/null 2>&1; then
   git -C "$engine" fetch --depth 1 origin "$source_sha"
   git -C "$engine" checkout -q --detach FETCH_HEAD
 fi

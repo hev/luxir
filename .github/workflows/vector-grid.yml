@@ -23,6 +23,15 @@ on:
         default: '1'
         options: ['1']
 
+  workflow_call:
+    inputs:
+      dataset:
+        type: string
+        required: true
+      stage:
+        type: string
+        required: true
+
 permissions:
   contents: read
 

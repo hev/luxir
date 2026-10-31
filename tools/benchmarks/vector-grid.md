@@ -6,8 +6,14 @@ This is a stage-1 experiment, not a new engine default recommendation.
 
 ## Run
 
-Use the fork-only `Vector defaults grid (Oven)` workflow on
+Use the fork-only `Vector defaults grid dispatch (Oven)` workflow on
 `hev/luxir:verify/defaults-grid`. Select `dataset=all`, `stage=1`.
+The new workflow path is not registered on the default branch. To preserve
+fork main, the already registered `vector-compare.yml` path on this branch is
+a dispatch-only adapter calling the local reusable `vector-grid.yml`. Both
+define dataset/stage dispatch inputs; only the selected branch is changed.
+Dispatch with `gh workflow run vector-compare.yml -R hev/luxir --ref verify/defaults-grid -f dataset=all -f stage=1`.
+
 The dataset matrix is ordered SIFT, GIST, Cohere 768, Cohere v3 1024,
 DBpedia 1536, DBpedia 3072, with max-parallel 1 and fail-fast disabled.
 Jobs run only on the existing `[self-hosted, linux, x64, oven-luxir]` runner.

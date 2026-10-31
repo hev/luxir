@@ -1,0 +1,34 @@
+name: Vector defaults grid dispatch (Oven)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Pinned dataset, or all in dimension order
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - sift-128-l2
+          - gist-960-l2
+          - cohere-768-cos
+          - cohere-v3-1024
+          - dbpedia-openai3-1536
+          - dbpedia-openai3-3072
+      stage:
+        description: Parameter grid stage
+        type: choice
+        required: true
+        default: '1'
+        options: ['1']
+
+permissions:
+  contents: read
+
+jobs:
+  grid:
+    uses: ./.github/workflows/vector-grid.yml
+    with:
+      dataset: ${{ inputs.dataset }}
+      stage: ${{ inputs.stage }}
