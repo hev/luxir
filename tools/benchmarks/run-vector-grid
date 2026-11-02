@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Build pinned engines once per dedicated cache, then run one serial dataset grid.
+set -euo pipefail
+harness=$(cd "$(dirname "$0")" && pwd)
+: "${DATASET:?dataset required}"
+: "${GRID_ROOT:?dedicated cache root required}"
+: "${GRID_OUTPUT:?fresh output required}"
+: "${GRID_EVIDENCE:?evidence directory required}"
+python=${BENCH_PYTHON:-python3}
+main_sha=b0fa2856d1356577d03839f44215ac2402223fd7
+pq4_sha=a7ba8db063060f25d9c34f31c9d98899fc26ed11
+image=ghcr.io/hev/luxir-dev@sha256:e6fd4747b2a258944abcf8548e05f3cce0b36a37a956bbd0a6d1d18631b27aeb
+mkdir -p "$GRID_ROOT" "$GRID_EVIDENCE"
+"$python" -c 'import shutil,sys; f=shutil.disk_usage(sys.argv[1]).free; print("free_disk_bytes",f); sys.exit(0 if f >= 60*10**9 else "Free disk below 60 GB")' "$GRID_ROOT"
+# Serialize only this benchmark cache, without touching the runner service.
+exec 9>"$GRID_ROOT/engine.lock"
+flock 9
+if [[ -z ${DOCKER_HOST:-} && -S /run/user/$(id -u)/docker.sock ]]; then
+  DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+  export DOCKER_HOST
+fi
+docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+docker image inspect "$image" > "$GRID_EVIDENCE/image.json"
+build_engine() {
+  local source_sha=$1 engine="$GRID_ROOT/engine-$1"
+  if [[ ! -d $engine/.git ]]; then
+    git init -q "$engine"
+    git -C "$engine" remote add origin https://github.com/luxir-search/luxir.git
+  fi
+  if ! git -C "$engine" rev-parse --verify HEAD >/dev/null 2>&1; then
+    git -C "$engine" fetch --depth 1 origin "$source_sha"
+    git -C "$engine" checkout -q --detach FETCH_HEAD
+  fi
+  [[ $(git -C "$engine" rev-parse HEAD) == "$source_sha" ]]
+  git -C "$engine" diff --exit-code
+  if [[ ! -f $engine/grid-build.json ]]; then
+    (
+      cd "$engine"
+      git submodule update --init
+      ./deps/fetch_sources.sh
+      # The published #187 environment lacks one header used by newer RaBitQ.
+      # Supply the pinned public header locally; never patch the image or engine.
+      if [[ $source_sha == "$main_sha" ]]; then
+        "$python" - "$engine" <<'PY'
+import hashlib,pathlib,sys,urllib.request
+p=pathlib.Path(sys.argv[1])/'deps/faiss/utils/popcount.h'
+p.parent.mkdir(parents=True,exist_ok=True)
+raw=urllib.request.urlopen('https://raw.githubusercontent.com/facebookresearch/faiss/v1.14.3/faiss/utils/popcount.h',timeout=120).read()
+assert hashlib.sha256(raw).hexdigest()=='7f78bc27619fbc750983bfab5130c2a468765ea38752437840df2957c61bb347'
+p.write_bytes(raw)
+PY
+      fi
+      export LUXIR_DEV_IMAGE="$image" LUXIR_CACHE_DIR="$GRID_ROOT/compiler-cache"
+      if docker info --format '{{json .SecurityOptions}}' | grep -q rootless; then
+        export CONTAINER_ENGINE="$harness/grid-container-engine"
+      fi
+      /usr/bin/time -v -o "$GRID_EVIDENCE/engine-$source_sha-build-time.txt" \
+        ./tools/dev-container bash -e -c \
+        'cmake --preset container-release -DLUXIR_COMPILE_JOBS=6 && cmake --build --preset container-release --target luxir' \
+        > "$GRID_EVIDENCE/engine-$source_sha-build.log" 2>&1
+      "$python" - "$engine" "$source_sha" "$image" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+sha=hashlib.file_digest((root/'build/container-release/bin/luxir').open('rb'),'sha256').hexdigest()
+(root/'grid-build.json').write_text(json.dumps({'source':sys.argv[2], 'image':sys.argv[3], 'binary_sha256':sha},indent=2)+'\n')
+PY
+    )
+  fi
+  cp "$engine/grid-build.json" "$GRID_EVIDENCE/engine-$source_sha.json"
+  "$python" - "$engine" "$source_sha" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); meta=json.loads((root/'grid-build.json').read_text())
+assert meta['source']==sys.argv[2]
+assert hashlib.file_digest((root/'build/container-release/bin/luxir').open('rb'),'sha256').hexdigest()==meta['binary_sha256']
+PY
+}
+build_engine "$main_sha"
+extra=()
+# PQ4 is not supported for L2, and is never substituted with another engine.
+if [[ $DATASET != sift-128-l2 && $DATASET != gist-960-l2 ]]; then
+  build_engine "$pq4_sha"
+  pq4_binary="$GRID_ROOT/engine-$pq4_sha/build/container-release/bin/luxir"
+  "$pq4_binary" --help > "$GRID_EVIDENCE/pq4-help.txt"
+  if grep -q -- --indexing.max-inflight-batches "$GRID_EVIDENCE/pq4-help.txt"; then
+    extra+=(--pq4-binary "$pq4_binary")
+  else
+    extra+=(--pq4-skip-reason '#187 binary lacks --indexing.max-inflight-batches; refusing parallel ingest')
+  fi
+fi
+flock -u 9
+lscpu > "$GRID_EVIDENCE/lscpu.txt"
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2
+if [[ ${SMOKE:-0} == 1 ]]; then
+  extra+=(--smoke)
+fi
+exec "$python" "$harness/vector-grid.py" --binary "$GRID_ROOT/engine-$main_sha/build/container-release/bin/luxir" \
+  --dataset "$DATASET" --cache "$GRID_ROOT/datasets" --output "$GRID_OUTPUT" --stage "${STAGE:-1}" \
+  --max-inflight-batches 1 "${extra[@]}"

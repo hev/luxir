@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Rootless Docker maps container uid 0 to the invoking host uid. Task-local only.
+set -euo pipefail
+args=()
+while (($#)); do
+  if [[ $1 == --user ]]; then
+    args+=(--user 0:0)
+    shift 2
+  else
+    args+=("$1")
+    shift
+  fi
+done
+exec docker "${args[@]}"
