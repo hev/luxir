@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Build two reviewed public refs on the dedicated Oven runner, then compare both codecs.
+set -euo pipefail
+harness=$(cd "$(dirname "$0")" && pwd)
+: "${BASE_REPO:?owner/repository required}"
+: "${BASE_REF:?base ref required}"
+: "${CANDIDATE_REPO:?owner/repository required}"
+: "${CANDIDATE_REF:?candidate ref required}"
+: "${WORK_DIR:?fresh work directory required}"
+python=${BENCH_PYTHON:-python3}
+image=ghcr.io/hev/luxir-dev@sha256:e6fd4747b2a258944abcf8548e05f3cce0b36a37a956bbd0a6d1d18631b27aeb
+# Refuse to overwrite or delete an existing run.
+mkdir "$WORK_DIR"
+mkdir "$WORK_DIR/evidence"
+work=$(cd "$WORK_DIR" && pwd)
+guard() {
+  "$python" -c 'import shutil,sys; f=shutil.disk_usage(sys.argv[1]).free; print("free_disk_bytes",f); sys.exit(0 if f >= 60*10**9 else "Free disk below 60 GB")' "$work"
+}
+guard
+if [[ -z ${DOCKER_HOST:-} && -S /run/user/$(id -u)/docker.sock ]]; then
+  DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+  export DOCKER_HOST
+fi
+docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+docker image inspect "$image" > "$work/evidence/image.json"
+# Rootless Docker must use its mapped uid 0. This wrapper affects this build only.
+cat > "$work/container-engine" <<'ENGINE'
+#!/usr/bin/env bash
+set -euo pipefail
+args=()
+while (($#)); do
+  if [[ $1 == --user ]]; then
+    args+=(--user 0:0)
+    shift 2
+  else
+    args+=("$1")
+    shift
+  fi
+done
+exec docker "${args[@]}"
+ENGINE
+chmod +x "$work/container-engine"
+if docker info --format '{{json .SecurityOptions}}' | grep -q rootless; then
+  export CONTAINER_ENGINE="$work/container-engine"
+fi
+for variant in base candidate; do
+  guard
+  if [[ $variant == base ]]; then
+    repo=$BASE_REPO ref=$BASE_REF
+  else
+    repo=$CANDIDATE_REPO ref=$CANDIDATE_REF
+  fi
+  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "Invalid repository" >&2; exit 2; }
+  [[ $ref =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { echo "Invalid ref" >&2; exit 2; }
+  git init -q "$work/$variant"
+  git -C "$work/$variant" fetch --depth 1 "https://github.com/$repo.git" "$ref"
+  git -C "$work/$variant" checkout -q --detach FETCH_HEAD
+  git -C "$work/$variant" rev-parse HEAD > "$work/evidence/$variant-revision.txt"
+  (
+    cd "$work/$variant"
+    git submodule update --init
+    ./deps/fetch_sources.sh
+    # The pinned dependency image predates the RaBitQ popcount header.
+    "$python" - <<'PY'
+import hashlib,pathlib,urllib.request
+p=pathlib.Path('deps/faiss/utils/popcount.h')
+p.parent.mkdir(parents=True,exist_ok=True)
+raw=urllib.request.urlopen('https://raw.githubusercontent.com/facebookresearch/faiss/v1.14.3/faiss/utils/popcount.h',timeout=120).read()
+assert hashlib.sha256(raw).hexdigest()=='7f78bc27619fbc750983bfab5130c2a468765ea38752437840df2957c61bb347'
+p.write_bytes(raw)
+PY
+    export LUXIR_DEV_IMAGE="$image"
+    /usr/bin/time -v -o "$work/evidence/$variant-build-time.txt" \
+      ./tools/dev-container bash -e -c \
+      'cmake --preset container-release -DLUXIR_COMPILE_JOBS=6 && cmake --build --preset container-release --target luxir' \
+      > "$work/evidence/$variant-build.log" 2>&1
+    sha256sum build/container-release/bin/luxir > "$work/evidence/$variant-binary.sha256"
+  )
+done
+guard
+lscpu > "$work/evidence/lscpu.txt"
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2
+"$python" "$harness/vector-compare.py" \
+  --base-binary "$work/base/build/container-release/bin/luxir" \
+  --candidate-binary "$work/candidate/build/container-release/bin/luxir" \
+  --base-revision "$(cat "$work/evidence/base-revision.txt")" \
+  --candidate-revision "$(cat "$work/evidence/candidate-revision.txt")" \
+  --filtered --dataset "${DATASET:-cohere-768-cos}" \
+  --cache "${DATASET_CACHE:-$work/dataset}" \
+  --label "${BENCH_LABEL:-Oven filtered}" --output "$work/evidence/benchmark"
