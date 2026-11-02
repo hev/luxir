@@ -94,5 +94,5 @@ if [[ ${SMOKE:-0} == 1 ]]; then
   extra+=(--smoke)
 fi
 exec "$python" "$harness/vector-grid.py" --binary "$GRID_ROOT/engine-$main_sha/build/container-release/bin/luxir" \
-  --dataset "$DATASET" --cache "$GRID_ROOT/datasets" --output "$GRID_OUTPUT" --stage "${STAGE:-1}" \
+  --dataset "$DATASET" --cache "$GRID_ROOT/datasets" --output "$GRID_OUTPUT" --stage "${STAGE:-1b}" \
   --max-inflight-batches 1 "${extra[@]}"
