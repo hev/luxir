@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: ${{ inputs.filtered && 720 || 120 }}
     env:
       WORK_DIR: ${{ inputs.filtered && format('{0}/.filtered-work-{1}-{2}', github.workspace, github.run_id, github.run_attempt) || format('{0}/.vector-work', github.workspace) }}
-      DATASET_CACHE: ${{ github.workspace }}/.vector-dataset
+      DATASET_CACHE: ${{ inputs.filtered && format('{0}/../luxir-vector-grid-cache/datasets', github.workspace) || format('{0}/.vector-dataset', github.workspace) }}
       LUXIR_CACHE_DIR: ${{ github.workspace }}/.vector-ccache
       DEPS_REGISTRY: ghcr.io/${{ github.repository_owner }}/luxir-dev
     steps:
